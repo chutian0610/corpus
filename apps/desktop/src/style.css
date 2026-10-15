@@ -1,0 +1,74 @@
+/* Corpus 桌面基础样式 */
+:root {
+  --text: #3b3a44;
+  --text-strong: #1a1922;
+  --text-muted: #7c7a88;
+  --bg: #f7f6f4;
+  --surface: #ffffff;
+  --border: #e4e2de;
+  --accent: #4f46e5;
+  --accent-soft: #eef0fe;
+  --accent-border: #b9b6f5;
+  --danger: #b4232a;
+  --danger-soft: #fdeeee;
+  --danger-border: #f2c1c3;
+  --ok: #167145;
+  --ok-soft: #eaf5ee;
+  --ok-border: #b9dfc9;
+  --mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+
+  font: 15px/1.6 system-ui, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  color: var(--text);
+  color-scheme: light dark;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #b7b5c2;
+    --text-strong: #eceaf3;
+    --text-muted: #8a8798;
+    --bg: #16171d;
+    --surface: #1e1f27;
+    --border: #30313c;
+    --accent: #8f88f7;
+    --accent-soft: #272339;
+    --accent-border: #4b45a0;
+    --danger: #ef9a9a;
+    --danger-soft: #331f21;
+    --danger-border: #6b3236;
+    --ok: #7fd0a2;
+    --ok-soft: #1c2b21;
+    --ok-border: #2f5c42;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+}
+
+h1,
+h2,
+h3 {
+  color: var(--text-strong);
+  font-weight: 600;
+  margin: 0;
+}
+
+p {
+  margin: 0;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
