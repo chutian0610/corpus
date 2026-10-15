@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { PROVIDER_OPTIONS, formatDateTime, templateDisplayName } from '../display'
+import { PROVIDER_OPTIONS, errorMessage, formatDateTime, templateDisplayName } from '../display'
+import { currentVault } from '../vault-state'
 
 /** 引擎 serde 的 snake_case 结构 */
 
@@ -65,6 +66,7 @@ const testError = reactive({ fast: null as string | null, strong: null as string
 const recentVaults = ref<RecentVault[]>([])
 const vaultsError = ref<string | null>(null)
 const removingPath = ref<string | null>(null)
+const openingPath = ref<string | null>(null)
 
 onMounted(async () => {
   await Promise.all([loadConfig(), loadRecentVaults()])
@@ -79,7 +81,7 @@ async function loadConfig(): Promise<void> {
     form.apply_mode = config.apply_mode
     form.query_pages = config.query_pages
   } catch (err) {
-    loadError.value = typeof err === 'string' ? err : JSON.stringify(err)
+    loadError.value = errorMessage(err)
   }
 }
 
@@ -87,7 +89,7 @@ async function loadRecentVaults(): Promise<void> {
   try {
     recentVaults.value = await invoke<RecentVault[]>('list_recent_vaults')
   } catch (err) {
-    vaultsError.value = typeof err === 'string' ? err : JSON.stringify(err)
+    vaultsError.value = errorMessage(err)
   }
 }
 
@@ -126,7 +128,7 @@ async function saveConfig(): Promise<void> {
     }, 2000)
   } catch (err) {
     saveState.value = 'idle'
-    saveError.value = typeof err === 'string' ? err : JSON.stringify(err)
+    saveError.value = errorMessage(err)
   }
 }
 
@@ -140,9 +142,26 @@ async function runTestConnection(key: 'fast' | 'strong'): Promise<void> {
       tier: toModelTier(form[key]),
     })
   } catch (err) {
-    testError[key] = typeof err === 'string' ? err : JSON.stringify(err)
+    testError[key] = errorMessage(err)
   } finally {
     testing[key] = false
+  }
+}
+
+/** 打开最近列表中的一个 Vault：设为应用「当前 Vault」并刷新
+ * last-opened 时间戳（经 add_recent_vault upsert，列表按最近重排）。
+ * T2 到此为止——Vault 浏览 / 工作区是 T4 的范围。 */
+async function openRecentVault(v: RecentVault): Promise<void> {
+  openingPath.value = v.path
+  vaultsError.value = null
+  try {
+    await invoke('add_recent_vault', { path: v.path, templateId: v.template_id })
+    currentVault.value = { path: v.path, templateId: v.template_id }
+    await loadRecentVaults()
+  } catch (err) {
+    vaultsError.value = errorMessage(err)
+  } finally {
+    openingPath.value = null
   }
 }
 
@@ -152,8 +171,9 @@ async function removeRecentVault(path: string): Promise<void> {
   try {
     await invoke('remove_recent_vault', { path })
     recentVaults.value = recentVaults.value.filter((v) => v.path !== path)
+    if (currentVault.value?.path === path) currentVault.value = null
   } catch (err) {
-    vaultsError.value = typeof err === 'string' ? err : JSON.stringify(err)
+    vaultsError.value = errorMessage(err)
   } finally {
     removingPath.value = null
   }
@@ -274,26 +294,42 @@ async function removeRecentVault(path: string): Promise<void> {
       <section class="card">
         <div class="section-head">
           <h3>最近打开的 Vault</h3>
-          <span class="hint-inline">创建 Vault 后自动登记；移除只动列表，不删文件</span>
+          <span class="hint-inline">「打开」设为当前 Vault 并置顶；移除只动列表，不删文件</span>
         </div>
         <p v-if="vaultsError" class="test-err">{{ vaultsError }}</p>
         <p v-else-if="recentVaults.length === 0" class="hint">暂无记录。</p>
         <ul v-else class="vault-list">
-          <li v-for="v in recentVaults" :key="v.path" class="vault-row">
+          <li
+            v-for="v in recentVaults"
+            :key="v.path"
+            class="vault-row"
+            :class="{ current: currentVault?.path === v.path }"
+          >
             <div class="vault-info">
               <code class="vault-path" :title="v.path">{{ v.path }}</code>
               <span class="vault-meta">
                 {{ templateDisplayName(v.template_id) }} · {{ formatDateTime(v.opened_at) }}
+                <em v-if="currentVault?.path === v.path" class="current-mark">当前</em>
               </span>
             </div>
-            <button
-              type="button"
-              class="btn small"
-              :disabled="removingPath === v.path"
-              @click="removeRecentVault(v.path)"
-            >
-              {{ removingPath === v.path ? '移除中…' : '移除' }}
-            </button>
+            <div class="vault-actions">
+              <button
+                type="button"
+                class="btn small primary"
+                :disabled="openingPath === v.path || removingPath === v.path"
+                @click="openRecentVault(v)"
+              >
+                {{ openingPath === v.path ? '打开中…' : '打开' }}
+              </button>
+              <button
+                type="button"
+                class="btn small"
+                :disabled="removingPath === v.path || openingPath === v.path"
+                @click="removeRecentVault(v.path)"
+              >
+                {{ removingPath === v.path ? '移除中…' : '移除' }}
+              </button>
+            </div>
           </li>
         </ul>
       </section>
@@ -509,6 +545,24 @@ async function removeRecentVault(path: string): Promise<void> {
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+.vault-row.current {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.vault-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+.current-mark {
+  margin-left: 4px;
+  font-style: normal;
+  color: var(--accent);
+  font-size: 12px;
 }
 
 .vault-info {

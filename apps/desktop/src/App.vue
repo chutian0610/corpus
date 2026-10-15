@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import SettingsPage from './components/SettingsPage.vue'
 import VaultCreatePage from './components/VaultCreatePage.vue'
+import { currentVault } from './vault-state'
 
 type PageId = 'create' | 'settings'
 
@@ -30,6 +31,13 @@ const page = ref<PageId>('create')
           设置
         </button>
       </div>
+      <span
+        v-if="currentVault"
+        class="current-vault"
+        :title="currentVault.path"
+      >
+        当前 Vault：{{ currentVault.path }}
+      </span>
     </nav>
     <VaultCreatePage v-if="page === 'create'" />
     <SettingsPage v-else />
@@ -60,6 +68,18 @@ const page = ref<PageId>('create')
   font-weight: 700;
   font-size: 17px;
   letter-spacing: 0.5px;
+}
+
+.current-vault {
+  margin-left: auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .tabs {

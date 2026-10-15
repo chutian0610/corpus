@@ -24,10 +24,12 @@ pub struct RecentVault {
     pub opened_at: DateTime<Utc>,
 }
 
+/// 分文件说明：注册表与配置**同库不同域**——配置回答「模型与行为怎么设」，
+/// 注册表回答「哪些 Vault 最近打开过」，分文件把两者的变化原因隔离开。
 impl ConfigStore {
     /// 列出最近打开的 Vault，按打开时间降序（最新在前）。
     pub fn list_recent_vaults(&self) -> Result<Vec<RecentVault>> {
-        let conn = self.conn.lock().expect("config db 连接锁中毒");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT path, template_id, opened_at FROM recent_vaults ORDER BY opened_at DESC",
         )?;
@@ -65,7 +67,7 @@ impl ConfigStore {
                     .join(", "),
             });
         }
-        let conn = self.conn.lock().expect("config db 连接锁中毒");
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO recent_vaults (path, template_id, opened_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(path) DO UPDATE SET
@@ -82,7 +84,7 @@ impl ConfigStore {
 
     /// 从注册表移除一个 Vault；返回是否确有删除（路径不存在则 `false`）。
     pub fn remove_recent_vault(&self, path: impl AsRef<Path>) -> Result<bool> {
-        let conn = self.conn.lock().expect("config db 连接锁中毒");
+        let conn = self.lock_conn();
         let removed = conn.execute(
             "DELETE FROM recent_vaults WHERE path = ?1",
             params![path.as_ref().to_string_lossy()],
@@ -96,14 +98,6 @@ mod tests {
     use super::*;
     use crate::template::{GENERIC, READING, RESEARCH};
 
-    /// TempDir 必须与 ConfigStore 一同存活：目录被删后连接写入会报
-    /// readonly database，故返回值持有两者。
-    fn store() -> (tempfile::TempDir, ConfigStore) {
-        let dir = tempfile::tempdir().expect("创建 tempdir 失败");
-        let store = ConfigStore::open(dir.path()).expect("打开 ConfigStore 失败");
-        (dir, store)
-    }
-
     fn sorted_paths(vaults: &[RecentVault]) -> Vec<String> {
         let mut paths: Vec<String> = vaults
             .iter()
@@ -115,13 +109,13 @@ mod tests {
 
     #[test]
     fn empty_registry_lists_nothing() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         assert!(store.list_recent_vaults().expect("列注册表失败").is_empty());
     }
 
     #[test]
     fn add_then_list_and_remove() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         store
             .add_recent_vault("/tmp/vault-a", &GENERIC.id)
             .expect("添加失败");
@@ -148,7 +142,7 @@ mod tests {
 
     #[test]
     fn readd_same_path_upserts_template_and_time() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         let before = Utc::now();
         store
             .add_recent_vault("/tmp/vault-a", &GENERIC.id)
@@ -167,7 +161,7 @@ mod tests {
 
     #[test]
     fn add_unknown_template_is_rejected() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         let err = store
             .add_recent_vault("/tmp/vault-x", &TemplateId::from("no-such-template"))
             .expect_err("未知模板应报错");
@@ -178,8 +172,7 @@ mod tests {
     /// 注册表真实落库：绕过公共 API 直读表行。
     #[test]
     fn registry_persists_real_rows_in_sqlite() {
-        let dir = tempfile::tempdir().expect("创建 tempdir 失败");
-        let store = ConfigStore::open(dir.path()).expect("打开失败");
+        let (dir, store) = ConfigStore::test_open();
         store
             .add_recent_vault("/tmp/vault-db", &GENERIC.id)
             .expect("添加失败");

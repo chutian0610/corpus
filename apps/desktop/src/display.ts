@@ -11,7 +11,11 @@ export function templateDisplayName(id: string, name?: string): string {
   return TEMPLATE_DISPLAY_NAMES[id] ?? name ?? id
 }
 
-/** provider id → 中文展示名（ProviderKind serde 值，见引擎 config.rs） */
+/** provider id → 中文展示名。
+ *
+ * 这是引擎 config.rs 中 PROVIDER_SPECS 单一数据源的**展示层镜像**
+ * （同 TEMPLATE_DISPLAY_NAMES 模式）：id 与顺序须与引擎侧保持一致；
+ * 引擎新增 provider 时此处同步补展示名，展示逻辑不回灌引擎。 */
 export const PROVIDER_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'openai', label: 'OpenAI' },
   { id: 'anthropic', label: 'Anthropic' },
@@ -23,4 +27,12 @@ export const PROVIDER_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
 export function formatDateTime(iso: string): string {
   const date = new Date(iso)
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
+}
+
+/** 把 Tauri invoke 抛出的错误统一转为可展示文本。
+ *
+ * Tauri 命令错误多为字符串，但结构化错误会以对象抛出——统一收敛到
+ * 这一出口，页面不再各自 `typeof err === 'string'` 判断。 */
+export function errorMessage(err: unknown): string {
+  return typeof err === 'string' ? err : JSON.stringify(err)
 }
