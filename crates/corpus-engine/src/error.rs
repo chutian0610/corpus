@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::template::TemplateId;
+
 /// Corpus 引擎错误。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -16,7 +18,7 @@ pub enum Error {
     #[error("未知模板 id：{id}（可用模板：{available}）")]
     UnknownTemplate {
         /// 传入的模板 id。
-        id: String,
+        id: TemplateId,
         /// 可用模板 id 列表（逗号分隔）。
         available: String,
     },

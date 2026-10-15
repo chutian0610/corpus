@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::git;
-use crate::template;
+use crate::template::{self, TemplateId};
 
 /// `create_vault` 的结果：Vault 位置与生成的骨架清单。
 #[derive(Debug, Clone, Serialize)]
@@ -16,7 +16,7 @@ pub struct VaultInfo {
     /// Vault 根目录（调用方传入的路径）。
     pub root: PathBuf,
     /// 所选模板 id。
-    pub template_id: String,
+    pub template_id: TemplateId,
     /// 所选模板展示名。
     pub template_name: String,
     /// 生成的骨架文件与目录（相对 `root`）。
@@ -48,11 +48,13 @@ const LOG_MD_HEADER: &str = "\
 /// 骨架清单（相对 root，用于 `VaultInfo::created_paths` 与界面展示）。
 const SKELETON: &[&str] = &[
     "raw/",
+    "raw/.gitkeep",
     "wiki/",
     "wiki/index.md",
     "wiki/log.md",
     "purpose.md",
     ".corpus/",
+    ".corpus/.gitkeep",
 ];
 
 /// 在 `path` 创建一个绑定 `template_id` 的新 Vault（公共 API）。
@@ -63,7 +65,7 @@ const SKELETON: &[&str] = &[
 /// - `path` 已存在（文件或目录）时报 [`Error::VaultPathExists`]，不覆盖；
 /// - `template_id` 非内置模板时报 [`Error::UnknownTemplate`]，不创建任何文件；
 /// - T1 阶段本操作不调用 LLM。
-pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &str) -> Result<VaultInfo> {
+pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result<VaultInfo> {
     let root = path.as_ref();
     if root.exists() {
         return Err(Error::VaultPathExists {
@@ -71,10 +73,10 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &str) -> Result<VaultI
         });
     }
     let template = template::template_by_id(template_id).ok_or_else(|| Error::UnknownTemplate {
-        id: template_id.to_string(),
+        id: template_id.clone(),
         available: template::builtin_templates()
             .iter()
-            .map(|t| t.id)
+            .map(|t| t.id.as_str())
             .collect::<Vec<_>>()
             .join(", "),
     })?;
@@ -83,6 +85,10 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &str) -> Result<VaultI
     fs::create_dir_all(root.join("raw"))?;
     fs::create_dir_all(root.join("wiki"))?;
     fs::create_dir_all(root.join(".corpus"))?;
+    // git 不跟踪空目录：raw/ 与 .corpus/ 放 .gitkeep 占位，
+    // 保证初始提交后克隆 / 回滚仍保留目录结构。
+    fs::write(root.join("raw/.gitkeep"), "")?;
+    fs::write(root.join(".corpus/.gitkeep"), "")?;
 
     // 内容目录
     fs::write(root.join("wiki/index.md"), INDEX_MD)?;
@@ -100,7 +106,7 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &str) -> Result<VaultI
 
     Ok(VaultInfo {
         root: root.to_path_buf(),
-        template_id: template.id.to_string(),
+        template_id: template.id.clone(),
         template_name: template.name.to_string(),
         created_paths: SKELETON.iter().map(|p| (*p).to_string()).collect(),
     })
