@@ -1,49 +1,16 @@
 //! create_vault 集成测试：只经引擎公共 API 驱动，断言落在真实文件系统
 //! （目录树、文件内容、git log）。LLM 接缝用 fake provider。
+//! 共享工具收敛在 `tests/common/mod.rs`（Rust 集成测试惯例）。
+
+mod common;
 
 use std::fs;
-use std::process::Command;
-use std::sync::{Arc, Mutex};
 
+use common::{fresh_vault_path, git, FakeProvider};
 use corpus_engine::{
     builtin_template_infos, builtin_templates, create_vault, template_by_id, Engine, Error,
-    Provider, Result, TemplateId, TemplateInfo,
+    TemplateId, TemplateInfo,
 };
-
-/// 记录全部 prompt 的 fake provider（scripted fake：原样回显）。
-#[derive(Clone, Default)]
-struct FakeProvider {
-    prompts: Arc<Mutex<Vec<String>>>,
-}
-
-impl Provider for FakeProvider {
-    fn complete(&self, prompt: &str) -> Result<String> {
-        self.prompts.lock().unwrap().push(prompt.to_string());
-        Ok(format!("fake: {prompt}"))
-    }
-}
-
-/// 在临时目录下造一个尚不存在的 vault 根路径。
-fn fresh_vault_path(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().expect("创建临时目录失败");
-    let root = dir.path().join(tag);
-    (dir, root)
-}
-
-/// 在 `repo` 内执行 git 并返回 stdout（测试断言用）。
-fn git(repo: &std::path::Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("执行 git 失败");
-    assert!(
-        output.status.success(),
-        "git {args:?} 失败：{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
 
 #[test]
 fn create_vault_creates_complete_skeleton_for_every_template() {

@@ -10,10 +10,10 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{Error, Result};
 
@@ -25,53 +25,110 @@ const CONFIG_KEY: &str = "app_config";
 
 /// LLM 供应方类型：决定 provider 工厂如何构造客户端（T2 调研笔记第 2 节）。
 ///
-/// serde 为小写蛇形字符串（如 `openai_compatible`），显式 rename 与
-/// [`ProviderKind::as_str`] 保持一致；更换供应商只改配置，引擎代码零改动。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// 序列化字符串、惯例 API key 环境变量名与全集顺序**只**定义在下方的
+/// [`PROVIDER_SPECS`] 单一数据源中（serde 为手写实现，从表派生）；
+/// 更换供应商只改配置，引擎代码零改动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     /// OpenAI 官方端点。
-    #[serde(rename = "openai")]
     OpenAI,
     /// Anthropic 官方端点（Messages API）。
-    #[serde(rename = "anthropic")]
     Anthropic,
     /// DeepSeek 官方端点（OpenAI 方言客户端）。
-    #[serde(rename = "deepseek")]
     DeepSeek,
     /// 任意 OpenAI 兼容端点：必须配置 base_url，工厂启用
     /// `Route::Chat` + system-instructions-as-messages 兜底。
-    #[serde(rename = "openai_compatible")]
     OpenAICompatible,
 }
 
+/// Provider 静态描述：[`ProviderKind`] 的单一数据源，新增供应方时
+/// 只改这张表与 enum 本体，serde / `as_str` / `default_api_key_env`
+/// / [`ProviderKind::all`] 全部自动跟随。
+struct ProviderSpec {
+    kind: ProviderKind,
+    /// serde / 展示 / 日志用 id 字符串（如 `openai_compatible`）。
+    id: &'static str,
+    /// 该供应方惯例的 API key 环境变量名；`openai_compatible` 无惯例
+    /// （自定义端点配自定义变量名），为 `None`。
+    default_api_key_env: Option<&'static str>,
+}
+
+const PROVIDER_SPECS: &[ProviderSpec] = &[
+    ProviderSpec {
+        kind: ProviderKind::OpenAI,
+        id: "openai",
+        default_api_key_env: Some("OPENAI_API_KEY"),
+    },
+    ProviderSpec {
+        kind: ProviderKind::Anthropic,
+        id: "anthropic",
+        default_api_key_env: Some("ANTHROPIC_API_KEY"),
+    },
+    ProviderSpec {
+        kind: ProviderKind::DeepSeek,
+        id: "deepseek",
+        default_api_key_env: Some("DEEPSEEK_API_KEY"),
+    },
+    ProviderSpec {
+        kind: ProviderKind::OpenAICompatible,
+        id: "openai_compatible",
+        default_api_key_env: None,
+    },
+];
+
 impl ProviderKind {
-    /// 全部供应方（展示顺序）。
-    pub const ALL: &'static [ProviderKind] = &[
-        ProviderKind::OpenAI,
-        ProviderKind::Anthropic,
-        ProviderKind::DeepSeek,
-        ProviderKind::OpenAICompatible,
-    ];
+    /// 全部供应方（顺序即 [`PROVIDER_SPECS`] 表序，展示用）。
+    pub fn all() -> impl Iterator<Item = ProviderKind> {
+        PROVIDER_SPECS.iter().map(|spec| spec.kind)
+    }
+
+    /// 本供应方在 [`PROVIDER_SPECS`] 中的描述项。
+    fn spec(self) -> &'static ProviderSpec {
+        PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.kind == self)
+            .expect("ProviderKind 必须在 PROVIDER_SPECS 表中（新增变体请同步表）")
+    }
+
+    /// 按 id 字符串反查（serde 反序列化路径）。
+    fn from_id(id: &str) -> Option<Self> {
+        PROVIDER_SPECS
+            .iter()
+            .find(|spec| spec.id == id)
+            .map(|spec| spec.kind)
+    }
 
     /// 该供应方惯例的 API key 环境变量名；`openai_compatible` 无惯例
     /// （自定义端点配自定义变量名），返回 `None`。
     pub fn default_api_key_env(self) -> Option<&'static str> {
-        match self {
-            ProviderKind::OpenAI => Some("OPENAI_API_KEY"),
-            ProviderKind::Anthropic => Some("ANTHROPIC_API_KEY"),
-            ProviderKind::DeepSeek => Some("DEEPSEEK_API_KEY"),
-            ProviderKind::OpenAICompatible => None,
-        }
+        self.spec().default_api_key_env
     }
 
     /// id 字符串（与 serde 表示一致，展示与日志用）。
     pub fn as_str(self) -> &'static str {
-        match self {
-            ProviderKind::OpenAI => "openai",
-            ProviderKind::Anthropic => "anthropic",
-            ProviderKind::DeepSeek => "deepseek",
-            ProviderKind::OpenAICompatible => "openai_compatible",
-        }
+        self.spec().id
+    }
+}
+
+/// serde 直接走 [`PROVIDER_SPECS`] 的 id，序列化结果与 `as_str` 一致。
+impl Serialize for ProviderKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// 未知 id 报错并列出全部可用 id（同样从 [`PROVIDER_SPECS`] 派生）。
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let id = <&str>::deserialize(deserializer)?;
+        ProviderKind::from_id(id).ok_or_else(|| {
+            let available = PROVIDER_SPECS
+                .iter()
+                .map(|spec| spec.id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            serde::de::Error::custom(format!("未知 provider：{id}（可用：{available}）"))
+        })
     }
 }
 
@@ -152,6 +209,41 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    /// 保存前即时校验：把「保存时就能发现」的配置错误挡在落盘之前，
+    /// 而不是等到连通测试 / 真实调用才暴露。
+    ///
+    /// 规则：两档模型名必须非空；`openai_compatible` 必须配置 base_url
+    /// （官方端点走默认地址，不强制）。违者报 [`Error::InvalidConfig`]，
+    /// 消息指明档位与原因。
+    pub fn validate(&self) -> Result<()> {
+        for (label, tier) in [
+            ("快速档（fast）", &self.fast),
+            ("强力档（strong）", &self.strong),
+        ] {
+            if tier.model.trim().is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "{label}模型名未填写（provider：{}）",
+                    tier.provider.as_str()
+                )));
+            }
+            if tier.provider == ProviderKind::OpenAICompatible
+                && tier
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "{label}使用 openai_compatible 端点时必须填写 base_url"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ModelTier {
     /// 指定 provider 的初始档位：模型名留空（视为尚未配置，连通测试会
     /// 给出明确错误），api_key_env 落回惯例名（`None`）。
@@ -174,6 +266,12 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    /// 锁住连接；持锁线程 panic 意味着进程已处于未定义状态，视为进程级
+    /// bug 直接 panic（统一信息，全部读写入口只经本辅助取锁）。
+    pub(crate) fn lock_conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().expect("config db 连接锁中毒")
+    }
+
     /// 打开 `{dir}/config.db`（不存在则创建）并执行迁移。
     ///
     /// `dir` 不存在时会先创建；壳层传入 `app_data_dir()`，测试传 tempdir。
@@ -205,7 +303,7 @@ impl ConfigStore {
 
     /// 读取应用配置；库中无记录时返回 [`AppConfig::default`]。
     pub fn get_config(&self) -> Result<AppConfig> {
-        let conn = self.conn.lock().expect("config db 连接锁中毒");
+        let conn = self.lock_conn();
         let json: Option<String> = conn
             .query_row(
                 "SELECT value FROM config WHERE key = ?1",
@@ -224,9 +322,13 @@ impl ConfigStore {
     }
 
     /// 保存应用配置（整体覆盖写）。
+    ///
+    /// 落盘前先做 [`AppConfig::validate`] 即时校验：模型名空缺、兼容端点
+    /// 缺 base_url 等本地可判定的错误在保存时即报出，不进库。
     pub fn set_config(&self, config: &AppConfig) -> Result<()> {
+        config.validate()?;
         let json = serde_json::to_string(config)?;
-        let conn = self.conn.lock().expect("config db 连接锁中毒");
+        let conn = self.lock_conn();
         conn.execute(
             "INSERT INTO config (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -236,21 +338,48 @@ impl ConfigStore {
     }
 }
 
+/// 测试辅助（config 与 registry 两处单测共用）：临时目录下打开 store。
+///
+/// TempDir 必须与 ConfigStore 一同存活——目录被删后连接写入会报
+/// readonly database，故返回值持有两者。
+#[cfg(test)]
+impl ConfigStore {
+    pub(crate) fn test_open() -> (tempfile::TempDir, ConfigStore) {
+        let dir = tempfile::tempdir().expect("创建 tempdir 失败");
+        let store = ConfigStore::open(dir.path()).expect("打开 ConfigStore 失败");
+        (dir, store)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::template::GENERIC;
     use std::io::Read;
 
-    fn store() -> (tempfile::TempDir, ConfigStore) {
-        let dir = tempfile::tempdir().expect("创建 tempdir 失败");
-        let store = ConfigStore::open(dir.path()).expect("打开 ConfigStore 失败");
-        (dir, store)
+    /// 通过 set_config 校验的合法配置（改动字段后仍须整体合法）。
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            fast: ModelTier {
+                provider: ProviderKind::OpenAI,
+                model: "gpt-5.2".into(),
+                base_url: None,
+                api_key_env: None,
+            },
+            strong: ModelTier {
+                provider: ProviderKind::Anthropic,
+                model: "claude-sonnet-4-6".into(),
+                base_url: None,
+                api_key_env: None,
+            },
+            apply_mode: ApplyMode::Manual,
+            query_pages: true,
+        }
     }
 
     #[test]
     fn default_config_when_db_empty() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         let config = store.get_config().expect("读取默认配置失败");
         assert_eq!(config, AppConfig::default());
         assert_eq!(config.apply_mode, ApplyMode::Manual);
@@ -262,7 +391,7 @@ mod tests {
 
     #[test]
     fn set_then_get_roundtrip_via_public_api() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         let config = AppConfig {
             fast: ModelTier {
                 provider: ProviderKind::OpenAICompatible,
@@ -287,7 +416,7 @@ mod tests {
     /// 配置必须真实落进 sqlite：绕过公共 API 直接读表内容断言。
     #[test]
     fn set_config_persists_real_row_in_sqlite() {
-        let (dir, store) = store();
+        let (dir, store) = ConfigStore::test_open();
         let config = AppConfig {
             fast: ModelTier {
                 provider: ProviderKind::DeepSeek,
@@ -295,7 +424,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
             },
-            ..AppConfig::default()
+            ..valid_config()
         };
         store.set_config(&config).expect("保存配置失败");
 
@@ -315,14 +444,64 @@ mod tests {
         assert_eq!(raw["query_pages"], true);
     }
 
+    /// 保存时即时校验：空模型名 / 兼容端点缺 base_url 拒绝落盘，
+    /// 错误消息指明档位与原因。
+    #[test]
+    fn set_config_rejects_empty_model_name() {
+        let (_dir, store) = ConfigStore::test_open();
+        let mut config = valid_config();
+        config.strong.model = "   ".into();
+        let err = store.set_config(&config).expect_err("空模型名应被拒绝");
+        assert!(
+            matches!(err, Error::InvalidConfig(ref msg) if msg.contains("strong") && msg.contains("模型名")),
+            "实际错误：{err}"
+        );
+        // 校验失败不得留下半成品：库中仍无配置记录，读回默认值
+        assert_eq!(store.get_config().expect("读取失败"), AppConfig::default());
+    }
+
+    #[test]
+    fn set_config_rejects_compatible_endpoint_without_base_url() {
+        let (_dir, store) = ConfigStore::test_open();
+        let mut config = valid_config();
+        config.fast = ModelTier {
+            provider: ProviderKind::OpenAICompatible,
+            model: "qwen3-max".into(),
+            base_url: None,
+            api_key_env: Some("GW_API_KEY".into()),
+        };
+        let err = store.set_config(&config).expect_err("缺 base_url 应被拒绝");
+        assert!(
+            matches!(err, Error::InvalidConfig(ref msg) if msg.contains("fast") && msg.contains("base_url")),
+            "实际错误：{err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_official_endpoints_without_base_url() {
+        // 官方端点（openai/anthropic/deepseek）base_url 可选：不填即合法
+        for provider in ProviderKind::all().filter(|p| *p != ProviderKind::OpenAICompatible) {
+            let mut config = valid_config();
+            config.fast = ModelTier {
+                provider,
+                model: "m".into(),
+                base_url: None,
+                api_key_env: None,
+            };
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{provider:?} 官方端点应免 base_url：{e}"));
+        }
+    }
+
     /// API key 值永不落盘：配置只含变量名，把一个伪造 key 值注入环境
     /// 并走完解析路径后，db 文件字节中不得出现该值。
     #[test]
     fn api_key_value_never_persists_to_db_file() {
         let secret_value = "corpus-fake-key-do-not-persist-9f8e7d";
         std::env::set_var("CORPUS_T2_FAKE_API_KEY", secret_value);
-        let (dir, store) = store();
-        let mut config = AppConfig::default();
+        let (dir, store) = ConfigStore::test_open();
+        let mut config = valid_config();
         config.fast.api_key_env = Some("CORPUS_T2_FAKE_API_KEY".into());
         store.set_config(&config).expect("保存配置失败");
 
@@ -347,10 +526,10 @@ mod tests {
 
     #[test]
     fn reopen_keeps_config() {
-        let (dir, store) = store();
+        let (dir, store) = ConfigStore::test_open();
         let config = AppConfig {
             query_pages: false,
-            ..AppConfig::default()
+            ..valid_config()
         };
         store.set_config(&config).expect("保存配置失败");
         drop(store);
@@ -392,10 +571,10 @@ mod tests {
     /// 注册表读写同库：配置保存后 recent_vaults 表仍可用（跨模块联动冒烟）。
     #[test]
     fn config_and_registry_share_one_db() {
-        let (_dir, store) = store();
+        let (_dir, store) = ConfigStore::test_open();
         let config = AppConfig {
             apply_mode: ApplyMode::Auto,
-            ..AppConfig::default()
+            ..valid_config()
         };
         store.set_config(&config).expect("保存配置失败");
         store
@@ -406,14 +585,30 @@ mod tests {
         assert_eq!(store.list_recent_vaults().expect("列注册表失败").len(), 1);
     }
 
+    /// 单一数据源派生的一致性：as_str / default_api_key_env / serde
+    /// 字符串三者互通，全集与顺序来自 PROVIDER_SPECS。
     #[test]
-    fn provider_kind_defaults() {
+    fn provider_kind_table_is_single_source_of_truth() {
+        assert_eq!(ProviderKind::all().count(), 4);
+        assert_eq!(ProviderKind::DeepSeek.as_str(), "deepseek");
         assert_eq!(
             ProviderKind::OpenAI.default_api_key_env(),
             Some("OPENAI_API_KEY")
         );
         assert_eq!(ProviderKind::OpenAICompatible.default_api_key_env(), None);
-        assert_eq!(ProviderKind::ALL.len(), 4);
-        assert_eq!(ProviderKind::DeepSeek.as_str(), "deepseek");
+
+        // serde 手写实现与 as_str 一致：全部 id 可 JSON 往返
+        for kind in ProviderKind::all() {
+            let json = serde_json::to_string(&kind).expect("序列化失败");
+            let back: ProviderKind = serde_json::from_str(&json).expect("反序列化失败");
+            assert_eq!(back, kind);
+        }
+
+        // 未知 id 报错并列出可用 id
+        let err =
+            serde_json::from_str::<ProviderKind>("\"nope\"").expect_err("未知 provider 应报错");
+        let msg = err.to_string();
+        assert!(msg.contains("nope"));
+        assert!(msg.contains("openai_compatible"));
     }
 }

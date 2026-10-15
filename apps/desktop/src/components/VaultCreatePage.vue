@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import { templateDisplayName } from '../display'
+import { errorMessage, templateDisplayName } from '../display'
 
 /** create_vault 命令的返回结构（字段为引擎 serde 的 snake_case） */
 interface VaultInfo {
@@ -25,7 +25,7 @@ const selectedTemplateId = ref<string | null>(null)
 const vaultPath = ref<string | null>(null)
 const creating = ref(false)
 const createdVault = ref<VaultInfo | null>(null)
-const errorMessage = ref<string | null>(null)
+const createError = ref<string | null>(null)
 
 onMounted(loadTemplates)
 
@@ -48,7 +48,7 @@ async function loadTemplates(): Promise<void> {
   try {
     templates.value = await invoke<TemplateInfo[]>('list_templates')
   } catch (err) {
-    templatesError.value = typeof err === 'string' ? err : JSON.stringify(err)
+    templatesError.value = errorMessage(err)
   }
 }
 
@@ -60,14 +60,14 @@ async function chooseDirectory(): Promise<void> {
   const dir = await open({ directory: true, multiple: false })
   if (typeof dir === 'string') {
     vaultPath.value = dir
-    errorMessage.value = null
+    createError.value = null
   }
 }
 
 async function createVault(): Promise<void> {
   if (!canCreate.value) return
   creating.value = true
-  errorMessage.value = null
+  createError.value = null
   createdVault.value = null
   try {
     createdVault.value = await invoke<VaultInfo>('create_vault', {
@@ -75,7 +75,7 @@ async function createVault(): Promise<void> {
       templateId: selectedTemplateId.value,
     })
   } catch (err) {
-    errorMessage.value = typeof err === 'string' ? err : JSON.stringify(err)
+    createError.value = errorMessage(err)
   } finally {
     creating.value = false
   }
@@ -174,9 +174,9 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
       </button>
     </div>
 
-    <section v-if="errorMessage" class="card result error">
+    <section v-if="createError" class="card result error">
       <h3>创建失败</h3>
-      <p class="error-text">{{ errorMessage }}</p>
+      <p class="error-text">{{ createError }}</p>
     </section>
 
     <section v-if="createdVault" class="card result success">
