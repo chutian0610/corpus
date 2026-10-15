@@ -239,6 +239,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::GENERIC;
     use std::io::Read;
 
     fn store() -> (tempfile::TempDir, ConfigStore) {
@@ -386,6 +387,23 @@ mod tests {
             tier.resolve_api_key(),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    /// 注册表读写同库：配置保存后 recent_vaults 表仍可用（跨模块联动冒烟）。
+    #[test]
+    fn config_and_registry_share_one_db() {
+        let (_dir, store) = store();
+        let config = AppConfig {
+            apply_mode: ApplyMode::Auto,
+            ..AppConfig::default()
+        };
+        store.set_config(&config).expect("保存配置失败");
+        store
+            .add_recent_vault("/tmp/some-vault", &GENERIC.id)
+            .expect("添加注册表失败");
+
+        assert_eq!(store.get_config().expect("读配置失败"), config);
+        assert_eq!(store.list_recent_vaults().expect("列注册表失败").len(), 1);
     }
 
     #[test]
