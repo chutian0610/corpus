@@ -1,0 +1,15 @@
+# Rust
+/target
+
+# Node / 前端
+node_modules/
+dist/
+
+# Tauri 构建生成
+apps/desktop/src-tauri/gen/schemas
+
+# 编辑器与系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
