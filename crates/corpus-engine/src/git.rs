@@ -27,29 +27,35 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// 先按 `primary` 执行 git 子命令，失败则回退到 `fallback` 重试一次。
+///
+/// 两次都失败时返回 `fallback` 的错误：`primary` 的失败多为能力不支持
+/// （旧版本 git、未配置提交身份），属预期回退；`fallback` 都失败才说明
+/// 命令真正有问题。
+fn run_git_with_fallback(repo: &Path, primary: &[&str], fallback: &[&str]) -> Result<String> {
+    run_git(repo, primary).or_else(|_| run_git(repo, fallback))
+}
+
 /// `git init` + 把当前全部内容作为初始提交。
 ///
 /// 提交身份优先沿用用户全局 git 配置；未配置时回退到 Corpus 引擎身份，
 /// 保证全新机器上也能完成初始提交。
 pub(super) fn init_with_initial_commit(repo: &Path, message: &str) -> Result<()> {
     // git 2.28+ 支持指定初始分支名；旧版本回退到默认分支。
-    if run_git(repo, &["init", "--branch", "main"]).is_err() {
-        run_git(repo, &["init"])?;
-    }
+    run_git_with_fallback(repo, &["init", "--branch", "main"], &["init"])?;
     run_git(repo, &["add", "--all"])?;
-    if run_git(repo, &["commit", "--message", message]).is_err() {
-        run_git(
-            repo,
-            &[
-                "-c",
-                "user.name=Corpus",
-                "-c",
-                "user.email=corpus@localhost",
-                "commit",
-                "--message",
-                message,
-            ],
-        )?;
-    }
+    run_git_with_fallback(
+        repo,
+        &["commit", "--message", message],
+        &[
+            "-c",
+            "user.name=Corpus",
+            "-c",
+            "user.email=corpus@localhost",
+            "commit",
+            "--message",
+            message,
+        ],
+    )?;
     Ok(())
 }

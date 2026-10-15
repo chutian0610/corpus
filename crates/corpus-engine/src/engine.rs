@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::error::Result;
 use crate::provider::Provider;
+use crate::template::TemplateId;
 use crate::vault::{self, VaultInfo};
 
 /// Corpus 引擎。
@@ -27,7 +28,11 @@ impl Engine {
     }
 
     /// 在 `path` 用 `template_id` 创建新 Vault，见 [`vault::create_vault`]。
-    pub fn create_vault<P: AsRef<Path>>(&self, path: P, template_id: &str) -> Result<VaultInfo> {
+    pub fn create_vault<P: AsRef<Path>>(
+        &self,
+        path: P,
+        template_id: &TemplateId,
+    ) -> Result<VaultInfo> {
         vault::create_vault(path, template_id)
     }
 }

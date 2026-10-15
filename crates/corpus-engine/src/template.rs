@@ -5,9 +5,67 @@
 //!
 //! v0.1 内置三个模板：Generic / Research / Reading。
 //! `schema_prompt` 与 `purpose_template` 在本票（T1）为合理初版，后续票据打磨。
+//!
+//! 模板清单的唯一访问通道是 [`builtin_templates`]（`BUILTIN_TEMPLATES`
+//! 常量已私有）；壳层下发用 [`builtin_template_infos`] 的元数据快照。
+
+use std::borrow::Cow;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// 模板 id 的 newtype：引擎与壳层各 API 边界的强类型引用。
+///
+/// serde 透明（JSON 中就是字符串）；可从任意字符串构造，但那只表示
+/// "一个模板 id"，是否为内置模板由 [`template_by_id`] 校验。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TemplateId(Cow<'static, str>);
+
+impl TemplateId {
+    /// 从静态字符串构造（内置模板常量定义用）。
+    const fn from_static(id: &'static str) -> Self {
+        Self(Cow::Borrowed(id))
+    }
+
+    /// id 字符串。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TemplateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for TemplateId {
+    fn from(id: &str) -> Self {
+        Self(Cow::Owned(id.to_string()))
+    }
+}
+
+impl From<String> for TemplateId {
+    fn from(id: String) -> Self {
+        Self(Cow::Owned(id))
+    }
+}
+
+/// 下发给壳层（Tauri / 未来的 CLI 与 MCP）的模板元数据快照：
+/// 前端模板选择器等界面元素的单一数据源，避免在壳层硬编码模板清单。
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateInfo {
+    /// 模板 id。
+    pub id: TemplateId,
+    /// 展示名。
+    pub name: &'static str,
+    /// 模板适用场景的一句话说明（选择器展示用）。
+    pub description: &'static str,
+}
 
 /// 模板特有的扩展页面类型声明（T1 留空，T13 完善）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageTypeSpec {
     /// 页面类型 id（小写单词，如 `book`）。
     pub id: &'static str,
@@ -18,10 +76,10 @@ pub struct PageTypeSpec {
 }
 
 /// Vault 创建时选定的页面类型组织方案（编译期常量）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WikiTemplate {
     /// 模板 id（小写单词，Vault 创建时以此引用）。
-    pub id: &'static str,
+    pub id: TemplateId,
     /// 展示名。
     pub name: &'static str,
     /// 模板适用场景的一句话说明（选择器展示用）。
@@ -38,7 +96,7 @@ pub struct WikiTemplate {
 
 /// 通用知识库模板：面向通用个人知识，适合大多数场景。
 pub const GENERIC: WikiTemplate = WikiTemplate {
-    id: "generic",
+    id: TemplateId::from_static("generic"),
     name: "Generic",
     description: "通用知识库：以 Entity / Concept / Topic 组织日常积累，适合大多数场景。",
     schema_prompt: "You are structuring knowledge for a generic personal wiki. \
@@ -62,7 +120,7 @@ provided by the engine.",
 
 /// 研究模板：面向课题研究，强调问题、方法与文献脉络。
 pub const RESEARCH: WikiTemplate = WikiTemplate {
-    id: "research",
+    id: TemplateId::from_static("research"),
     name: "Research",
     description: "研究：围绕课题的问题、方法与文献脉络组织页面，便于追源与对比。",
     schema_prompt: "You are structuring knowledge for a research vault. \
@@ -88,7 +146,7 @@ Respond in the JSON schema provided by the engine.",
 
 /// 阅读模板：面向长期阅读沉淀，强调书摘、人物与主题。
 pub const READING: WikiTemplate = WikiTemplate {
-    id: "reading",
+    id: TemplateId::from_static("reading"),
     name: "Reading",
     description: "阅读：以书摘、作者、人物与主题沉淀长期阅读，构建个人阅读图谱。",
     schema_prompt: "You are structuring knowledge for a reading vault. \
@@ -110,15 +168,29 @@ Respond in the JSON schema provided by the engine.",
     extended_page_types: &[],
 };
 
-/// 内置模板全集。
-pub const BUILTIN_TEMPLATES: &[WikiTemplate] = &[GENERIC, RESEARCH, READING];
+/// 内置模板全集（私有：对外唯一通道是 [`builtin_templates`]）。
+const BUILTIN_TEMPLATES: &[WikiTemplate] = &[GENERIC, RESEARCH, READING];
 
 /// 全部内置模板（按展示顺序）。
 pub fn builtin_templates() -> &'static [WikiTemplate] {
     BUILTIN_TEMPLATES
 }
 
+/// 全部内置模板的元数据快照（按展示顺序），供壳层下发。
+pub fn builtin_template_infos() -> Vec<TemplateInfo> {
+    builtin_templates()
+        .iter()
+        .map(|template| TemplateInfo {
+            id: template.id.clone(),
+            name: template.name,
+            description: template.description,
+        })
+        .collect()
+}
+
 /// 按 id 查找内置模板。
-pub fn template_by_id(id: &str) -> Option<&'static WikiTemplate> {
-    BUILTIN_TEMPLATES.iter().find(|template| template.id == id)
+pub fn template_by_id(id: &TemplateId) -> Option<&'static WikiTemplate> {
+    builtin_templates()
+        .iter()
+        .find(|template| &template.id == id)
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 
@@ -11,36 +11,29 @@ interface VaultInfo {
   created_paths: string[]
 }
 
-/** 模板选择项：id 与引擎编译期常量（generic / research / reading）对应 */
-interface TemplateOption {
+/** list_templates 命令的返回结构：模板清单的单一数据源来自引擎 */
+interface TemplateInfo {
   id: string
   name: string
   description: string
 }
 
-const templates: TemplateOption[] = [
-  {
-    id: 'generic',
-    name: '通用知识库',
-    description: '以 Entity / Concept / Topic 组织日常积累，适合大多数场景。',
-  },
-  {
-    id: 'research',
-    name: '研究',
-    description: '围绕课题的问题、方法与文献脉络组织页面，便于追源与对比。',
-  },
-  {
-    id: 'reading',
-    name: '阅读',
-    description: '以书摘、作者、人物与主题沉淀长期阅读，构建个人阅读图谱。',
-  },
-]
+/** 按 template id 的中文展示名（纯展示层翻译；列表与 id 集合以引擎下发为准） */
+const TEMPLATE_DISPLAY_NAMES: Record<string, string> = {
+  generic: '通用知识库',
+  research: '研究',
+  reading: '阅读',
+}
 
+const templates = ref<TemplateInfo[]>([])
+const templatesError = ref<string | null>(null)
 const selectedTemplateId = ref<string | null>(null)
 const vaultPath = ref<string | null>(null)
 const creating = ref(false)
 const createdVault = ref<VaultInfo | null>(null)
 const errorMessage = ref<string | null>(null)
+
+onMounted(loadTemplates)
 
 const canCreate = computed(
   () =>
@@ -56,6 +49,19 @@ const structureLines = computed(() => {
   const rootName = info.root.split('/').filter(Boolean).pop() ?? info.root
   return buildTreeLines(info.created_paths, rootName)
 })
+
+/** 展示名优先取中文映射，无映射时回退引擎下发的 name */
+function displayName(id: string, name: string): string {
+  return TEMPLATE_DISPLAY_NAMES[id] ?? name
+}
+
+async function loadTemplates(): Promise<void> {
+  try {
+    templates.value = await invoke<TemplateInfo[]>('list_templates')
+  } catch (err) {
+    templatesError.value = typeof err === 'string' ? err : JSON.stringify(err)
+  }
+}
 
 function selectTemplate(id: string): void {
   selectedTemplateId.value = id
@@ -135,7 +141,11 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
 
     <section class="card step">
       <h2>1 · 选择模板</h2>
-      <div class="template-grid">
+      <div v-if="templatesError" class="load-error">
+        <p>模板加载失败：{{ templatesError }}</p>
+      </div>
+      <div v-else-if="templates.length === 0" class="hint">正在加载模板…</div>
+      <div v-else class="template-grid">
         <button
           v-for="t in templates"
           :key="t.id"
@@ -144,7 +154,7 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
           :class="{ selected: selectedTemplateId === t.id }"
           @click="selectTemplate(t.id)"
         >
-          <span class="template-name">{{ t.name }}</span>
+          <span class="template-name">{{ displayName(t.id, t.name) }}</span>
           <span class="template-id">{{ t.id }}</span>
           <span class="template-desc">{{ t.description }}</span>
         </button>
@@ -189,7 +199,10 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
         </div>
         <div class="meta-row">
           <dt>模板</dt>
-          <dd>{{ createdVault.template_name }}（{{ createdVault.template_id }}）</dd>
+          <dd>
+            {{ displayName(createdVault.template_id, createdVault.template_name) }}
+            （{{ createdVault.template_id }}）
+          </dd>
         </div>
         <div class="meta-row">
           <dt>git</dt>
@@ -313,6 +326,12 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
   margin-top: 10px;
   font-size: 13px;
   color: var(--text-muted);
+}
+
+.load-error p {
+  font-size: 14px;
+  color: var(--danger);
+  word-break: break-all;
 }
 
 .actions {

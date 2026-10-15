@@ -16,6 +16,7 @@ pub use engine::Engine;
 pub use error::{Error, Result};
 pub use provider::{NullProvider, Provider};
 pub use template::{
-    builtin_templates, template_by_id, PageTypeSpec, WikiTemplate, GENERIC, READING, RESEARCH,
+    builtin_template_infos, builtin_templates, template_by_id, PageTypeSpec, TemplateId,
+    TemplateInfo, WikiTemplate, GENERIC, READING, RESEARCH,
 };
 pub use vault::{create_vault, VaultInfo};
