@@ -1,0 +1,279 @@
+//! [`LlmPort`] 的 Rig 实现：provider 工厂 + 真实「测试连通」。
+//!
+//! 全部在 `rig` feature 之后（默认开启；引擎可在无 rig feature 下编译
+//! 测试，见根 Cargo.toml）。rig 0.44 API 依据 T2 调研笔记第 2、3 节：
+//! - OpenAI 兼容端点走 `OpenAIConfig`，强制 `Route::Chat` 并启用
+//!   `with_system_instructions_as_messages()` 兜底（preamble 改走 input
+//!   里的 system 消息，兼容拒绝顶层 `instructions` 字段的后端）；
+//! - system prompt 经 `AgentBuilder::preamble()` 注入；
+//! - DynModel 是 `Clone`（Arc 内部），端口持有一次构造的模型即可。
+
+use rig::operation::Completion;
+use rig::providers::anthropic::AnthropicConfig;
+use rig::providers::openai::{OpenAIConfig, Route};
+use rig::{AgentBuilder, DynModel};
+
+use crate::config::{ModelTier, ProviderKind};
+use crate::error::{Error, Result};
+use crate::llm::{test_connection_with, ConnectionReport, LlmPort};
+
+/// LlmPort 的 Rig 实现：持有构造好的 `DynModel<Completion>`。
+pub struct RigLlmPort {
+    model: DynModel<Completion>,
+}
+
+#[async_trait::async_trait]
+impl LlmPort for RigLlmPort {
+    async fn complete(&self, system: Option<&str>, user: &str) -> Result<String> {
+        let mut builder = AgentBuilder::new(self.model.clone());
+        if let Some(system) = system {
+            builder = builder.preamble(system);
+        }
+        let agent = builder.build();
+        let response = agent
+            .prompt(user.to_string())
+            .max_turns(1)
+            .await
+            .map_err(|e| Error::Llm(e.to_string()))?;
+        Ok(response.output())
+    }
+}
+
+/// OpenAI 型（openai / openai_compatible）配置构造。
+///
+/// 独立成公共函数是为了让测试能直接断言配置对象上的
+/// `base_url` / 路由 / system prompt 兜底，而不必发起网络请求。
+pub fn openai_config(tier: &ModelTier, api_key: &str) -> Result<OpenAIConfig> {
+    match tier.provider {
+        ProviderKind::OpenAICompatible => {
+            let base_url = tier.base_url.as_deref().ok_or_else(|| {
+                Error::InvalidConfig("OpenAI 兼容端点必须配置 base_url".to_string())
+            })?;
+            // 兼容端点双兜底：Chat Completions 是唯一全方言保证的端点；
+            // system-instructions-as-messages 防后端忽略/拒绝顶层 instructions。
+            Ok(OpenAIConfig::new(api_key)
+                .with_base_url(base_url)
+                .with_route(Route::Chat)
+                .with_system_instructions_as_messages())
+        }
+        ProviderKind::OpenAI => {
+            let mut config = OpenAIConfig::new(api_key);
+            if let Some(base_url) = tier.base_url.as_deref() {
+                config = config.with_base_url(base_url);
+            }
+            Ok(config)
+        }
+        other => Err(Error::InvalidConfig(format!(
+            "openai_config 不适用于 provider：{}",
+            other.as_str()
+        ))),
+    }
+}
+
+/// Anthropic 配置构造（公共供测试断言 base_url 归一化，不发网络）。
+pub fn anthropic_config(tier: &ModelTier, api_key: &str) -> Result<AnthropicConfig> {
+    if tier.provider != ProviderKind::Anthropic {
+        return Err(Error::InvalidConfig(format!(
+            "anthropic_config 不适用于 provider：{}",
+            tier.provider.as_str()
+        )));
+    }
+    let mut config = AnthropicConfig::new(api_key);
+    if let Some(base_url) = tier.base_url.as_deref() {
+        config = config.with_base_url(base_url);
+    }
+    Ok(config)
+}
+
+/// 按档位构造 DynModel（provider 工厂；不发起网络请求）。
+///
+/// 更换供应商只改配置：工厂依据 [`ProviderKind`] 分派——
+/// - openai：`OpenAIConfig::client().completion(model)`（官方端点默认 Responses 线路）；
+/// - openai_compatible：`Route::Chat` + system prompt 兜底（见 [`openai_config`]）；
+/// - anthropic：`AnthropicConfig::client().completion(model)`；
+/// - deepseek：`deepseek::new` 预配置方言与 base_url，走 `.chat(model)`。
+pub fn build_model(tier: &ModelTier, api_key: &str) -> Result<DynModel<Completion>> {
+    if tier.model.trim().is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "模型名未配置（provider：{}）",
+            tier.provider.as_str()
+        )));
+    }
+    match tier.provider {
+        ProviderKind::OpenAI | ProviderKind::OpenAICompatible => Ok(openai_config(tier, api_key)?
+            .client()
+            .completion(tier.model.clone())
+            .into()),
+        ProviderKind::Anthropic => Ok(anthropic_config(tier, api_key)?
+            .client()
+            .completion(tier.model.clone())
+            .into()),
+        ProviderKind::DeepSeek => {
+            if tier.base_url.is_some() {
+                return Err(Error::InvalidConfig(
+                    "DeepSeek 端点固定，不支持自定义 base_url；自建网关请改用 openai_compatible"
+                        .to_string(),
+                ));
+            }
+            Ok(rig::providers::deepseek::new(api_key)
+                .chat(tier.model.clone())
+                .into())
+        }
+    }
+}
+
+/// 按档位构造端口：校验配置 → 从环境变量解析 key → 工厂建模型。
+pub fn build_llm_port(tier: &ModelTier) -> Result<RigLlmPort> {
+    let api_key = tier.resolve_api_key()?;
+    Ok(RigLlmPort {
+        model: build_model(tier, &api_key)?,
+    })
+}
+
+/// 真实「测试连通」：按 `tier` 构造端口并发起一次最小补全调用。
+///
+/// 本地可判定的失败（模型名未配置、key 环境变量未设置、兼容端点缺
+/// base_url）以 [`Error::InvalidConfig`] / [`Error::MissingApiKey`] 报告；
+/// 远端失败以 [`Error::Llm`] 报告。均不发任何回退网络请求。
+pub async fn test_connection(tier: &ModelTier) -> Result<ConnectionReport> {
+    test_connection_with(&build_llm_port(tier)?).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::providers::openai::responses_api::SystemInstructionsPlacement;
+
+    fn tier(provider: ProviderKind, model: &str, base_url: Option<&str>) -> ModelTier {
+        ModelTier {
+            provider,
+            model: model.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_key_env: None,
+        }
+    }
+
+    /// 票据验收：provider 工厂对 OpenAI 兼容端点启用 system prompt 兜底。
+    #[test]
+    fn openai_compatible_config_enables_system_prompt_fallback_and_chat_route() {
+        let config = openai_config(
+            &tier(
+                ProviderKind::OpenAICompatible,
+                "some-model",
+                Some("https://gw.example.com/v1"),
+            ),
+            "key",
+        )
+        .expect("构造兼容端点配置失败");
+        assert_eq!(config.base_url, "https://gw.example.com/v1");
+        assert_eq!(config.completion_route(), Route::Chat);
+        assert_eq!(
+            config.system_instructions_placement(),
+            SystemInstructionsPlacement::InputSystemMessages,
+            "兼容端点必须把 preamble 改走 input 里的 system 消息"
+        );
+    }
+
+    /// 官方 OpenAI 不动默认策略（Responses 线路 + 顶层 instructions），
+    /// 只显式配置了 base_url 时才覆盖。
+    #[test]
+    fn plain_openai_keeps_dialect_defaults() {
+        let config = openai_config(&tier(ProviderKind::OpenAI, "gpt-5.2", None), "key")
+            .expect("构造 OpenAI 配置失败");
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.completion_route(), Route::Responses);
+        assert_eq!(
+            config.system_instructions_placement(),
+            SystemInstructionsPlacement::Instructions
+        );
+
+        let overridden = openai_config(
+            &tier(
+                ProviderKind::OpenAI,
+                "gpt-5.2",
+                Some("https://proxy.internal/v1"),
+            ),
+            "key",
+        )
+        .expect("构造自定义 base_url 配置失败");
+        assert_eq!(overridden.base_url, "https://proxy.internal/v1");
+    }
+
+    #[test]
+    fn openai_compatible_requires_base_url() {
+        let err = openai_config(&tier(ProviderKind::OpenAICompatible, "m", None), "key")
+            .expect_err("缺 base_url 应报错");
+        assert!(matches!(err, Error::InvalidConfig(ref msg) if msg.contains("base_url")));
+    }
+
+    #[test]
+    fn anthropic_config_applies_and_normalizes_base_url() {
+        let config = anthropic_config(
+            &tier(ProviderKind::Anthropic, "claude-sonnet-4-6", None),
+            "key",
+        )
+        .expect("构造 Anthropic 配置失败");
+        assert_eq!(config.base_url, "https://api.anthropic.com");
+
+        let custom = anthropic_config(
+            &tier(
+                ProviderKind::Anthropic,
+                "claude-sonnet-4-6",
+                Some("https://gw.example.com"),
+            ),
+            "key",
+        )
+        .expect("构造 Anthropic 自定义端点失败");
+        assert_eq!(custom.base_url, "https://gw.example.com");
+    }
+
+    /// 工厂构造不发起网络请求：直接断言 DynModel 上的 provider 名与模型 id。
+    #[test]
+    fn build_model_addresses_the_requested_model() {
+        let model = build_model(
+            &tier(
+                ProviderKind::OpenAICompatible,
+                "qwen3-max",
+                Some("https://gw/v1"),
+            ),
+            "key",
+        )
+        .expect("构造 DynModel 失败");
+        assert_eq!(model.name(), "openai");
+        assert_eq!(model.id(), Some("qwen3-max"));
+    }
+
+    #[test]
+    fn build_model_rejects_empty_model_name() {
+        let err = build_model(&tier(ProviderKind::OpenAI, "  ", None), "key")
+            .expect_err("空模型名应报错");
+        assert!(matches!(err, Error::InvalidConfig(ref msg) if msg.contains("模型名")));
+    }
+
+    #[test]
+    fn build_model_rejects_deepseek_with_base_url() {
+        let err = build_model(
+            &tier(
+                ProviderKind::DeepSeek,
+                "deepseek-v4-flash",
+                Some("https://x"),
+            ),
+            "key",
+        )
+        .expect_err("DeepSeek + base_url 应报错");
+        assert!(matches!(err, Error::InvalidConfig(ref msg) if msg.contains("openai_compatible")));
+    }
+
+    /// 本地可判定失败不依赖环境：缺 key 变量时 build_llm_port 直接报
+    /// MissingApiKey（变量名取 provider 惯例）。
+    #[test]
+    fn build_llm_port_requires_api_key_env() {
+        let mut t = tier(ProviderKind::OpenAI, "gpt-5.2", None);
+        t.api_key_env = Some("CORPUS_T2_RIG_DEFINITELY_UNSET".to_string());
+        match build_llm_port(&t) {
+            Err(Error::MissingApiKey { env }) => assert_eq!(env, "CORPUS_T2_RIG_DEFINITELY_UNSET"),
+            Ok(_) => panic!("期望 MissingApiKey，实际成功构造"),
+            Err(other) => panic!("期望 MissingApiKey，实际 {other}"),
+        }
+    }
+}
