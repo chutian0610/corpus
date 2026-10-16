@@ -8,6 +8,7 @@
  * 响应字段均为引擎 serde 的 snake_case。
  */
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export interface TemplateInfo {
   id: string
@@ -47,6 +48,36 @@ export interface RecentVault {
   opened_at: string
 }
 
+/** 页面类型（引擎 PageKind serde 表示）。 */
+export type PageKind = 'source' | 'entity' | 'concept'
+
+/** 页面动作：新建 / 精确名命中更新。 */
+export type PageAction = 'create' | 'update'
+
+/** Ingest 产出 / 更新的单个页面。 */
+export interface IngestedPage {
+  path: string
+  title: string
+  page_type: PageKind
+  action: PageAction
+}
+
+/** ingest_file 的结果：跳过路径（指纹命中）或完整产出快照。 */
+export interface IngestReport {
+  skipped: boolean
+  fingerprint: string
+  source_title: string
+  pages: IngestedPage[]
+  commit: string | null
+}
+
+/** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。 */
+export type IngestProgress =
+  | { stage: 'reading'; raw: string }
+  | { stage: 'analyzing' }
+  | { stage: 'generating'; pages: number }
+  | { stage: 'applying'; pages: number }
+
 export function listTemplates(): Promise<TemplateInfo[]> {
   return invoke<TemplateInfo[]>('list_templates')
 }
@@ -77,4 +108,16 @@ export function addRecentVault(path: string, templateId: string): Promise<void> 
 
 export function removeRecentVault(path: string): Promise<void> {
   return invoke('remove_recent_vault', { path })
+}
+
+export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport> {
+  return invoke<IngestReport>('ingest_file', { vaultPath, rawPath })
+}
+
+/**
+ * 订阅 Ingest 进度事件；返回的 unlisten 必须在组件卸载时调用
+ * （SPA 路由切换不会自动注销，见 T3 调研笔记第 4 节）。
+ */
+export function onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
+  return listen<IngestProgress>('ingest-progress', (e) => handler(e.payload))
 }
