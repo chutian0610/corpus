@@ -7,8 +7,8 @@ use crate::template::TemplateId;
 /// Corpus 引擎错误。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// create_vault 的目标路径已存在：拒绝覆盖，保持原样。
-    #[error("目标路径已存在，拒绝覆盖：{path}")]
+    /// create_vault 的目标路径已存在且非空：拒绝覆盖，保持原样。
+    #[error("目标路径已存在且非空，拒绝覆盖：{path}")]
     VaultPathExists {
         /// 已存在的路径。
         path: PathBuf,
