@@ -42,6 +42,15 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// 页面相对路径非法（read_page 等只读入口的路径安全校验）。
+    #[error("非法页面路径：{path}（{reason}）")]
+    InvalidPagePath {
+        /// 被拒绝的相对路径原样。
+        path: String,
+        /// 具体原因（绝对路径 / `..` 逃逸 / 非 `.md` / 解析逃出 Vault 等）。
+        reason: String,
+    },
+
     /// Ingest 的 raw 文件不在 Vault 的 raw/ 目录内。
     #[error("raw 文件必须在 Vault 的 raw/ 目录内：{}（Vault：{}）", raw.display(), vault.display())]
     RawNotInVault {

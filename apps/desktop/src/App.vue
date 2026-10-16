@@ -32,8 +32,8 @@ onMounted(async () => {
   try {
     const recent = await listRecentVaults()
     if (recent.length > 0) {
-      // 自动恢复最近打开的 Vault；打不开（目录被移走 / 非 Vault）静默
-      // 回启动页，错误经 startupError 展示
+      // 自动恢复最近打开的 Vault；打不开（目录被移走 / 非 Vault）回启动页，
+      // 错误经 startupError 醒目展示在启动页顶部（非静默）
       await openVault(recent[0].path)
     }
   } catch (err) {

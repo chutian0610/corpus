@@ -9,10 +9,9 @@
 //! 清单（完整人审流程属票据 T5）。
 //! T-UX：应用壳两级结构（启动页 + 工作区）的支撑命令——`open_vault`
 //! （引擎校验 + 最近列表登记）、`list_pages`（页面树）、`read_page`
-//! （预览用只读取文）；`add_recent_vault` 退役（「打开」统一走
-//! `open_vault` 的校验口径，不再允许无校验登记）。
-
-use std::path::{Component, Path};
+//! （预览用只读文本，路径安全由引擎 `resolve_page_path` 校验）；
+//! `add_recent_vault` 退役（「打开」统一走 `open_vault` 的校验口径，
+//! 不再允许无校验登记）。
 
 use corpus_engine::{
     AppConfig, ApplyMode, ConfigStore, ConnectionReport, IngestOutcome, IngestReport, IngestStage,
@@ -152,20 +151,15 @@ async fn list_pages(vault_path: String) -> Result<PageTree, String> {
 
 /// 只读读取 `wiki/` 下某页面的原始文本（预览面板；正式渲染属 T4）。
 ///
-/// 路径安全：`rel_path` 必须是不含 `..` 的相对 `.md` 路径，拼接后
-/// 不会逃出 `wiki/`。
+/// 路径安全全部由引擎 [`corpus_engine::resolve_page_path`] 单一关口承担
+/// （拒绝绝对路径 / `..` / 非 `.md`，canonicalize 断言不逃出 Vault）；
+/// 读取前先对 `vault_path` 跑 `open_vault` 级校验（`.corpus/vault.json`
+/// 存在且模板可解析），与「打开」同一口径。
 #[tauri::command]
 async fn read_page(vault_path: String, rel_path: String) -> Result<String, String> {
-    let rel = Path::new(&rel_path);
-    if rel.is_absolute()
-        || rel.components().any(|c| matches!(c, Component::ParentDir))
-        || rel.extension().and_then(|e| e.to_str()) != Some("md")
-    {
-        return Err(format!(
-            "非法页面路径：{rel_path}（必须是 wiki/ 内的相对 .md 路径）"
-        ));
-    }
-    let full = Path::new(&vault_path).join("wiki").join(rel);
+    corpus_engine::open_vault(&vault_path).map_err(|e| e.to_string())?;
+    let full =
+        corpus_engine::resolve_page_path(&vault_path, &rel_path).map_err(|e| e.to_string())?;
     std::fs::read_to_string(&full).map_err(|e| format!("读取 {} 失败：{e}", full.display()))
 }
 
