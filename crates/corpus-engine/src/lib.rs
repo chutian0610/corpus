@@ -32,4 +32,4 @@ pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, PageTypeSpec, TemplateId,
     TemplateInfo, WikiTemplate, GENERIC, READING, RESEARCH,
 };
-pub use vault::{create_vault, VaultInfo};
+pub use vault::{create_vault, vault_template_id, VaultInfo, VaultMeta};
