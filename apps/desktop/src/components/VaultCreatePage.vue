@@ -1,23 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
+import { createVault, listTemplates, type TemplateInfo, type VaultInfo } from '../api'
 import { errorMessage, templateDisplayName } from '../display'
-
-/** create_vault 命令的返回结构（字段为引擎 serde 的 snake_case） */
-interface VaultInfo {
-  root: string
-  template_id: string
-  template_name: string
-  created_paths: string[]
-}
-
-/** list_templates 命令的返回结构：模板清单的单一数据源来自引擎 */
-interface TemplateInfo {
-  id: string
-  name: string
-  description: string
-}
 
 const templates = ref<TemplateInfo[]>([])
 const templatesError = ref<string | null>(null)
@@ -46,7 +31,7 @@ const structureLines = computed(() => {
 
 async function loadTemplates(): Promise<void> {
   try {
-    templates.value = await invoke<TemplateInfo[]>('list_templates')
+    templates.value = await listTemplates()
   } catch (err) {
     templatesError.value = errorMessage(err)
   }
@@ -64,16 +49,13 @@ async function chooseDirectory(): Promise<void> {
   }
 }
 
-async function createVault(): Promise<void> {
+async function handleCreate(): Promise<void> {
   if (!canCreate.value) return
   creating.value = true
   createError.value = null
   createdVault.value = null
   try {
-    createdVault.value = await invoke<VaultInfo>('create_vault', {
-      path: vaultPath.value,
-      templateId: selectedTemplateId.value,
-    })
+    createdVault.value = await createVault(vaultPath.value!, selectedTemplateId.value!)
   } catch (err) {
     createError.value = errorMessage(err)
   } finally {
@@ -168,7 +150,7 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
         type="button"
         class="btn primary"
         :disabled="!canCreate"
-        @click="createVault"
+        @click="handleCreate"
       >
         {{ creating ? '创建中…' : '创建 Vault' }}
       </button>
