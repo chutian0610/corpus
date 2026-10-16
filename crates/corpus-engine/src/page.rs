@@ -27,6 +27,12 @@ pub enum PageKind {
 }
 
 impl PageKind {
+    /// 全部页面类型（固定顺序：Source / Entity / Concept）。
+    ///
+    /// 遍历各类型目录的代码（如 [`crate::wiki::list_pages`]）从这里取
+    /// 清单，不各自硬编码，新增类型时只改这一处。
+    pub const ALL: [PageKind; 3] = [PageKind::Source, PageKind::Entity, PageKind::Concept];
+
     /// 单一数据源：该类型页面在 `wiki/` 下的子目录名与 `type` 字段取值
     /// （`.0` 为 dir、`.1` 为 id），dir()/as_str() 都从这里派生。
     fn parts(self) -> (&'static str, &'static str) {
