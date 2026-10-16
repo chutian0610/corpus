@@ -27,22 +27,24 @@ pub enum PageKind {
 }
 
 impl PageKind {
+    /// 单一数据源：该类型页面在 `wiki/` 下的子目录名与 `type` 字段取值
+    /// （`.0` 为 dir、`.1` 为 id），dir()/as_str() 都从这里派生。
+    fn parts(self) -> (&'static str, &'static str) {
+        match self {
+            PageKind::Source => ("sources", "source"),
+            PageKind::Entity => ("entities", "entity"),
+            PageKind::Concept => ("concepts", "concept"),
+        }
+    }
+
     /// 该类型页面在 `wiki/` 下的子目录名。
     pub fn dir(self) -> &'static str {
-        match self {
-            PageKind::Source => "sources",
-            PageKind::Entity => "entities",
-            PageKind::Concept => "concepts",
-        }
+        self.parts().0
     }
 
     /// frontmatter `type` 字段的取值（与 serde 表示一致）。
     pub fn as_str(self) -> &'static str {
-        match self {
-            PageKind::Source => "source",
-            PageKind::Entity => "entity",
-            PageKind::Concept => "concept",
-        }
+        self.parts().1
     }
 }
 
@@ -294,6 +296,21 @@ mod tests {
         assert_eq!(slugify("《深度学习》"), "深度学习");
         assert_eq!(slugify("???"), "untitled");
         assert_eq!(slugify("v1.2 release"), "v1-2-release");
+    }
+
+    #[test]
+    fn page_kind_dir_and_str_come_from_single_table() {
+        // dir / as_str / serde 三者从同一 match 派生，断言互一致防漂移
+        for (kind, dir, id) in [
+            (PageKind::Source, "sources", "source"),
+            (PageKind::Entity, "entities", "entity"),
+            (PageKind::Concept, "concepts", "concept"),
+        ] {
+            assert_eq!(kind.dir(), dir);
+            assert_eq!(kind.as_str(), id);
+            let yaml = serde_yaml_ng::to_string(&kind).unwrap();
+            assert!(yaml.contains(id), "serde 表示须与 as_str 一致：{yaml}");
+        }
     }
 
     #[test]

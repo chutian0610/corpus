@@ -1,16 +1,17 @@
 //! Ingest 管道：把一个 raw source 编译进 Wiki（票据 T3，核心 tracer）。
 //!
-//! 流程（单文件）：
-//! 1. 读取 raw 文件并计算 SHA-256；指纹未变则跳过整个管道（零 LLM 调用）；
-//! 2. 第一步（fast 档）：注入模板 `schema_prompt` 的结构化分析，引擎侧
-//!    解析 JSON（容错提取 + 失败重试一次，再失败报错且零写入）；
-//! 3. 精确名去重：分析产出的 title/alias 与既有页面 frontmatter 精确
-//!    匹配（不区分大小写）→ 更新既有页而非新建；
-//! 4. 第二步（strong 档）：一次调用为 Source page 与每个 Entity/Concept
-//!    成文（Markdown，含 `[[wikilink]]`）；
-//! 5. Draft（内存变更集，可整体检视/丢弃）→ 自动 Apply：全页面原子写 +
-//!    git add/commit（恰好一个提交）+ log.md 追加 + index.md 增量更新；
-//!    任一步失败恢复快照，不留半写状态。
+//! 两段式公共 API（Apply 语义见 CONTEXT.md「Apply」）：
+//! - [`ingest`]（第一步，不落盘）：读取 raw 并计算 SHA-256，指纹未变则
+//!   跳过整个管道（零 LLM 调用）；fast 档结构化分析（容错提取 + 失败
+//!   重试一次，再失败报错且零写入）→ 精确名去重（title/alias 与既有页
+//!   frontmatter 不区分大小写匹配 → 更新而非新建）→ strong 档一次调用
+//!   为 Source page 与每个 Entity/Concept 成文 → 组装 [`IngestDraft`]
+//!   （内存变更集，可整体检视/丢弃，不产生任何写入与提交）；
+//! - [`apply`]（第二步，显式落盘）：全页面原子写 + git add/commit
+//!   （恰好一个提交）+ log.md 追加 + index.md 增量更新 + 指纹记录；
+//!   任一步失败恢复快照并清空暂存区，不留半写状态。
+//!   自动执行还是人审触发由配置 `apply_mode` 决定，引擎不预设——
+//!   壳层读到 `manual` 时不调 apply，Draft 留待人审。
 //!
 //! 引擎不依赖 tauri：进度经 `on_progress: impl FnMut(IngestStage)` 回调
 //! 上报（见 T3 调研笔记第 4 节架构提示），壳层负责转成事件。
@@ -26,7 +27,9 @@ use crate::error::{Error, Result};
 use crate::fingerprint::{sha256_hex, StateStore};
 use crate::git;
 use crate::llm::LlmPort;
-use crate::page::{parse_page, slugify, PageAction, PageDraft, PageFrontmatter, PageKind};
+use crate::page::{
+    parse_page, slugify, wikilink, PageAction, PageDraft, PageFrontmatter, PageKind,
+};
 use crate::template::{template_by_id, WikiTemplate};
 use crate::vault::vault_template_id;
 
@@ -57,40 +60,42 @@ pub enum IngestStage {
 }
 
 /// 第一步（fast 档）的 JSON 输出目标：实体/概念列表与 Source 元信息。
+///
+/// 仅本模块内部使用（解析 LLM 输出），不属于公共 API。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct AnalysisOutcome {
+struct AnalysisOutcome {
     /// Source page 标题（空则引擎回退 raw 文件名）。
     #[serde(default)]
-    pub source_title: String,
+    source_title: String,
     /// 原始文档摘要（供第二步成文）。
     #[serde(default)]
-    pub source_summary: String,
+    source_summary: String,
     /// 实体页面清单。
     #[serde(default)]
-    pub entities: Vec<AnalyzedPage>,
+    entities: Vec<AnalyzedPage>,
     /// 概念页面清单。
     #[serde(default)]
-    pub concepts: Vec<AnalyzedPage>,
+    concepts: Vec<AnalyzedPage>,
 }
 
-/// 第一步产出的单个页面条目。
+/// 第一步产出的单个页面条目（仅本模块内部使用）。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct AnalyzedPage {
+struct AnalyzedPage {
     /// 页面标题（必填，空则引擎丢弃该条目）。
     #[serde(default)]
-    pub title: String,
+    title: String,
     /// 别名（跨语言 / 缩写）。
     #[serde(default)]
-    pub aliases: Vec<String>,
+    aliases: Vec<String>,
     /// 标签。
     #[serde(default)]
-    pub tags: Vec<String>,
+    tags: Vec<String>,
     /// 该条目在原文中的要点（供第二步成文）。
     #[serde(default)]
-    pub summary: String,
+    summary: String,
     /// 相关页面标题（引擎解析为 wikilink）。
     #[serde(default)]
-    pub related: Vec<String>,
+    related: Vec<String>,
 }
 
 /// 第二步（strong 档）的 JSON 输出目标：每个计划页面的正文。
@@ -108,6 +113,20 @@ struct WrittenPage {
     body: String,
 }
 
+/// 降级页标注：第二步 LLM 漏产出该页正文、以分析摘要兜底时的显式标记
+/// （产出索引与 Draft 检视清单都会带上，可 grep）。
+pub const DEGRADED_NOTE: &str = "（降级：模型未产出，摘要兜底）";
+
+/// Source page 的原文指针：raw 相对路径 + 内容 SHA-256（frontmatter 的
+/// `raw_path` / `fingerprint` 专有字段对，仅 Source page 使用）。
+#[derive(Debug, Clone, Copy)]
+pub struct RawPointer<'a> {
+    /// raw source 在 Vault 内的相对路径。
+    pub raw_path: &'a str,
+    /// raw source 内容的 SHA-256。
+    pub fingerprint: &'a str,
+}
+
 /// Draft：一次 Ingest 的内存变更集，可整体检视或丢弃（[`IngestDraft::discard`]）。
 #[derive(Debug, Clone)]
 pub struct IngestDraft {
@@ -119,26 +138,61 @@ pub struct IngestDraft {
     pub fingerprint: String,
     /// 全部页面变更（Source 在首位）。
     pub pages: Vec<PageDraft>,
+    /// 使用摘要兜底正文的页面路径（第二步 LLM 漏产出的降级页）。
+    pub degraded_paths: Vec<String>,
 }
 
 impl IngestDraft {
-    /// 人读检视清单：每页一行 `action path title`。
+    /// 人读检视清单：每页一行 `action path title`，降级页带 [`DEGRADED_NOTE`]。
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "source: {} (raw: {}, sha256: {})",
             self.source_title, self.raw_path, self.fingerprint
         )];
         for page in &self.pages {
-            lines.push(format!(
+            let mut line = format!(
                 "{:?} {}: {}",
                 page.action, page.path, page.frontmatter.title
-            ));
+            );
+            if self.degraded_paths.contains(&page.path) {
+                line.push_str(DEGRADED_NOTE);
+            }
+            lines.push(line);
         }
         lines
     }
 
+    /// 报告形态：产出页面清单 + Apply 产生的 commit（未 Apply 时 `None`）。
+    pub fn report(&self, commit: Option<String>) -> IngestReport {
+        IngestReport {
+            skipped: false,
+            fingerprint: self.fingerprint.clone(),
+            source_title: self.source_title.clone(),
+            pages: self
+                .pages
+                .iter()
+                .map(|p| IngestedPage {
+                    path: p.path.clone(),
+                    title: p.frontmatter.title.clone(),
+                    page_type: p.frontmatter.page_type,
+                    action: p.action,
+                })
+                .collect(),
+            commit,
+        }
+    }
+
     /// 显式丢弃 Draft：内存变更集直接释放，Wiki 零改动。
     pub fn discard(self) {}
+}
+
+/// [`ingest`] 的结果：指纹命中跳过，或待 Apply 的 Draft。
+#[derive(Debug, Clone)]
+pub enum IngestOutcome {
+    /// 指纹命中，管道跳过（零 LLM 调用、零写入）。
+    Skipped(IngestReport),
+    /// 待 Apply 的内存变更集（尚未落盘、尚未提交）。
+    Draft(IngestDraft),
 }
 
 /// Ingest 结果快照（含跳过路径）。
@@ -152,7 +206,7 @@ pub struct IngestReport {
     pub source_title: String,
     /// 产出 / 更新的页面清单。
     pub pages: Vec<IngestedPage>,
-    /// Apply 产生的 git 短 hash（skipped 时为 `None`）。
+    /// Apply 产生的 git 短 hash（skipped 与未 Apply 时为 `None`）。
     pub commit: Option<String>,
 }
 
@@ -169,18 +223,21 @@ pub struct IngestedPage {
     pub action: PageAction,
 }
 
-/// 摄取一个 raw 文件（公共 API）：指纹检查 → 两步 LLM → Draft → 自动 Apply。
+/// 摄取一个 raw 文件（第一步，不落盘）：指纹检查 → 两步 LLM → Draft。
+///
+/// 全程零写入、零提交——Draft 是内存变更集，落盘由显式 [`apply`] 完成
+/// （`apply_mode = manual` 时壳层不调 apply，Draft 留待人审）。
 ///
 /// `raw_path` 接受绝对路径或相对 `vault_root` 的路径，必须位于 Vault 的
 /// `raw/` 目录内（否则 [`Error::RawNotInVault`]）。`fast` / `strong` 分别
 /// 是两步所用档位的 [`LlmPort`]（注入方决定真实或 fake）。
-pub async fn ingest_file<F>(
+pub async fn ingest<F>(
     vault_root: impl AsRef<Path>,
     raw_path: impl AsRef<Path>,
     fast: &dyn LlmPort,
     strong: &dyn LlmPort,
     mut on_progress: F,
-) -> Result<IngestReport>
+) -> Result<IngestOutcome>
 where
     F: FnMut(IngestStage),
 {
@@ -206,14 +263,14 @@ where
     // 指纹命中：跳过整个管道（零 LLM 调用）。
     let state = StateStore::open(vault_root)?;
     if state.fingerprint(&raw_rel)?.as_deref() == Some(fingerprint.as_str()) {
-        return Ok(IngestReport {
+        return Ok(IngestOutcome::Skipped(IngestReport {
             skipped: true,
             fingerprint,
             source_title: existing_source_title(vault_root, &raw_rel)
                 .unwrap_or_else(|| raw_file_stem(&raw_rel)),
             pages: Vec::new(),
             commit: None,
-        });
+        }));
     }
 
     let template_id = vault_template_id(vault_root)?;
@@ -241,31 +298,34 @@ where
     on_progress(IngestStage::Generating { pages: plan.len() });
     let bodies = compose(strong, template, &raw_text, &raw_rel, &plan).await?;
 
-    let draft = build_draft(&raw_rel, plan, &bodies, &fingerprint);
+    Ok(IngestOutcome::Draft(build_draft(
+        &raw_rel,
+        plan,
+        &bodies,
+        &fingerprint,
+    )))
+}
 
-    // 自动 Apply（Apply 模式为 Manual 时的 Draft 人审入口由后续票据提供）。
+/// Apply（第二步，显式落盘）：全部页面原子写 + log/index 更新 + 恰好
+/// 一个 git 提交 + 指纹记录。
+///
+/// 任一步失败恢复快照并 `git reset` 清空暂存区，文件系统与 git 回到
+/// 提交点。指纹只在提交成功后记录——Apply 失败的 raw 可直接重摄取。
+pub fn apply<F>(
+    vault_root: impl AsRef<Path>,
+    draft: &IngestDraft,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(IngestStage),
+{
+    let vault_root = vault_root.as_ref();
     on_progress(IngestStage::Applying {
         pages: draft.pages.len(),
     });
-    let commit = apply(vault_root, &draft)?;
-    state.set_fingerprint(&raw_rel, &fingerprint)?;
-
-    Ok(IngestReport {
-        skipped: false,
-        fingerprint,
-        source_title: draft.source_title.clone(),
-        pages: draft
-            .pages
-            .iter()
-            .map(|p| IngestedPage {
-                path: p.path.clone(),
-                title: p.frontmatter.title.clone(),
-                page_type: p.frontmatter.page_type,
-                action: p.action,
-            })
-            .collect(),
-        commit: Some(commit),
-    })
+    let commit = write_and_commit(vault_root, draft)?;
+    StateStore::open(vault_root)?.set_fingerprint(&draft.raw_path, &draft.fingerprint)?;
+    Ok(commit)
 }
 
 /// 归一化 raw 路径：相对 Vault 解析为绝对，并校验位于 `raw/` 内。
@@ -337,6 +397,28 @@ no code fences). Shape:
 Every item MUST have a non-empty title; aliases must contain at least the \
 title itself when no better alias exists; use [] when a list is empty.";
 
+/// LLM 调用 + 解析的重试助手（两步共用）：解析失败重试一次，两次都
+/// 失败报 [`Error::BadLlmOutput`]（`what` 为步骤名，进错误消息）。
+async fn with_retry<T>(
+    port: &dyn LlmPort,
+    system: Option<&str>,
+    user: &str,
+    what: &str,
+    parse: impl Fn(&str) -> Result<T>,
+) -> Result<T> {
+    let mut last_error = String::new();
+    for _attempt in 0..2 {
+        let output = port.complete(system, user).await?;
+        match parse(&output) {
+            Ok(parsed) => return Ok(parsed),
+            Err(err) => last_error = err.to_string(),
+        }
+    }
+    Err(Error::BadLlmOutput(format!(
+        "{what}输出两次均无法解析（最后一次：{last_error}）"
+    )))
+}
+
 /// 第一步调用：schema_prompt 注入 system，raw 全文作为 user；
 /// 解析失败重试一次，再失败报 [`Error::BadLlmOutput`]（零写入）。
 async fn analyze(
@@ -346,17 +428,7 @@ async fn analyze(
 ) -> Result<AnalysisOutcome> {
     let system = format!("{}\n\n{ANALYSIS_JSON_INSTRUCTIONS}", template.schema_prompt);
     let user = format!("# Raw source\n\n```text\n{raw}\n```\n");
-    let mut last_error = String::new();
-    for _attempt in 0..2 {
-        let output = fast.complete(Some(&system), &user).await?;
-        match parse_analysis(&output) {
-            Ok(outcome) => return Ok(outcome),
-            Err(err) => last_error = err.to_string(),
-        }
-    }
-    Err(Error::BadLlmOutput(format!(
-        "结构化分析输出两次均无法解析（最后一次：{last_error}）"
-    )))
+    with_retry(fast, Some(&system), &user, "结构化分析", parse_analysis).await
 }
 
 /// 容错解析分析输出：截取首个 `{` 到最后一个 `}` 再走 serde_json。
@@ -405,6 +477,34 @@ struct PlannedPage {
 /// 名称归一化：去首尾空白 + 小写（精确名匹配不区分大小写）。
 fn normalize_name(name: &str) -> String {
     name.trim().to_lowercase()
+}
+
+/// 别名并集的唯一实现（build_plan / 批内合并 / 更新并集 / 不变量兜底
+/// 四处收敛于此）：把 `incoming` 去空白、去重后并入 `aliases`（跳过与
+/// `title` 或既有项重复的别名，不区分大小写），并保证 `title` 自身在
+/// 集合内——「aliases 非空不变量」由此兜底。
+fn merge_aliases(aliases: &mut Vec<String>, incoming: &[String], title: &str) {
+    let push_unique = |aliases: &mut Vec<String>, value: String| {
+        let normalized = normalize_name(&value);
+        if normalized != normalize_name(title)
+            && !aliases.iter().any(|a| normalize_name(a) == normalized)
+        {
+            aliases.push(value);
+        }
+    };
+    for alias in incoming {
+        let alias = alias.trim().to_string();
+        if alias.is_empty() {
+            continue;
+        }
+        push_unique(aliases, alias);
+    }
+    if !aliases
+        .iter()
+        .any(|a| normalize_name(a) == normalize_name(title))
+    {
+        aliases.push(title.to_string());
+    }
 }
 
 /// 扫描 wiki/ 下三类核心页面（解析失败的单页跳过，不阻断管道）。
@@ -502,19 +602,9 @@ fn build_plan(
         if title.is_empty() {
             continue; // 无名条目无法成为页面，丢弃
         }
-        // aliases 非空不变量的第一步：title 自身始终在别名集内。
-        let mut aliases: Vec<String> = item
-            .aliases
-            .iter()
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
-            .collect();
-        if !aliases
-            .iter()
-            .any(|a| normalize_name(a) == normalize_name(&title))
-        {
-            aliases.push(title.clone());
-        }
+        // 别名集：条目 aliases 去重并入 + title 自身始终在集内（不变量）。
+        let mut aliases: Vec<String> = Vec::new();
+        merge_aliases(&mut aliases, &item.aliases, &title);
         // 批内精确名去重：同名（title 或别名相撞）合并进已计划页面。
         if let Some(idx) = find_batch_match(&planned, &title, &aliases) {
             merge_into_planned(&mut planned[idx], item);
@@ -550,7 +640,8 @@ fn build_plan(
     }
 
     // related 解析：本批页面名 → 该批 link；既有页面名 → 既有 link；
-    // 解析不到丢弃（不产生死链，孤儿关联留给 lint）。
+    // 解析不到的保留为短形式 unresolved wikilink（死链合法，目标页
+    // 产出后 Obsidian 自动解析；死链检测属 T11 lint，本管道不裁决）。
     let link_by_batch_name: HashMap<String, String> = planned
         .iter()
         .flat_map(|p| {
@@ -581,12 +672,13 @@ fn build_plan(
         let related = std::mem::take(&mut page.related);
         page.related = related
             .iter()
-            .filter_map(|name| {
+            .map(|name| {
                 let key = normalize_name(name);
                 link_by_batch_name
                     .get(&key)
                     .or_else(|| link_by_existing_name.get(&key))
                     .map(|link| format!("[[{link}]]"))
+                    .unwrap_or_else(|| format!("[[{name}]]"))
             })
             .collect();
     }
@@ -627,22 +719,7 @@ fn find_batch_match(planned: &[PlannedPage], title: &str, aliases: &[String]) ->
 
 /// 批内同名的后续条目合并进首个计划页面（aliases/tags/related/summary 累积）。
 fn merge_into_planned(target: &mut PlannedPage, item: &AnalyzedPage) {
-    for alias in &item.aliases {
-        let alias = alias.trim().to_string();
-        if alias.is_empty() {
-            continue;
-        }
-        let normalized = normalize_name(&alias);
-        let title_norm = normalize_name(&target.title);
-        if normalized != title_norm
-            && !target
-                .aliases
-                .iter()
-                .any(|a| normalize_name(a) == normalized)
-        {
-            target.aliases.push(alias);
-        }
-    }
+    merge_aliases(&mut target.aliases, &item.aliases, &target.title);
     for tag in &item.tags {
         if !target.tags.contains(tag) {
             target.tags.push(tag.clone());
@@ -710,28 +787,17 @@ async fn compose(
         serde_json::to_string_pretty(&plan_json)?,
     );
 
-    let mut last_error = String::new();
-    for _attempt in 0..2 {
-        let output = strong.complete(Some(COMPOSE_SYSTEM), &user).await?;
-        match parse_written(&output) {
-            Ok(pages) => {
-                let mut bodies = HashMap::new();
-                for page in pages.pages {
-                    let key = page
-                        .path
-                        .strip_suffix(".md")
-                        .unwrap_or(&page.path)
-                        .to_string();
-                    bodies.insert(key, page.body);
-                }
-                return Ok(bodies);
-            }
-            Err(err) => last_error = err.to_string(),
-        }
+    let written = with_retry(strong, Some(COMPOSE_SYSTEM), &user, "成文", parse_written).await?;
+    let mut bodies = HashMap::new();
+    for page in written.pages {
+        let key = page
+            .path
+            .strip_suffix(".md")
+            .unwrap_or(&page.path)
+            .to_string();
+        bodies.insert(key, page.body);
     }
-    Err(Error::BadLlmOutput(format!(
-        "成文输出两次均无法解析（最后一次：{last_error}）"
-    )))
+    Ok(bodies)
 }
 
 fn parse_written(output: &str) -> Result<WrittenPages> {
@@ -756,6 +822,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 /// 把计划 + 正文组装成 Draft：frontmatter 合并（update 保留 created、
 /// 并集 aliases/tags/related/sources）、Source 正文追加产出索引。
+/// 第二步漏产出的页面以摘要兜底并记入 `degraded_paths`（显式降级标记）。
 fn build_draft(
     raw_rel: &str,
     plan: Vec<PlannedPage>,
@@ -768,20 +835,30 @@ fn build_draft(
         .map(|p| p.path.strip_suffix(".md").unwrap_or(&p.path).to_string());
 
     let mut pages: Vec<PageDraft> = Vec::new();
+    let mut degraded_paths: Vec<String> = Vec::new();
     for item in plan.iter().skip(1) {
-        pages.push(build_page_draft(item, &source_link, bodies, &now, None));
+        let (page, degraded) = build_page_draft(item, &source_link, bodies, &now, None);
+        if degraded {
+            degraded_paths.push(page.path.clone());
+        }
+        pages.push(page);
     }
 
     // Source page 放首位；正文尾部追加确定性产出索引（引擎生成非 LLM）。
     let source_item = plan.first().expect("页面计划至少含 Source 页");
-    let mut source = build_page_draft(
+    let (mut source, _) = build_page_draft(
         source_item,
         &source_link,
         bodies,
         &now,
-        Some((raw_rel, fingerprint)),
+        Some(RawPointer {
+            raw_path: raw_rel,
+            fingerprint,
+        }),
     );
-    source.body.push_str(&produced_index(&pages_meta(&pages)));
+    source
+        .body
+        .push_str(&produced_index(&pages_meta(&pages, &degraded_paths)));
     let source_title = source.frontmatter.title.clone();
     pages.insert(0, source);
 
@@ -790,10 +867,11 @@ fn build_draft(
         raw_path: raw_rel.to_string(),
         fingerprint: fingerprint.to_string(),
         pages,
+        degraded_paths,
     }
 }
 
-/// 单个计划页面 → Draft 页面：字段合并与不变量兜底。
+/// 单个计划页面 → Draft 页面（附带「是否降级」：第二步漏产出该页正文）。
 ///
 /// `raw_pointer` 仅 Source page 使用（raw 相对路径 + 指纹）。
 fn build_page_draft(
@@ -801,8 +879,8 @@ fn build_page_draft(
     source_link: &Option<String>,
     bodies: &HashMap<String, String>,
     now: &str,
-    raw_pointer: Option<(&str, &str)>,
-) -> PageDraft {
+    raw_pointer: Option<RawPointer<'_>>,
+) -> (PageDraft, bool) {
     let action = if item.existing.is_some() {
         PageAction::Update
     } else {
@@ -814,14 +892,7 @@ fn build_page_draft(
     let (path, created, mut sources) = match &item.existing {
         Some(old) => {
             // 更新：保留 created 与 path；字段取并集（旧在前，保序去重）。
-            for alias in &old.frontmatter.aliases {
-                let normalized = normalize_name(alias);
-                if normalized != normalize_name(&item.title)
-                    && !aliases.iter().any(|a| normalize_name(a) == normalized)
-                {
-                    aliases.push(alias.clone());
-                }
-            }
+            merge_aliases(&mut aliases, &old.frontmatter.aliases, &item.title);
             for tag in &old.frontmatter.tags {
                 if !tags.contains(tag) {
                     tags.push(tag.clone());
@@ -852,20 +923,15 @@ fn build_page_draft(
         }
     }
 
-    // aliases 非空不变量兜底（title 必在别名集内）。
+    // aliases 非空不变量兜底（title 必在别名集内，空集回退 title）。
     aliases.retain(|a| !a.trim().is_empty());
-    if !aliases
-        .iter()
-        .any(|a| normalize_name(a) == normalize_name(&item.title))
-    {
-        aliases.push(item.title.clone());
-    }
-    if aliases.is_empty() {
-        aliases.push(item.title.clone());
-    }
+    merge_aliases(&mut aliases, &[], &item.title);
 
     let (raw_path, fingerprint) = match raw_pointer {
-        Some((rel, sha)) => (Some(rel.to_string()), Some(sha.to_string())),
+        Some(pointer) => (
+            Some(pointer.raw_path.to_string()),
+            Some(pointer.fingerprint.to_string()),
+        ),
         None => (None, None),
     };
 
@@ -883,19 +949,24 @@ fn build_page_draft(
     };
 
     let link = path.strip_suffix(".md").unwrap_or(&path).to_string();
-    let body = bodies
-        .get(&link)
-        .cloned()
-        .unwrap_or_else(|| fallback_body(item));
-    PageDraft {
-        path,
-        action,
-        frontmatter,
-        body: body.trim_end().to_string(),
-    }
+    let degraded = !bodies.contains_key(&link);
+    let body = match bodies.get(&link) {
+        Some(body) => body.clone(),
+        None => fallback_body(item),
+    };
+    (
+        PageDraft {
+            path,
+            action,
+            frontmatter,
+            body: body.trim_end().to_string(),
+        },
+        degraded,
+    )
 }
 
-/// 第二步漏掉某页时的兜底正文（管道继续，不阻断 Apply）。
+/// 第二步漏掉某页时的兜底正文（管道继续，不阻断 Apply；降级事实另经
+/// [`DEGRADED_NOTE`] 在产出索引与 Draft 检视清单中显式标注）。
 fn fallback_body(item: &PlannedPage) -> String {
     format!(
         "（本页正文暂缺，以分析摘要代替）\n\n## 摘要\n\n{}",
@@ -903,28 +974,38 @@ fn fallback_body(item: &PlannedPage) -> String {
     )
 }
 
-/// Source page 正文末尾的产出页面索引（确定性，引擎生成而非 LLM）。
-fn produced_index(pages: &[(String, String, PageAction)]) -> String {
+/// Source page 正文末尾的产出页面索引（确定性，引擎生成而非 LLM）；
+/// 降级页条目带 [`DEGRADED_NOTE`] 标注。
+fn produced_index(entries: &[(String, String, PageAction, bool)]) -> String {
     let mut out = String::from("\n\n## 产出页面\n\n");
-    for (link, title, action) in pages {
-        let alias = if link == title {
-            String::new()
-        } else {
-            format!("|{title}")
-        };
+    for (link, title, action, degraded) in entries {
         let verb = match action {
             PageAction::Create => "新建",
             PageAction::Update => "更新",
         };
-        out.push_str(&format!("- [[{link}{alias}]]（{verb}）\n"));
+        let mut note = format!("（{verb}）");
+        if *degraded {
+            note.push_str(DEGRADED_NOTE);
+        }
+        out.push_str(&format!("- {}{note}\n", wikilink(link, title)));
     }
     out
 }
 
-fn pages_meta(pages: &[PageDraft]) -> Vec<(String, String, PageAction)> {
+fn pages_meta(
+    pages: &[PageDraft],
+    degraded_paths: &[String],
+) -> Vec<(String, String, PageAction, bool)> {
     pages
         .iter()
-        .map(|p| (p.link().to_string(), p.frontmatter.title.clone(), p.action))
+        .map(|p| {
+            (
+                p.link().to_string(),
+                p.frontmatter.title.clone(),
+                p.action,
+                degraded_paths.contains(&p.path),
+            )
+        })
         .collect()
 }
 
@@ -975,11 +1056,7 @@ fn update_index(existing: &str, entries: &[(String, String)]) -> String {
     for (link, title) in entries {
         let prefix = format!("- [[{link}]]");
         let prefix_alias = format!("- [[{link}|");
-        let rendered = if link == title {
-            prefix.clone()
-        } else {
-            format!("- [[{link}|{title}]]")
-        };
+        let rendered = format!("- {}", wikilink(link, title));
         match lines
             .iter()
             .position(|line| line.starts_with(&prefix) || line.starts_with(&prefix_alias))
@@ -995,20 +1072,22 @@ fn update_index(existing: &str, entries: &[(String, String)]) -> String {
     out
 }
 
-/// log.md 追加一条可 grep 的时序记录：`## [YYYY-MM-DD] ingest | <标题>`。
+/// log.md 追加一条可 grep 的时序记录：`## [YYYY-MM-DD] ingest | <标题>`
+/// （规格格式；git 提交信息另带 `corpus:` 前缀，见 [`INGEST_COMMIT_PREFIX`]）。
 fn append_log(existing: &str, title: &str) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d");
     let mut out = existing.to_string();
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&format!("## [{today}] {INGEST_COMMIT_PREFIX} | {title}\n"));
+    out.push_str(&format!("## [{today}] ingest | {title}\n"));
     out
 }
 
-/// Apply：全部页面 tempfile persist 原子写 + log/index 更新 + 恰好一个
-/// git 提交。任一步失败恢复快照，文件系统与 git 回到提交点。
-fn apply(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
+/// 写入 + 提交（apply 的私有实现）：全部页面 tempfile persist 原子写 +
+/// log/index 更新 + 恰好一个 git 提交。任一步失败恢复快照并清空暂存区
+/// （commit 前的 `git add` 可能把文件写进了 index），不留半写状态。
+fn write_and_commit(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
     let wiki = vault_root.join("wiki");
 
     // 先在内存生成全部新内容：render 失败（schema 违规）时零写入。
@@ -1067,6 +1146,12 @@ fn apply(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
         Ok(commit) => Ok(commit),
         Err(err) => {
             restore_all(&snapshots);
+            // commit 失败时 add 多半已把文件写入暂存区：mixed reset 清空
+            // 之，否则索引里残留「已暂存但工作区已恢复」的幽灵条目，
+            // 工作区并非真正回到提交点。
+            if let Err(reset_err) = git::reset_index(vault_root) {
+                eprintln!("git reset 失败（{reset_err}），请用 git status 检查暂存区");
+            }
             Err(err)
         }
     }
@@ -1129,13 +1214,63 @@ mod tests {
         let out = append_log(initial, "Attention Is All You Need");
         let last = out.lines().last().unwrap();
         assert!(
-            last.starts_with("## [")
-                && last.contains("] corpus: ingest | Attention Is All You Need"),
-            "记录行应为 `## [日期] corpus: ingest | 标题`：{last}"
+            last.starts_with("## [") && last.contains("] ingest | Attention Is All You Need"),
+            "记录行应为 `## [日期] ingest | 标题`：{last}"
         );
         // 日期是今天（本地）
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(last.contains(&today));
+    }
+
+    #[test]
+    fn produced_index_marks_degraded_pages() {
+        let entries = vec![
+            (
+                "entities/a".to_string(),
+                "A".to_string(),
+                PageAction::Create,
+                false,
+            ),
+            (
+                "concepts/b".to_string(),
+                "B".to_string(),
+                PageAction::Create,
+                true,
+            ),
+        ];
+        let out = produced_index(&entries);
+        assert!(
+            out.contains("- [[entities/a|A]]（新建）\n"),
+            "普通条目：{out}"
+        );
+        assert!(
+            out.contains(&format!("- [[concepts/b|B]]（新建）{DEGRADED_NOTE}\n")),
+            "降级条目须带显式标注：{out}"
+        );
+    }
+
+    #[test]
+    fn merge_aliases_dedupes_case_insensitively_and_keeps_title() {
+        // title 自身始终在集内（即使 incoming 为空）
+        let mut aliases = Vec::new();
+        merge_aliases(&mut aliases, &[], "Transformer");
+        assert_eq!(aliases, vec!["Transformer".to_string()]);
+
+        // 并入去重（不区分大小写、跳过空白项与 title 重复）
+        merge_aliases(
+            &mut aliases,
+            &[
+                "  ".to_string(),
+                "transformer".to_string(),
+                "Transformer 架构".to_string(),
+                "Transformer 架构".to_string(),
+            ],
+            "Transformer",
+        );
+        assert_eq!(
+            aliases,
+            vec!["Transformer".to_string(), "Transformer 架构".to_string()]
+        );
     }
 
     #[test]

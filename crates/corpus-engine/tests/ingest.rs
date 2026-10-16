@@ -1,6 +1,7 @@
 //! Ingest 集成测试（票据 T3 验收）：只经引擎公共 API 驱动，LLM 接缝用
 //! Scripted Fake（离线、确定性），断言落在真实文件系统（页面内容、
 //! frontmatter schema、git 历史、raw/ 不变量）与 wikilink 回读。
+//! 两段式 API：`ingest`（→ Draft，不落盘）+ 显式 `apply`。
 
 mod common;
 
@@ -9,8 +10,8 @@ use std::path::Path;
 
 use common::{fresh_vault_path, git, tree_snapshot, ScriptedLlmPort};
 use corpus_engine::{
-    create_vault, ingest_file, parse_page, Error, IngestReport, IngestStage, PageAction, PageKind,
-    TemplateId,
+    apply, create_vault, ingest, parse_page, Error, IngestDraft, IngestOutcome, IngestReport,
+    IngestStage, PageAction, PageKind, TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,12 +78,34 @@ fn no_progress() -> impl FnMut(IngestStage) {
     |_: IngestStage| {}
 }
 
-/// 运行一次完整摄取（标准脚本）。
-async fn ingest_ok(root: &Path, raw_rel: &str) -> IngestReport {
+/// 从 ingest 结果取 Draft（跳过则 panic：调用方断言非跳过路径）。
+fn draft_of(outcome: IngestOutcome) -> IngestDraft {
+    match outcome {
+        IngestOutcome::Draft(draft) => draft,
+        IngestOutcome::Skipped(report) => panic!("预期产出 Draft，实际指纹跳过：{report:?}"),
+    }
+}
+
+/// 第二段：显式 apply → 报告（含 commit）。
+fn apply_ok(root: &Path, draft: &IngestDraft) -> IngestReport {
+    let commit = apply(root, draft, no_progress()).expect("apply 失败");
+    draft.report(Some(commit))
+}
+
+/// 第一步（标准脚本）：ingest → Draft，不落盘。
+async fn standard_draft(root: &Path, raw_rel: &str) -> IngestDraft {
     let (fast, strong) = standard_llms();
-    ingest_file(root, raw_rel, &fast, &strong, no_progress())
-        .await
-        .expect("标准脚本摄取应成功")
+    draft_of(
+        ingest(root, raw_rel, &fast, &strong, no_progress())
+            .await
+            .expect("标准脚本 ingest 应成功"),
+    )
+}
+
+/// 两段式完整摄取（标准脚本）：ingest → Draft → apply → 报告。
+async fn ingest_ok(root: &Path, raw_rel: &str) -> IngestReport {
+    let draft = standard_draft(root, raw_rel).await;
+    apply_ok(root, &draft)
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +196,13 @@ async fn unchanged_fingerprint_skips_entire_pipeline() {
     let commits_after_first = git(&root, &["rev-list", "--count", "HEAD"]);
 
     let (fast, strong) = standard_llms();
-    let second = ingest_file(&root, &raw, &fast, &strong, no_progress())
+    let second = match ingest(&root, &raw, &fast, &strong, no_progress())
         .await
-        .expect("重复摄取应成功返回（跳过路径）");
+        .expect("重复摄取应成功返回（跳过路径）")
+    {
+        IngestOutcome::Skipped(report) => report,
+        IngestOutcome::Draft(_) => panic!("指纹未变必须跳过，不得产出 Draft"),
+    };
     assert!(second.skipped, "指纹未变必须跳过");
     assert_eq!(fast.call_count(), 0, "跳过时 fast 档零调用");
     assert_eq!(strong.call_count(), 0, "跳过时 strong 档零调用");
@@ -194,7 +221,8 @@ async fn unchanged_fingerprint_skips_entire_pipeline() {
 // ---------------------------------------------------------------------------
 
 /// 验收：两步调用各恰好一次且档位正确（fast 分析 / strong 成文），
-/// fast 的 system prompt 注入模板 schema_prompt；进度回调阶段有序。
+/// fast 的 system prompt 注入模板 schema_prompt；两段进度阶段有序
+/// （ingest 三段 + apply 落盘段）。
 #[tokio::test]
 async fn two_llm_steps_each_once_with_correct_tier_and_schema_prompt() {
     let (_dir, root) = setup_vault("vault");
@@ -202,18 +230,19 @@ async fn two_llm_steps_each_once_with_correct_tier_and_schema_prompt() {
 
     let (fast, strong) = standard_llms();
     let mut stages: Vec<String> = Vec::new();
-    let report = ingest_file(&root, &raw, &fast, &strong, |stage| {
-        stages.push(
-            serde_json::to_value(&stage).unwrap()["stage"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        );
+    let stage_name = |stage: &IngestStage| {
+        serde_json::to_value(stage).unwrap()["stage"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let outcome = ingest(&root, &raw, &fast, &strong, |stage| {
+        stages.push(stage_name(&stage));
     })
     .await
     .expect("摄取失败");
+    let draft = draft_of(outcome);
 
-    assert!(!report.skipped);
     // fast：恰好一次，system 含 schema_prompt，user 含 raw 全文
     assert_eq!(fast.call_count(), 1, "第一步（分析）应恰好调用一次");
     let (fast_system, fast_user) = &fast.recorded_calls()[0];
@@ -243,7 +272,10 @@ async fn two_llm_steps_each_once_with_correct_tier_and_schema_prompt() {
     assert!(strong_user.contains("# Page plan"));
     assert!(strong_user.contains("论文正文内容"));
 
-    // 进度阶段：读取 → 分析 → 生成 → 落盘（依序且齐全）
+    // 第二段 apply：落盘进度
+    apply(&root, &draft, |stage| stages.push(stage_name(&stage))).expect("apply 失败");
+
+    // 进度阶段：读取 → 分析 → 生成 → 落盘（两段合计，依序且齐全）
     assert_eq!(
         stages,
         vec!["reading", "analyzing", "generating", "applying"]
@@ -263,7 +295,7 @@ async fn bad_analysis_json_retries_once_then_fails_without_writes() {
 
     let fast = ScriptedLlmPort::new(vec!["这不是 JSON".to_string(), "仍然不是 JSON".to_string()]);
     let strong = ScriptedLlmPort::new(vec![]);
-    let err = ingest_file(&root, &raw, &fast, &strong, no_progress())
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
         .await
         .expect_err("两次坏输出必须报错");
     assert!(matches!(err, Error::BadLlmOutput(_)), "got: {err:?}");
@@ -281,7 +313,7 @@ async fn compose_failure_leaves_no_partial_writes() {
 
     let fast = ScriptedLlmPort::new(vec![analysis_json()]);
     let strong = ScriptedLlmPort::new(vec!["格式错误".to_string(), "还是格式错误".to_string()]);
-    let err = ingest_file(&root, &raw, &fast, &strong, no_progress())
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
         .await
         .expect_err("第二步坏输出必须报错");
     assert!(matches!(err, Error::BadLlmOutput(_)), "got: {err:?}");
@@ -301,11 +333,13 @@ async fn retry_recovers_from_one_bad_output() {
         analysis_json(),
     ]);
     let strong = ScriptedLlmPort::new(vec![bodies_json()]);
-    let report = ingest_file(&root, &raw, &fast, &strong, no_progress())
-        .await
-        .expect("重试一次后应成功");
-    assert!(!report.skipped);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("重试一次后应成功"),
+    );
     assert_eq!(fast.call_count(), 2);
+    apply(&root, &draft, no_progress()).expect("apply 失败");
     assert!(root.join("wiki/sources").is_dir());
 }
 
@@ -346,6 +380,34 @@ fn assert_failure_clean(root: &Path, baseline: &FailureBaseline) {
 }
 
 // ---------------------------------------------------------------------------
+// 人审模式语义（ingest 不 apply）
+// ---------------------------------------------------------------------------
+
+/// 验收（apply_mode=manual 的引擎级语义）：只 ingest 不 apply 时零写入、
+/// 零提交、指纹不记录——Draft 是纯内存变更集，丢弃后 Wiki 与摄取前一致，
+/// 重摄取会重新走 LLM（跳过仅在 apply 成功记录指纹后发生）。
+#[tokio::test]
+async fn draft_without_apply_writes_nothing() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "内容");
+    let state = failure_baseline(&root);
+
+    let draft = standard_draft(&root, &raw).await;
+    // Draft 可整体检视（人读清单：source 行 + 每页一行）
+    assert!(draft.summary_lines().len() >= 2);
+    assert_failure_clean(&root, &state);
+
+    // 指纹未记录：同一 raw 再次 ingest 不走跳过路径（重新调用 LLM）
+    let (fast, strong) = standard_llms();
+    draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("未 apply 则指纹未记录，重摄取应重新分析"),
+    );
+    assert_eq!(fast.call_count(), 1, "未 apply → 未记录指纹 → 不跳过");
+}
+
+// ---------------------------------------------------------------------------
 // 精确名去重
 // ---------------------------------------------------------------------------
 
@@ -379,10 +441,14 @@ async fn exact_name_dedup_updates_existing_page() {
     let raw_b = write_raw(&root, "b.md", "第二篇：BERT。");
     let fast = ScriptedLlmPort::new(vec![analysis_b.to_string()]);
     let strong = ScriptedLlmPort::new(vec![bodies_b.to_string()]);
-    let report = ingest_file(&root, &raw_b, &fast, &strong, no_progress())
-        .await
-        .expect("第二次摄取应成功");
-    assert!(!report.skipped);
+    let report = apply_ok(
+        &root,
+        &draft_of(
+            ingest(&root, &raw_b, &fast, &strong, no_progress())
+                .await
+                .expect("第二次摄取应成功"),
+        ),
+    );
 
     // 实体目录仍只有一个文件：更新而非新建
     let entity_files_after_second = list_md(&entity_dir);
@@ -437,16 +503,20 @@ async fn same_raw_reingest_after_change_updates_same_source_page() {
 
     let raw_changed = write_raw(&root, "a.md", "第二版内容（已修改）");
     assert_eq!(raw_changed, raw);
-    let second = ingest_file(
+    let second = apply_ok(
         &root,
-        &raw,
-        &ScriptedLlmPort::new(vec![analysis_json()]),
-        &ScriptedLlmPort::new(vec![bodies_json()]),
-        no_progress(),
-    )
-    .await
-    .expect("内容变化后重摄取应成功");
-    assert!(!second.skipped, "指纹变化必须重新摄取");
+        &draft_of(
+            ingest(
+                &root,
+                &raw,
+                &ScriptedLlmPort::new(vec![analysis_json()]),
+                &ScriptedLlmPort::new(vec![bodies_json()]),
+                no_progress(),
+            )
+            .await
+            .expect("内容变化后重摄取应成功"),
+        ),
+    );
     assert_ne!(second.fingerprint, first.fingerprint);
 
     // 仍只有一个 Source page，且是更新
@@ -471,6 +541,116 @@ fn list_md(dir: &Path) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// related 解析：unresolved 死链保留
+// ---------------------------------------------------------------------------
+
+/// 验收：related 指向不存在的页面时原样保留为短形式 unresolved wikilink
+/// （死链合法，目标页产出后 Obsidian 自动解析；死链检测属 T11 lint），
+/// 可解析项照常解析为路径形式。
+#[tokio::test]
+async fn unresolved_related_is_preserved_as_dead_link() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "内容");
+    let analysis = r#"{
+  "source_title": "T",
+  "source_summary": "s",
+  "entities": [
+    {"title": "Transformer", "aliases": [], "tags": [],
+     "summary": "架构。", "related": ["自注意力", "不存在的幽灵页面"]}
+  ],
+  "concepts": [
+    {"title": "自注意力", "aliases": [], "tags": [], "summary": "机制。", "related": []}
+  ]
+}"#;
+    let bodies = r#"{"pages": [
+      {"path": "sources/t", "body": "b"},
+      {"path": "entities/transformer", "body": "b"},
+      {"path": "concepts/自注意力", "body": "b"}
+    ]}"#;
+    let draft = draft_of(
+        ingest(
+            &root,
+            &raw,
+            &ScriptedLlmPort::new(vec![analysis.to_string()]),
+            &ScriptedLlmPort::new(vec![bodies.to_string()]),
+            no_progress(),
+        )
+        .await
+        .expect("摄取失败"),
+    );
+    apply(&root, &draft, no_progress()).expect("apply 失败");
+
+    let (fm, _) =
+        parse_page(&fs::read_to_string(root.join("wiki/entities/transformer.md")).unwrap())
+            .unwrap();
+    assert_eq!(
+        fm.related,
+        vec![
+            "[[concepts/自注意力]]".to_string(),
+            "[[不存在的幽灵页面]]".to_string(),
+        ],
+        "可解析项 → 路径形式；不可解析项原样保留为短形式死链"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 漏页降级：摘要兜底的显式标记
+// ---------------------------------------------------------------------------
+
+/// 验收：第二步漏产出某页正文时管道继续，页面以摘要兜底，且 Source
+/// 产出索引与 Draft 检视清单都带显式降级标注（可 grep）。
+#[tokio::test]
+async fn missing_body_degrades_with_explicit_marker() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "paper.md", "内容");
+    // 成文脚本漏掉 concepts/自注意力
+    let bodies = r#"{"pages": [
+      {"path": "sources/attention-is-all-you-need", "body": "摘要正文。"},
+      {"path": "entities/transformer", "body": "实体正文。"}
+    ]}"#;
+    let fast = ScriptedLlmPort::new(vec![analysis_json()]);
+    let strong = ScriptedLlmPort::new(vec![bodies.to_string()]);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("ingest 失败"),
+    );
+
+    // Draft 检视清单：降级页带标注
+    let degraded_line = draft
+        .summary_lines()
+        .into_iter()
+        .find(|l| l.contains("concepts/自注意力"))
+        .expect("清单应含概念页行");
+    assert!(
+        degraded_line.contains("降级：模型未产出，摘要兜底"),
+        "{degraded_line}"
+    );
+
+    apply(&root, &draft, no_progress()).expect("apply 失败");
+    // 降级页正文：显式声明 + 分析摘要兜底
+    let (_, concept_body) =
+        parse_page(&fs::read_to_string(root.join("wiki/concepts/自注意力.md")).unwrap()).unwrap();
+    assert!(concept_body.contains("（本页正文暂缺，以分析摘要代替）"));
+    assert!(concept_body.contains("让序列中每个位置直接关注全部位置的机制"));
+
+    // Source 产出索引：降级条目带标注，正常条目不带
+    let (_, source_body) = parse_page(
+        &fs::read_to_string(root.join("wiki/sources/attention-is-all-you-need.md")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        source_body
+            .contains("[[concepts/自注意力|自注意力]]（新建）（降级：模型未产出，摘要兜底）"),
+        "降级条目应带显式标注：{source_body}"
+    );
+    assert!(
+        source_body.contains("[[entities/transformer|Transformer]]（新建）\n"),
+        "正常条目不应带标注：{source_body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // git 提交 / log / index
 // ---------------------------------------------------------------------------
 
@@ -487,14 +667,12 @@ async fn apply_creates_exactly_one_commit_with_log_and_index() {
     assert_eq!(subject, "corpus: ingest | Attention Is All You Need");
     assert!(report.commit.is_some());
 
-    // log.md：追加可 grep 的时序记录
+    // log.md：追加可 grep 的时序记录（规格格式，无提交信息前缀）
     let log = fs::read_to_string(root.join("wiki/log.md")).unwrap();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     assert!(
-        log.contains(&format!(
-            "## [{today}] corpus: ingest | Attention Is All You Need"
-        )),
-        "log.md 应含 `## [日期] corpus: ingest | 标题` 记录"
+        log.contains(&format!("## [{today}] ingest | Attention Is All You Need")),
+        "log.md 应含 `## [日期] ingest | 标题` 记录：{log}"
     );
 
     // index.md：占位清除 + 三个新页条目
@@ -529,16 +707,50 @@ async fn apply_creates_exactly_one_commit_with_log_and_index() {
     let analysis_b =
         r#"{"source_title": "BERT", "source_summary": "s", "entities": [], "concepts": []}"#;
     let bodies_b = r#"{"pages": [{"path": "sources/bert", "body": "BERT 摘要。"}]}"#;
-    ingest_file(
+    apply_ok(
         &root,
-        &raw_b,
-        &ScriptedLlmPort::new(vec![analysis_b.to_string()]),
-        &ScriptedLlmPort::new(vec![bodies_b.to_string()]),
-        no_progress(),
-    )
-    .await
-    .expect("第二次摄取失败");
+        &draft_of(
+            ingest(
+                &root,
+                &raw_b,
+                &ScriptedLlmPort::new(vec![analysis_b.to_string()]),
+                &ScriptedLlmPort::new(vec![bodies_b.to_string()]),
+                no_progress(),
+            )
+            .await
+            .expect("第二次摄取失败"),
+        ),
+    );
     assert_eq!(git(&root, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+/// 验收（apply 失败分支）：git commit 失败时恢复全部文件快照并清空
+/// 暂存区——工作区与索引都回到提交点，不留「已暂存但工作区已恢复」的
+/// 幽灵条目。用必定失败的 pre-commit 钩子迫使 commit 失败（add 仍成功，
+/// 精确命中「add 之后 commit 失败」分支；chmod .git 会让 add 一起失败，
+/// 无法覆盖该分支，故弃用）。仓库级 `core.hooksPath` 显式指回
+/// `.git/hooks`，不受开发机全局 hooksPath 覆盖（如 CCM）影响。
+#[tokio::test]
+#[cfg(unix)]
+async fn apply_commit_failure_restores_worktree_and_clears_index() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "paper.md", "内容");
+    let state = failure_baseline(&root);
+
+    git(&root, &["config", "core.hooksPath", ".git/hooks"]);
+    let hook = root.join(".git/hooks/pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("写 pre-commit 钩子失败");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("设钩子执行位失败");
+
+    let draft = standard_draft(&root, &raw).await;
+    let err = apply(&root, &draft, no_progress()).expect_err("commit 钩子失败必须报错");
+    assert!(matches!(err, Error::Git { .. }), "got: {err:?}");
+    // 工作区与暂存区都回到提交点（无 reset 时 status 会残留已暂存条目）
+    assert_failure_clean(&root, &state);
+    // 指纹未记录：失败的 raw 可直接重摄取
+    let reingest = standard_draft(&root, &raw).await;
+    assert_eq!(reingest.pages.len(), draft.pages.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +773,7 @@ async fn raw_directory_is_never_written() {
     let after_first = tree_snapshot(&root, "raw");
     let fast = ScriptedLlmPort::new(vec!["坏输出".to_string(), "还是坏".to_string()]);
     let strong = ScriptedLlmPort::new(vec![]);
-    assert!(ingest_file(&root, &raw_b, &fast, &strong, no_progress())
+    assert!(ingest(&root, &raw_b, &fast, &strong, no_progress())
         .await
         .is_err());
     assert_eq!(tree_snapshot(&root, "raw"), after_first);
@@ -659,7 +871,7 @@ async fn raw_outside_vault_is_rejected() {
     fs::write(other_root.join("外部文件.md"), "内容").unwrap();
 
     let (fast, strong) = standard_llms();
-    let err = ingest_file(&root, &other_root, &fast, &strong, no_progress())
+    let err = ingest(&root, &other_root, &fast, &strong, no_progress())
         .await
         .expect_err("Vault 外文件必须拒绝");
     assert!(matches!(err, Error::RawNotInVault { .. }), "got: {err:?}");
@@ -672,7 +884,7 @@ async fn non_vault_directory_is_rejected() {
     let (dir, root) = fresh_vault_path("not-a-vault");
     fs::create_dir_all(&root).unwrap();
     let (fast, strong) = standard_llms();
-    let err = ingest_file(&root, "raw/a.md", &fast, &strong, no_progress())
+    let err = ingest(&root, "raw/a.md", &fast, &strong, no_progress())
         .await
         .expect_err("非 Vault 目录必须拒绝");
     assert!(matches!(err, Error::NotAVault { .. }), "got: {err:?}");

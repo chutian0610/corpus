@@ -62,9 +62,18 @@ const canIngest = computed(
   () => selectedVaultPath.value !== null && rawPath.value !== null && !ingesting.value,
 )
 
+/** 人审模式结果：Draft 未落盘（apply_mode=manual，完整人审流程属 T5）。 */
+const manualPending = computed(
+  () => report.value !== null && !report.value.skipped && !report.value.applied,
+)
+
 /** 当前步骤索引（done 时全部完成，idle 时 -1）。 */
 const currentStep = computed(() => {
-  if (phase.value === 'done') return STEPS.length
+  if (phase.value === 'done') {
+    // 人审模式未落盘：只有前三步（读取/分析/生成）真实完成
+    if (manualPending.value) return 3
+    return STEPS.length
+  }
   const idx = STEPS.findIndex((s) => s.key === phase.value)
   return idx
 })
@@ -106,7 +115,7 @@ function pageTypeLabel(kind: PageKind): string {
   <main class="page">
     <header class="page-header">
       <h2>摄取（Ingest）</h2>
-      <p class="subtitle">把 raw/ 中的文档编译进 Wiki：指纹检查 → 两步 LLM → Draft → 自动 Apply</p>
+      <p class="subtitle">把 raw/ 中的文档编译进 Wiki：指纹检查 → 两步 LLM → Draft → Apply（自动或人审由配置决定）</p>
     </header>
 
     <section class="card step">
@@ -173,7 +182,7 @@ function pageTypeLabel(kind: PageKind): string {
     </section>
 
     <section v-if="report && phase === 'done'" class="card result success">
-      <h3>{{ report.skipped ? '指纹命中，已跳过' : '摄取完成' }}</h3>
+      <h3>{{ report.skipped ? '指纹命中，已跳过' : manualPending ? '摄取完成（Draft 未落盘）' : '摄取完成' }}</h3>
       <dl class="meta">
         <div class="meta-row">
           <dt>Source</dt>
@@ -188,6 +197,11 @@ function pageTypeLabel(kind: PageKind): string {
           <dd><code>{{ report.commit }}</code></dd>
         </div>
       </dl>
+
+      <div v-if="report.note" class="manual-note">
+        <p>{{ report.note }}</p>
+        <pre v-if="report.summary_lines.length > 0" class="summary-lines">{{ report.summary_lines.join('\n') }}</pre>
+      </div>
 
       <h4 v-if="report.pages.length > 0" class="pages-title">产出页面（{{ report.pages.length }}）</h4>
       <table v-if="report.pages.length > 0" class="pages-table">
@@ -434,6 +448,33 @@ function pageTypeLabel(kind: PageKind): string {
 .fingerprint {
   font-family: var(--mono);
   font-size: 12px;
+}
+
+.manual-note {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px dashed var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.manual-note p {
+  font-size: 13px;
+  color: var(--text-strong);
+  margin: 0;
+}
+
+.summary-lines {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .pages-title {
