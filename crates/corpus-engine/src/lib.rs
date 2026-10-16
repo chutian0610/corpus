@@ -6,6 +6,9 @@
 //! - T2 范围：全局配置层（[`config`]，sqlite，API key 只存环境变量名）、
 //!   Vault 注册表（[`registry`]）、LLM 窄端口 [`LlmPort`] 与连通测试协议，
 //!   以及 `rig` feature 之后的 Rig 真实实现（[`rig_llm`]）。
+//! - T-UX 范围：[`vault::open_vault`]（打开已有 Vault 的只读校验）、
+//!   [`wiki::list_pages`]（页面树纯文件系统遍历）与
+//!   [`wiki::resolve_page_path`]（read_page 等只读入口的路径安全校验）。
 
 mod atomic;
 mod git;
@@ -23,6 +26,7 @@ pub mod registry;
 pub mod rig_llm;
 pub mod template;
 pub mod vault;
+pub mod wiki;
 
 // 根 re-export 只保留外部消费者实际使用的名字（桌面壳与集成测试）；
 // 其余类型经各自模块路径访问（如 `corpus_engine::template::GENERIC`），
@@ -43,4 +47,5 @@ pub use rig_llm::{build_llm_port, build_model, test_connection, RigLlmPort};
 pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, TemplateId, TemplateInfo,
 };
-pub use vault::{create_vault, vault_template_id, VaultInfo};
+pub use vault::{create_vault, open_vault, vault_template_id, OpenedVault, VaultInfo};
+pub use wiki::{list_pages, resolve_page_path, PageEntry, PageGroup, PageTree};

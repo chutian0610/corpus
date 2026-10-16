@@ -7,8 +7,12 @@ Corpus 是基于 Karpathy LLM Wiki 模式的 Rust 桌面知识库引擎：LLM �
 ### 工作区结构
 
 **Vault**:
-一个独立的知识库工作区：一个目录即一个 git 仓库，包含 Raw sources、Wiki 与 Purpose。一个 Vault 在创建时绑定一个 Template。
-_Avoid_: project、workspace
+一个独立的知识库：一个目录即一个 git 仓库，包含 Raw sources、Wiki 与 Purpose。一个 Vault 在创建时绑定一个 Template。
+_Avoid_: project；workspace（指磁盘上的知识库本体时——「工作区」一词保留给应用壳的 Workspace 界面，见下一条）
+
+**Workspace（应用工作区）**:
+应用壳的第二级界面（T-UX）：打开某个 Vault 后的浏览与操作环境（左侧文件面板、主内容区、底部状态栏）。它只是当前打开 Vault 的 UI 上下文，不是数据单位——一个 Workspace 任一时刻至多对应一个 Vault。
+_Avoid_: 与 Vault 混用（指磁盘上的知识库本体时一律说 Vault，Workspace 只指界面形态）
 
 **Raw source**:
 用户策展、引擎只读的不可变原始文档，存放于 Vault 的 `raw/` 目录。

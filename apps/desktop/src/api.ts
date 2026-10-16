@@ -23,6 +23,13 @@ export interface VaultInfo {
   created_paths: string[]
 }
 
+/** open_vault 的结果：路径与绑定模板元数据（引擎 OpenedVault）。 */
+export interface OpenedVault {
+  root: string
+  template_id: string
+  template_name: string
+}
+
 export interface ModelTier {
   provider: string
   model: string
@@ -50,6 +57,25 @@ export interface RecentVault {
 
 /** 页面类型（引擎 PageKind serde 表示）。 */
 export type PageKind = 'source' | 'entity' | 'concept'
+
+/** 单个页面条目（引擎 PageEntry）：路径 + 最后更新时间。 */
+export interface PageEntry {
+  /** 相对 wiki/ 的 .md 路径。 */
+  path: string
+  /** frontmatter 的 updated 时间（RFC 3339）；解析失败为 null（界面不展示）。 */
+  updated: string | null
+}
+
+/** 按类型分组的页面清单（引擎 PageGroup）。 */
+export interface PageGroup {
+  kind: PageKind
+  pages: PageEntry[]
+}
+
+/** wiki/ 页面树（引擎 PageTree）：非空分组，按固定类型顺序。 */
+export interface PageTree {
+  groups: PageGroup[]
+}
 
 /** 页面动作：新建 / 精确名命中更新。 */
 export type PageAction = 'create' | 'update'
@@ -108,12 +134,23 @@ export function listRecentVaults(): Promise<RecentVault[]> {
   return invoke<RecentVault[]>('list_recent_vaults')
 }
 
-export function addRecentVault(path: string, templateId: string): Promise<void> {
-  return invoke('add_recent_vault', { path, templateId })
-}
-
 export function removeRecentVault(path: string): Promise<void> {
   return invoke('remove_recent_vault', { path })
+}
+
+/** 打开一个已有 Vault：引擎校验 + 壳层登记最近列表，非 Vault 明确报错。 */
+export function openVault(path: string): Promise<OpenedVault> {
+  return invoke<OpenedVault>('open_vault', { path })
+}
+
+/** 当前 Vault 的 wiki/ 页面树（文件面板数据源）。 */
+export function listPages(vaultPath: string): Promise<PageTree> {
+  return invoke<PageTree>('list_pages', { vaultPath })
+}
+
+/** 只读读取 wiki/ 下某页面的原始文本（预览用；正式渲染属 T4）。 */
+export function readPage(vaultPath: string, relPath: string): Promise<string> {
+  return invoke<string>('read_page', { vaultPath, relPath })
 }
 
 export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport> {

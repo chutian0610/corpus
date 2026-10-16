@@ -3,15 +3,13 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   ingestFile,
-  listRecentVaults,
   onIngestProgress,
   type IngestProgress,
   type IngestReport,
   type PageKind,
-  type RecentVault,
 } from '../api'
-import { errorMessage, templateDisplayName } from '../display'
-import { currentVault } from '../vault-state'
+import { errorMessage, PAGE_TYPE_LABELS } from '../display'
+import { bumpPages, currentVault } from '../vault-state'
 
 /** 四阶段步骤条（引擎 IngestStage 的 UI 映射）。 */
 const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
@@ -21,17 +19,8 @@ const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
   { key: 'applying', label: '落盘' },
 ]
 
-const PAGE_TYPE_LABELS: Record<PageKind, string> = {
-  source: 'Source 页',
-  entity: 'Entity',
-  concept: 'Concept',
-}
-
 type Phase = 'idle' | IngestProgress['stage'] | 'done' | 'error'
 
-const recentVaults = ref<RecentVault[]>([])
-const vaultsError = ref<string | null>(null)
-const selectedVaultPath = ref<string | null>(null)
 const rawPath = ref<string | null>(null)
 const ingesting = ref(false)
 const phase = ref<Phase>('idle')
@@ -45,12 +34,6 @@ onMounted(async () => {
   unlisten = await onIngestProgress((progress) => {
     if (ingesting.value) phase.value = progress.stage
   })
-  try {
-    recentVaults.value = await listRecentVaults()
-  } catch (err) {
-    vaultsError.value = errorMessage(err)
-  }
-  if (currentVault.value) selectedVaultPath.value = currentVault.value.path
 })
 
 onUnmounted(() => {
@@ -58,8 +41,11 @@ onUnmounted(() => {
   unlisten = null
 })
 
+/** 摄取只作用于当前打开的 Vault（工作区面板；无 Vault 时不会挂载）。 */
+const vault = computed(() => currentVault.value)
+
 const canIngest = computed(
-  () => selectedVaultPath.value !== null && rawPath.value !== null && !ingesting.value,
+  () => vault.value !== null && rawPath.value !== null && !ingesting.value,
 )
 
 /** 人审模式结果：Draft 未落盘（apply_mode=manual，完整人审流程属 T5）。 */
@@ -90,14 +76,16 @@ async function chooseRawFile(): Promise<void> {
 }
 
 async function runIngest(): Promise<void> {
-  if (!canIngest.value || selectedVaultPath.value === null || rawPath.value === null) return
+  if (!canIngest.value || vault.value === null || rawPath.value === null) return
   ingesting.value = true
   phase.value = 'reading'
   report.value = null
   ingestError.value = null
   try {
-    report.value = await ingestFile(selectedVaultPath.value, rawPath.value)
+    report.value = await ingestFile(vault.value.path, rawPath.value)
     phase.value = 'done'
+    // 落盘成功：Wiki 有新页面，通知文件面板重拉页面树
+    if (report.value.applied) bumpPages()
   } catch (err) {
     ingestError.value = errorMessage(err)
     phase.value = 'error'
@@ -116,34 +104,22 @@ function pageTypeLabel(kind: PageKind): string {
     <header class="page-header">
       <h2>摄取（Ingest）</h2>
       <p class="subtitle">把 raw/ 中的文档编译进 Wiki：指纹检查 → 两步 LLM → Draft → Apply（自动或人审由配置决定）</p>
+      <p v-if="vault" class="subtitle vault-line">
+        当前 Vault：<code :title="vault.path">{{ vault.path }}</code>
+      </p>
     </header>
 
     <section class="card step">
-      <h3>1 · 选择 Vault 与 raw 文件</h3>
-      <div v-if="vaultsError" class="load-error">
-        <p>Vault 列表加载失败：{{ vaultsError }}</p>
+      <h3>1 · 选择 raw 文件</h3>
+      <label class="field-label" for="raw-path">raw 文件（须位于当前 Vault 的 raw/ 目录内）</label>
+      <div class="path-row">
+        <output id="raw-path" class="path-box" :title="rawPath ?? undefined">
+          {{ rawPath ?? '尚未选择文件' }}
+        </output>
+        <button type="button" class="btn" :disabled="ingesting" @click="chooseRawFile">
+          浏览…
+        </button>
       </div>
-      <div v-else-if="recentVaults.length === 0" class="hint">
-        尚无最近打开的 Vault——请先在「创建 Vault」页创建或到设置页登记已有 Vault。
-      </div>
-      <template v-else>
-        <label class="field-label" for="vault-select">Vault</label>
-        <select id="vault-select" v-model="selectedVaultPath" class="select" :disabled="ingesting">
-          <option v-for="v in recentVaults" :key="v.path" :value="v.path">
-            {{ v.path }}（{{ templateDisplayName(v.template_id) }}）
-          </option>
-        </select>
-
-        <label class="field-label" for="raw-path">raw 文件（须位于所选 Vault 的 raw/ 目录内）</label>
-        <div class="path-row">
-          <output id="raw-path" class="path-box" :title="rawPath ?? undefined">
-            {{ rawPath ?? '尚未选择文件' }}
-          </output>
-          <button type="button" class="btn" :disabled="ingesting" @click="chooseRawFile">
-            浏览…
-          </button>
-        </div>
-      </template>
     </section>
 
     <div class="actions">
@@ -233,7 +209,7 @@ function pageTypeLabel(kind: PageKind): string {
   width: 100%;
   max-width: 760px;
   margin: 0 auto;
-  padding: 40px 24px 64px;
+  padding: 28px 24px 48px;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -242,6 +218,15 @@ function pageTypeLabel(kind: PageKind): string {
 .page-header .subtitle {
   color: var(--text-muted);
   margin-top: 6px;
+}
+
+.page-header .vault-line {
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.page-header .vault-line code {
+  font-size: 12px;
 }
 
 .step h3 {
@@ -265,18 +250,6 @@ function pageTypeLabel(kind: PageKind): string {
 
 .field-label:first-of-type {
   margin-top: 0;
-}
-
-.select {
-  width: 100%;
-  min-height: 38px;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--text-strong);
-  font-size: 13px;
-  font-family: var(--mono);
 }
 
 .path-row {
@@ -305,12 +278,6 @@ function pageTypeLabel(kind: PageKind): string {
   margin-top: 10px;
   font-size: 13px;
   color: var(--text-muted);
-}
-
-.load-error p {
-  font-size: 14px;
-  color: var(--danger);
-  word-break: break-all;
 }
 
 .actions {

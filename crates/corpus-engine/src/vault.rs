@@ -23,6 +23,17 @@ pub struct VaultInfo {
     pub created_paths: Vec<String>,
 }
 
+/// `open_vault` 的结果：Vault 位置与绑定模板的元数据。
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenedVault {
+    /// Vault 根目录（调用方传入的路径）。
+    pub root: PathBuf,
+    /// 绑定的模板 id（`.corpus/vault.json`）。
+    pub template_id: TemplateId,
+    /// 绑定模板的展示名。
+    pub template_name: String,
+}
+
 /// Vault 初始提交信息。
 pub const INITIAL_COMMIT_MESSAGE: &str = "corpus: init vault";
 
@@ -76,12 +87,20 @@ const SKELETON: &[&str] = &[
 /// 生成目录骨架：`raw/`、`wiki/index.md`、`wiki/log.md`、`purpose.md`、
 /// `.corpus/`，随后 `git init` 并完成初始提交。
 ///
+/// - `path` 已是 Corpus Vault（存在 `.corpus/vault.json`）时报
+///   [`Error::AlreadyAVault`]，明确引导「打开」而非重复创建；
 /// - `path` 已存在且非空（文件或含内容的目录）时报 [`Error::VaultPathExists`]，不覆盖；
 /// - `path` 已存在但为空目录时允许（目录选择对话框只能选中已存在的目录）；
 /// - `template_id` 非内置模板时报 [`Error::UnknownTemplate`]，不创建任何文件；
 /// - T1 阶段本操作不调用 LLM。
 pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result<VaultInfo> {
     let root = path.as_ref();
+    // 已是 Vault 的目录给出精确引导（先于泛泛的「非空拒绝」判定）。
+    if root.join(".corpus/vault.json").is_file() {
+        return Err(Error::AlreadyAVault {
+            path: root.to_path_buf(),
+        });
+    }
     if root.exists() && !is_empty_dir(root) {
         return Err(Error::VaultPathExists {
             path: root.to_path_buf(),
@@ -152,6 +171,40 @@ pub fn vault_template_id(root: impl AsRef<Path>) -> Result<TemplateId> {
         reason: format!("{} 内容非法：{err}", meta_path.display()),
     })?;
     Ok(meta.template_id)
+}
+
+/// 打开一个已有 Vault（公共 API）：校验 `.corpus/vault.json` 存在且其中
+/// 模板 id 可解析为内置模板，返回路径与模板元数据（[`OpenedVault`]）。
+///
+/// 只读校验、零写入——「最近打开」是全局配置层（桌面壳的 ConfigStore
+/// 注册表）的职责，引擎不越权登记。以下情形均报 [`Error::NotAVault`]，
+/// 错误信息含路径与原因：
+/// - 目录缺 `.corpus/vault.json`（含路径根本不存在 / 是文件的情况）；
+/// - 元数据内容非法（非 JSON / 缺字段）；
+/// - 绑定的模板 id 不在内置模板中（如旧版本创建的 Vault）。
+///
+/// 校验通过不代表后续操作必然成功（如 git 仓库缺失由具体操作自查），
+/// 但能保证 Ingest 等模板相关操作拿到的模板绑定是可用的。
+pub fn open_vault<P: AsRef<Path>>(path: P) -> Result<OpenedVault> {
+    let root = path.as_ref();
+    let template_id = vault_template_id(root)?;
+    let template = template::template_by_id(&template_id).ok_or_else(|| Error::NotAVault {
+        path: root.to_path_buf(),
+        reason: format!(
+            "绑定的模板 id「{}」不在内置模板中（可用模板：{}）",
+            template_id,
+            template::builtin_templates()
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })?;
+    Ok(OpenedVault {
+        root: root.to_path_buf(),
+        template_id,
+        template_name: template.name.to_string(),
+    })
 }
 
 /// 路径是「空目录」吗？读取失败按非空处理（保守：宁可拒绝也不覆盖）。

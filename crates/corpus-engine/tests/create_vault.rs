@@ -175,6 +175,28 @@ fn existing_empty_directory_is_accepted() {
 }
 
 #[test]
+fn existing_corpus_vault_is_rejected_with_open_guidance() {
+    // 目标已是 Corpus Vault：报 AlreadyAVault（引导「打开」）而非泛泛的
+    // VaultPathExists，且目录保持原样
+    let (_dir, root) = fresh_vault_path("vault");
+    create_vault(&root, &TemplateId::from("generic")).expect("首次创建应成功");
+
+    let err = create_vault(&root, &TemplateId::from("research")).unwrap_err();
+    assert!(matches!(err, Error::AlreadyAVault { .. }), "got: {err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("该目录已是一个 Vault") && message.contains("请从启动页打开"),
+        "错误信息须引导打开而非重复创建：{message}"
+    );
+
+    // 模板绑定不受影响（仍是首次创建时的 generic）
+    assert_eq!(
+        corpus_engine::vault_template_id(&root).unwrap(),
+        TemplateId::from("generic")
+    );
+}
+
+#[test]
 fn unknown_template_is_rejected_without_creating_anything() {
     let (_dir, root) = fresh_vault_path("vault");
     let err = create_vault(&root, &TemplateId::from("no-such-template")).unwrap_err();

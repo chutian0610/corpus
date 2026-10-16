@@ -32,6 +32,25 @@ pub enum Error {
         reason: String,
     },
 
+    /// create_vault 的目标目录已经是一个 Corpus Vault（存在 .corpus/vault.json）。
+    ///
+    /// 与 [`Error::VaultPathExists`]（泛泛的「非空拒绝」）区分：此错误明确
+    /// 引导用户走「打开」而非重复创建（应用壳启动页据此提示）。
+    #[error("该目录已是一个 Vault，请从启动页打开：{path}")]
+    AlreadyAVault {
+        /// 已是 Vault 的目标路径。
+        path: PathBuf,
+    },
+
+    /// 页面相对路径非法（read_page 等只读入口的路径安全校验）。
+    #[error("非法页面路径：{path}（{reason}）")]
+    InvalidPagePath {
+        /// 被拒绝的相对路径原样。
+        path: String,
+        /// 具体原因（绝对路径 / `..` 逃逸 / 非 `.md` / 解析逃出 Vault 等）。
+        reason: String,
+    },
+
     /// Ingest 的 raw 文件不在 Vault 的 raw/ 目录内。
     #[error("raw 文件必须在 Vault 的 raw/ 目录内：{}（Vault：{}）", raw.display(), vault.display())]
     RawNotInVault {
