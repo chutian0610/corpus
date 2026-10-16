@@ -1,8 +1,16 @@
 <script setup lang="ts">
+/** 新建 Vault 表单（启动页「+ 新建 Vault…」内嵌）。
+ *  创建成功 emit('created', root)——由启动页立即打开进入工作区；
+ *  目标已是 Vault 时引擎报「该目录已是一个 Vault，请从启动页打开」，
+ *  原样内联展示。 */
 import { computed, onMounted, ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { createVault, listTemplates, type TemplateInfo, type VaultInfo } from '../api'
 import { errorMessage, templateDisplayName } from '../display'
+
+const emit = defineEmits<{
+  (e: 'created', root: string): void
+}>()
 
 const templates = ref<TemplateInfo[]>([])
 const templatesError = ref<string | null>(null)
@@ -56,6 +64,8 @@ async function handleCreate(): Promise<void> {
   createdVault.value = null
   try {
     createdVault.value = await createVault(vaultPath.value!, selectedTemplateId.value!)
+    // 成功即打开：启动页接管（openVault → 工作区），本表单随启动页卸载
+    emit('created', createdVault.value.root)
   } catch (err) {
     createError.value = errorMessage(err)
   } finally {
@@ -104,12 +114,7 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
 </script>
 
 <template>
-  <main class="page">
-    <header class="page-header">
-      <h2>创建 Vault</h2>
-      <p class="subtitle">一个目录即一个 git 仓库（Raw sources + Wiki + Purpose）</p>
-    </header>
-
+  <div class="page">
     <section class="card step">
       <h3>1 · 选择模板</h3>
       <div v-if="templatesError" class="load-error">
@@ -142,7 +147,7 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
           浏览…
         </button>
       </div>
-      <p class="hint">可选择已存在的空目录，或输入尚不存在的新路径；Corpus 会初始化目录骨架并完成 git 初始提交。</p>
+      <p class="hint">可选择已存在的空目录，或输入尚不存在的新路径；Corpus 会初始化目录骨架并完成 git 初始提交。若所选目录已是一个 Vault，请回到启动页打开它。</p>
     </section>
 
     <div class="actions">
@@ -182,23 +187,15 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
       </dl>
       <pre class="structure">{{ structureLines.join('\n') }}</pre>
     </section>
-  </main>
+  </div>
 </template>
 
 <style scoped>
 .page {
   width: 100%;
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 40px 24px 64px;
   display: flex;
   flex-direction: column;
   gap: 20px;
-}
-
-.page-header .subtitle {
-  color: var(--text-muted);
-  margin-top: 6px;
 }
 
 .step h3 {
