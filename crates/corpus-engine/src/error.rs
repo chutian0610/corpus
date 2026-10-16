@@ -45,6 +45,10 @@ pub enum Error {
     #[error("LLM 输出无法解析：{0}")]
     BadLlmOutput(String),
 
+    /// YAML frontmatter 序列化/反序列化失败。
+    #[error("YAML frontmatter 错误：{0}")]
+    Yaml(#[from] serde_yaml_ng::Error),
+
     /// 文件系统 IO 错误。
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
