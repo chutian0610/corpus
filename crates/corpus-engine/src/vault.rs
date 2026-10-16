@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::git;
@@ -25,6 +25,18 @@ pub struct VaultInfo {
 
 /// Vault 初始提交信息。
 pub const INITIAL_COMMIT_MESSAGE: &str = "corpus: init vault";
+
+/// `.corpus/vault.json`：Vault 与模板的绑定元数据（Ingest 等操作据此
+/// 取回创建时选定的模板，见 CONTEXT.md「Vault」）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultMeta {
+    /// 创建时绑定的模板 id。
+    pub template_id: TemplateId,
+}
+
+/// `.corpus/.gitignore` 内容：指纹缓存 `state.db` 可由 raw/ 全量重算，
+/// 属可再生数据，不入库（git 历史只承载 Wiki 与骨架）。
+const CORPUS_GITIGNORE: &str = "state.db\n";
 
 /// `wiki/index.md` 初始内容（内容目录，由引擎维护）。
 const INDEX_MD: &str = "\
@@ -55,6 +67,8 @@ const SKELETON: &[&str] = &[
     "purpose.md",
     ".corpus/",
     ".corpus/.gitkeep",
+    ".corpus/.gitignore",
+    ".corpus/vault.json",
 ];
 
 /// 在 `path` 创建一个绑定 `template_id` 的新 Vault（公共 API）。
@@ -90,6 +104,14 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result
     // 保证初始提交后克隆 / 回滚仍保留目录结构。
     fs::write(root.join("raw/.gitkeep"), "")?;
     fs::write(root.join(".corpus/.gitkeep"), "")?;
+    // 指纹缓存不入库；模板绑定元数据随仓库走（克隆后模板仍可知）。
+    fs::write(root.join(".corpus/.gitignore"), CORPUS_GITIGNORE)?;
+    fs::write(
+        root.join(".corpus/vault.json"),
+        serde_json::to_string_pretty(&VaultMeta {
+            template_id: template.id.clone(),
+        })?,
+    )?;
 
     // 内容目录
     fs::write(root.join("wiki/index.md"), INDEX_MD)?;
@@ -111,6 +133,25 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result
         template_name: template.name.to_string(),
         created_paths: SKELETON.iter().map(|p| (*p).to_string()).collect(),
     })
+}
+
+/// 读取 Vault 绑定的模板 id（`.corpus/vault.json`）。
+///
+/// Ingest 等需要模板的操作以此取回创建时的选择，调用方再经
+/// [`crate::template::template_by_id`] 校验并取得模板常量。
+/// 路径缺骨架 / 元数据缺失 / 内容非法时报 [`Error::NotAVault`]。
+pub fn vault_template_id(root: impl AsRef<Path>) -> Result<TemplateId> {
+    let root = root.as_ref();
+    let meta_path = root.join(".corpus/vault.json");
+    let raw = fs::read_to_string(&meta_path).map_err(|err| Error::NotAVault {
+        path: root.to_path_buf(),
+        reason: format!("无法读取 {}（{err}）", meta_path.display()),
+    })?;
+    let meta: VaultMeta = serde_json::from_str(&raw).map_err(|err| Error::NotAVault {
+        path: root.to_path_buf(),
+        reason: format!("{} 内容非法：{err}", meta_path.display()),
+    })?;
+    Ok(meta.template_id)
 }
 
 /// 路径是「空目录」吗？读取失败按非空处理（保守：宁可拒绝也不覆盖）。

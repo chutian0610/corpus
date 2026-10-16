@@ -1,0 +1,1148 @@
+//! Ingest 管道：把一个 raw source 编译进 Wiki（票据 T3，核心 tracer）。
+//!
+//! 流程（单文件）：
+//! 1. 读取 raw 文件并计算 SHA-256；指纹未变则跳过整个管道（零 LLM 调用）；
+//! 2. 第一步（fast 档）：注入模板 `schema_prompt` 的结构化分析，引擎侧
+//!    解析 JSON（容错提取 + 失败重试一次，再失败报错且零写入）；
+//! 3. 精确名去重：分析产出的 title/alias 与既有页面 frontmatter 精确
+//!    匹配（不区分大小写）→ 更新既有页而非新建；
+//! 4. 第二步（strong 档）：一次调用为 Source page 与每个 Entity/Concept
+//!    成文（Markdown，含 `[[wikilink]]`）；
+//! 5. Draft（内存变更集，可整体检视/丢弃）→ 自动 Apply：全页面原子写 +
+//!    git add/commit（恰好一个提交）+ log.md 追加 + index.md 增量更新；
+//!    任一步失败恢复快照，不留半写状态。
+//!
+//! 引擎不依赖 tauri：进度经 `on_progress: impl FnMut(IngestStage)` 回调
+//! 上报（见 T3 调研笔记第 4 节架构提示），壳层负责转成事件。
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::atomic::atomic_write;
+use crate::error::{Error, Result};
+use crate::fingerprint::{sha256_hex, StateStore};
+use crate::git;
+use crate::llm::LlmPort;
+use crate::page::{parse_page, slugify, PageAction, PageDraft, PageFrontmatter, PageKind};
+use crate::template::{template_by_id, WikiTemplate};
+use crate::vault::vault_template_id;
+
+/// Ingest 提交信息前缀（`corpus: ingest | <Source 标题>`，可 grep）。
+pub const INGEST_COMMIT_PREFIX: &str = "corpus: ingest";
+
+/// 进度阶段：粗粒度、低频（读取/分析/生成/落盘），壳层映射为 UI 步骤。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum IngestStage {
+    /// 读取 raw 文件并计算指纹。
+    Reading {
+        /// raw 文件相对 Vault 的路径。
+        raw: String,
+    },
+    /// 第一步：fast 档结构化分析。
+    Analyzing,
+    /// 第二步：strong 档成文（`pages` 为计划页面数）。
+    Generating {
+        /// 计划生成正文的页面数。
+        pages: usize,
+    },
+    /// 落盘：原子写 + git 提交 + log/index 更新。
+    Applying {
+        /// Draft 中的页面数。
+        pages: usize,
+    },
+}
+
+/// 第一步（fast 档）的 JSON 输出目标：实体/概念列表与 Source 元信息。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnalysisOutcome {
+    /// Source page 标题（空则引擎回退 raw 文件名）。
+    #[serde(default)]
+    pub source_title: String,
+    /// 原始文档摘要（供第二步成文）。
+    #[serde(default)]
+    pub source_summary: String,
+    /// 实体页面清单。
+    #[serde(default)]
+    pub entities: Vec<AnalyzedPage>,
+    /// 概念页面清单。
+    #[serde(default)]
+    pub concepts: Vec<AnalyzedPage>,
+}
+
+/// 第一步产出的单个页面条目。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnalyzedPage {
+    /// 页面标题（必填，空则引擎丢弃该条目）。
+    #[serde(default)]
+    pub title: String,
+    /// 别名（跨语言 / 缩写）。
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// 标签。
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 该条目在原文中的要点（供第二步成文）。
+    #[serde(default)]
+    pub summary: String,
+    /// 相关页面标题（引擎解析为 wikilink）。
+    #[serde(default)]
+    pub related: Vec<String>,
+}
+
+/// 第二步（strong 档）的 JSON 输出目标：每个计划页面的正文。
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WrittenPages {
+    #[serde(default)]
+    pages: Vec<WrittenPage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WrittenPage {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// Draft：一次 Ingest 的内存变更集，可整体检视或丢弃（[`IngestDraft::discard`]）。
+#[derive(Debug, Clone)]
+pub struct IngestDraft {
+    /// Source page 标题。
+    pub source_title: String,
+    /// raw 文件相对 Vault 的路径。
+    pub raw_path: String,
+    /// raw 内容 SHA-256。
+    pub fingerprint: String,
+    /// 全部页面变更（Source 在首位）。
+    pub pages: Vec<PageDraft>,
+}
+
+impl IngestDraft {
+    /// 人读检视清单：每页一行 `action path title`。
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "source: {} (raw: {}, sha256: {})",
+            self.source_title, self.raw_path, self.fingerprint
+        )];
+        for page in &self.pages {
+            lines.push(format!(
+                "{:?} {}: {}",
+                page.action, page.path, page.frontmatter.title
+            ));
+        }
+        lines
+    }
+
+    /// 显式丢弃 Draft：内存变更集直接释放，Wiki 零改动。
+    pub fn discard(self) {}
+}
+
+/// Ingest 结果快照（含跳过路径）。
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestReport {
+    /// 指纹命中，管道被跳过（零 LLM 调用、零写入）。
+    pub skipped: bool,
+    /// 本次 raw 内容的 SHA-256。
+    pub fingerprint: String,
+    /// Source page 标题。
+    pub source_title: String,
+    /// 产出 / 更新的页面清单。
+    pub pages: Vec<IngestedPage>,
+    /// Apply 产生的 git 短 hash（skipped 时为 `None`）。
+    pub commit: Option<String>,
+}
+
+/// 单个产出页面。
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestedPage {
+    /// 相对 `wiki/` 的路径。
+    pub path: String,
+    /// 页面标题。
+    pub title: String,
+    /// 页面类型。
+    pub page_type: PageKind,
+    /// 新建还是更新。
+    pub action: PageAction,
+}
+
+/// 摄取一个 raw 文件（公共 API）：指纹检查 → 两步 LLM → Draft → 自动 Apply。
+///
+/// `raw_path` 接受绝对路径或相对 `vault_root` 的路径，必须位于 Vault 的
+/// `raw/` 目录内（否则 [`Error::RawNotInVault`]）。`fast` / `strong` 分别
+/// 是两步所用档位的 [`LlmPort`]（注入方决定真实或 fake）。
+pub async fn ingest_file<F>(
+    vault_root: impl AsRef<Path>,
+    raw_path: impl AsRef<Path>,
+    fast: &dyn LlmPort,
+    strong: &dyn LlmPort,
+    mut on_progress: F,
+) -> Result<IngestReport>
+where
+    F: FnMut(IngestStage),
+{
+    let vault_root = vault_root.as_ref();
+    if !vault_root.join("wiki").is_dir() {
+        return Err(Error::NotAVault {
+            path: vault_root.to_path_buf(),
+            reason: "缺 wiki/ 目录".to_string(),
+        });
+    }
+    let (raw_rel, raw_abs) = resolve_raw(vault_root, raw_path.as_ref())?;
+    let raw_rel = raw_rel.to_string_lossy().replace('\\', "/");
+
+    on_progress(IngestStage::Reading {
+        raw: raw_rel.clone(),
+    });
+    let bytes = fs::read(&raw_abs)?;
+    let raw_text = String::from_utf8(bytes.clone()).map_err(|_| {
+        Error::InvalidConfig(format!("raw 文件不是 UTF-8 文本：{}", raw_abs.display()))
+    })?;
+    let fingerprint = sha256_hex(&bytes);
+
+    // 指纹命中：跳过整个管道（零 LLM 调用）。
+    let state = StateStore::open(vault_root)?;
+    if state.fingerprint(&raw_rel)?.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(IngestReport {
+            skipped: true,
+            fingerprint,
+            source_title: existing_source_title(vault_root, &raw_rel)
+                .unwrap_or_else(|| raw_file_stem(&raw_rel)),
+            pages: Vec::new(),
+            commit: None,
+        });
+    }
+
+    let template_id = vault_template_id(vault_root)?;
+    let template = template_by_id(&template_id).ok_or_else(|| Error::UnknownTemplate {
+        id: template_id.clone(),
+        available: crate::template::builtin_templates()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    })?;
+
+    // 第一步：结构化分析（fast 档）。
+    on_progress(IngestStage::Analyzing);
+    let mut analysis = analyze(fast, template, &raw_text).await?;
+    if analysis.source_title.trim().is_empty() {
+        analysis.source_title = raw_file_stem(&raw_rel);
+    }
+
+    // 组装页面计划（精确名去重 + 别名解析）。
+    let existing = scan_existing_pages(vault_root)?;
+    let plan = build_plan(&analysis, &raw_rel, &existing)?;
+
+    // 第二步：成文（strong 档）。
+    on_progress(IngestStage::Generating { pages: plan.len() });
+    let bodies = compose(strong, template, &raw_text, &raw_rel, &plan).await?;
+
+    let draft = build_draft(&raw_rel, plan, &bodies, &fingerprint);
+
+    // 自动 Apply（Apply 模式为 Manual 时的 Draft 人审入口由后续票据提供）。
+    on_progress(IngestStage::Applying {
+        pages: draft.pages.len(),
+    });
+    let commit = apply(vault_root, &draft)?;
+    state.set_fingerprint(&raw_rel, &fingerprint)?;
+
+    Ok(IngestReport {
+        skipped: false,
+        fingerprint,
+        source_title: draft.source_title.clone(),
+        pages: draft
+            .pages
+            .iter()
+            .map(|p| IngestedPage {
+                path: p.path.clone(),
+                title: p.frontmatter.title.clone(),
+                page_type: p.frontmatter.page_type,
+                action: p.action,
+            })
+            .collect(),
+        commit: Some(commit),
+    })
+}
+
+/// 归一化 raw 路径：相对 Vault 解析为绝对，并校验位于 `raw/` 内。
+fn resolve_raw(vault_root: &Path, raw: &Path) -> Result<(PathBuf, PathBuf)> {
+    let abs = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        vault_root.join(raw)
+    };
+    // 不 canonicalize（文件必须已存在，join 结果足够判定前缀）；
+    // raw 不存在时随后的 read 会报 IO 错误。
+    let rel = abs
+        .strip_prefix(vault_root)
+        .map_err(|_| Error::RawNotInVault {
+            raw: raw.to_path_buf(),
+            vault: vault_root.to_path_buf(),
+        })?
+        .to_path_buf();
+    if !rel.starts_with("raw") {
+        return Err(Error::RawNotInVault {
+            raw: raw.to_path_buf(),
+            vault: vault_root.to_path_buf(),
+        });
+    }
+    Ok((rel, abs))
+}
+
+/// raw 相对路径的文件名主干（Source 标题回退用）。
+fn raw_file_stem(rel: &str) -> String {
+    Path::new(rel)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "untitled".to_string())
+}
+
+/// 已有 Source page 中锚定同一 raw 的标题（跳过报告展示用）。
+fn existing_source_title(vault_root: &Path, raw_rel: &str) -> Option<String> {
+    let dir = vault_root.join("wiki/sources");
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok((fm, _)) = parse_page(&content) {
+                if fm.raw_path.as_deref() == Some(raw_rel) {
+                    return Some(fm.title);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// 第一步：结构化分析（fast 档）
+// ---------------------------------------------------------------------------
+
+/// 第一步 system 指令的 JSON 输出约束（追加在模板 schema_prompt 之后）。
+const ANALYSIS_JSON_INSTRUCTIONS: &str = "\
+Output contract — respond with ONE JSON object and nothing else (no prose, \
+no code fences). Shape:
+{
+  \"source_title\": \"title for the source page (original title or topic)\",
+  \"source_summary\": \"3-6 sentence summary of the raw source\",
+  \"entities\": [{\"title\": \"...\", \"aliases\": [\"...\"], \"tags\": [\"...\"], \"summary\": \"key points about this entity in the source\", \"related\": [\"titles of related pages\"]}],
+  \"concepts\": [{\"title\": \"...\", \"aliases\": [\"...\"], \"tags\": [\"...\"], \"summary\": \"...\", \"related\": [\"...\"]}]
+}
+Every item MUST have a non-empty title; aliases must contain at least the \
+title itself when no better alias exists; use [] when a list is empty.";
+
+/// 第一步调用：schema_prompt 注入 system，raw 全文作为 user；
+/// 解析失败重试一次，再失败报 [`Error::BadLlmOutput`]（零写入）。
+async fn analyze(
+    fast: &dyn LlmPort,
+    template: &WikiTemplate,
+    raw: &str,
+) -> Result<AnalysisOutcome> {
+    let system = format!("{}\n\n{ANALYSIS_JSON_INSTRUCTIONS}", template.schema_prompt);
+    let user = format!("# Raw source\n\n```text\n{raw}\n```\n");
+    let mut last_error = String::new();
+    for _attempt in 0..2 {
+        let output = fast.complete(Some(&system), &user).await?;
+        match parse_analysis(&output) {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => last_error = err.to_string(),
+        }
+    }
+    Err(Error::BadLlmOutput(format!(
+        "结构化分析输出两次均无法解析（最后一次：{last_error}）"
+    )))
+}
+
+/// 容错解析分析输出：截取首个 `{` 到最后一个 `}` 再走 serde_json。
+fn parse_analysis(output: &str) -> Result<AnalysisOutcome> {
+    let json = extract_json_object(output);
+    serde_json::from_str(json).map_err(|err| Error::BadLlmOutput(format!("JSON 解析失败：{err}")))
+}
+
+/// 提取输出中的 JSON 对象字面量（容忍 ```json 围栏与前后杂文字）。
+fn extract_json_object(output: &str) -> &str {
+    match (output.find('{'), output.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &output[start..=end],
+        _ => "",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 页面计划：精确名去重与别名解析
+// ---------------------------------------------------------------------------
+
+/// 既有页面（wiki/ 下已存在的页面）。
+#[derive(Debug, Clone)]
+struct ExistingPage {
+    /// 相对 wiki/ 的路径。
+    path: String,
+    frontmatter: PageFrontmatter,
+    body: String,
+}
+
+/// 计划页面：分析条目 + 去重决策 + slug 目标。
+#[derive(Debug, Clone)]
+struct PlannedPage {
+    kind: PageKind,
+    title: String,
+    aliases: Vec<String>,
+    tags: Vec<String>,
+    /// 解析后的 related wikilink（`[[link]]` 形式）。
+    related: Vec<String>,
+    summary: String,
+    /// 精确名命中既有页面 → 更新它（保留 path/created）。
+    existing: Option<ExistingPage>,
+    /// 相对 wiki/ 的目标路径（含 .md）。
+    path: String,
+}
+
+/// 名称归一化：去首尾空白 + 小写（精确名匹配不区分大小写）。
+fn normalize_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// 扫描 wiki/ 下三类核心页面（解析失败的单页跳过，不阻断管道）。
+fn scan_existing_pages(vault_root: &Path) -> Result<Vec<ExistingPage>> {
+    let wiki = vault_root.join("wiki");
+    let mut pages = Vec::new();
+    for kind in [PageKind::Source, PageKind::Entity, PageKind::Concept] {
+        let dir = wiki.join(kind.dir());
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue, // 目录尚不存在（全新 Vault）
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok((frontmatter, body)) = parse_page(&content) else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(&wiki)
+                .expect("wiki 下的页面必然能 strip wiki/ 前缀");
+            pages.push(ExistingPage {
+                path: rel.to_string_lossy().replace('\\', "/"),
+                frontmatter,
+                body,
+            });
+        }
+    }
+    Ok(pages)
+}
+
+impl ExistingPage {
+    /// 该页面占用的全部名称（title + aliases，归一化后）。
+    fn owned_names(&self) -> Vec<String> {
+        let mut names = vec![normalize_name(&self.frontmatter.title)];
+        names.extend(self.frontmatter.aliases.iter().map(|n| normalize_name(n)));
+        names
+    }
+}
+
+/// 组装页面计划：Source page（按 raw 路径锚定复用）+ 实体/概念
+/// （批内同名合并、与既有页面精确名去重、related 解析、slug 分配）。
+fn build_plan(
+    analysis: &AnalysisOutcome,
+    raw_rel: &str,
+    existing: &[ExistingPage],
+) -> Result<Vec<PlannedPage>> {
+    let mut planned: Vec<PlannedPage> = Vec::new();
+
+    // Source page：身份键是 raw 相对路径（同一 raw 变更后重摄取更新原页）。
+    let source_existing = existing
+        .iter()
+        .find(|p| p.frontmatter.raw_path.as_deref() == Some(raw_rel))
+        .cloned();
+    let source_title = source_existing
+        .as_ref()
+        .map(|p| p.frontmatter.title.clone())
+        .unwrap_or_else(|| analysis.source_title.trim().to_string());
+    planned.push(PlannedPage {
+        kind: PageKind::Source,
+        title: source_title.clone(),
+        aliases: vec![source_title],
+        tags: vec!["source".to_string()],
+        related: Vec::new(),
+        summary: analysis.source_summary.clone(),
+        existing: source_existing,
+        path: String::new(), // 下方统一分配
+    });
+
+    // 既有实体/概念页面索引（Source page 不参与精确名去重）。
+    let existing_index: Vec<&ExistingPage> = existing
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.frontmatter.page_type,
+                PageKind::Entity | PageKind::Concept
+            )
+        })
+        .collect();
+
+    let items: Vec<(PageKind, &AnalyzedPage)> = analysis
+        .entities
+        .iter()
+        .map(|p| (PageKind::Entity, p))
+        .chain(analysis.concepts.iter().map(|p| (PageKind::Concept, p)))
+        .collect();
+
+    for (kind, item) in items {
+        let title = item.title.trim().to_string();
+        if title.is_empty() {
+            continue; // 无名条目无法成为页面，丢弃
+        }
+        // aliases 非空不变量的第一步：title 自身始终在别名集内。
+        let mut aliases: Vec<String> = item
+            .aliases
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        if !aliases
+            .iter()
+            .any(|a| normalize_name(a) == normalize_name(&title))
+        {
+            aliases.push(title.clone());
+        }
+        // 批内精确名去重：同名（title 或别名相撞）合并进已计划页面。
+        if let Some(idx) = find_batch_match(&planned, &title, &aliases) {
+            merge_into_planned(&mut planned[idx], item);
+            continue;
+        }
+
+        // 与既有页面精确名去重（title/alias 任一相等，不区分大小写）。
+        let matched = existing_index
+            .iter()
+            .find(|p| names_intersect(&p.owned_names(), &title, &aliases))
+            .map(|p| (*p).clone());
+
+        planned.push(PlannedPage {
+            kind,
+            title,
+            aliases,
+            tags: if item.tags.is_empty() {
+                vec![kind.as_str().to_string()]
+            } else {
+                item.tags.clone()
+            },
+            related: item.related.clone(),
+            summary: item.summary.clone(),
+            existing: matched,
+            path: String::new(),
+        });
+    }
+
+    // Source page 的 related 指向本次全部产出页面（与正文产出索引呼应，
+    // 让 Wiki Graph 从溯源锚点可达每个产出页）。
+    if let Some((source, rest)) = planned.split_first_mut() {
+        source.related = rest.iter().map(|p| p.title.clone()).collect();
+    }
+
+    // related 解析：本批页面名 → 该批 link；既有页面名 → 既有 link；
+    // 解析不到丢弃（不产生死链，孤儿关联留给 lint）。
+    let link_by_batch_name: HashMap<String, String> = planned
+        .iter()
+        .flat_map(|p| {
+            let link = format!("{}/{}", p.kind.dir(), slugify(&p.title));
+            std::iter::once((normalize_name(&p.title), link.clone())).chain(
+                p.aliases
+                    .iter()
+                    .map(move |a| (normalize_name(a), link.clone())),
+            )
+        })
+        .collect();
+    let link_by_existing_name: HashMap<String, String> = existing
+        .iter()
+        .flat_map(|p| {
+            let link = p.path.strip_suffix(".md").unwrap_or(&p.path).to_string();
+            std::iter::once((normalize_name(&p.frontmatter.title), link.clone())).chain(
+                p.frontmatter
+                    .aliases
+                    .iter()
+                    .map(move |a| (normalize_name(a), link.clone())),
+            )
+        })
+        .collect();
+    for page in &mut planned {
+        if page.related.is_empty() {
+            continue;
+        }
+        let related = std::mem::take(&mut page.related);
+        page.related = related
+            .iter()
+            .filter_map(|name| {
+                let key = normalize_name(name);
+                link_by_batch_name
+                    .get(&key)
+                    .or_else(|| link_by_existing_name.get(&key))
+                    .map(|link| format!("[[{link}]]"))
+            })
+            .collect();
+    }
+
+    // 路径分配：更新保留原路径；新建按 slug（同目录冲突追加序号）。
+    let mut used_paths: HashMap<String, usize> = HashMap::new();
+    for page in &mut planned {
+        if let Some(existing_page) = &page.existing {
+            page.path = existing_page.path.clone();
+            continue;
+        }
+        let base = slugify(&page.title);
+        let dir = page.kind.dir();
+        let counter = used_paths.entry(format!("{dir}/{base}")).or_insert(0);
+        let slug = if *counter == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", *counter + 1)
+        };
+        *counter += 1;
+        page.path = format!("{dir}/{slug}.md");
+    }
+    Ok(planned)
+}
+
+/// 批内匹配：已计划页面的 title/aliases 与新条目名称相撞（不区分大小写）。
+fn find_batch_match(planned: &[PlannedPage], title: &str, aliases: &[String]) -> Option<usize> {
+    let new_names: Vec<String> = std::iter::once(normalize_name(title))
+        .chain(aliases.iter().map(|n| normalize_name(n)))
+        .collect();
+    planned.iter().position(|p| {
+        let owned: Vec<String> = std::iter::once(normalize_name(&p.title))
+            .chain(p.aliases.iter().map(|n| normalize_name(n)))
+            .collect();
+        owned.iter().any(|o| new_names.contains(o))
+    })
+}
+
+/// 批内同名的后续条目合并进首个计划页面（aliases/tags/related/summary 累积）。
+fn merge_into_planned(target: &mut PlannedPage, item: &AnalyzedPage) {
+    for alias in &item.aliases {
+        let alias = alias.trim().to_string();
+        if alias.is_empty() {
+            continue;
+        }
+        let normalized = normalize_name(&alias);
+        let title_norm = normalize_name(&target.title);
+        if normalized != title_norm
+            && !target
+                .aliases
+                .iter()
+                .any(|a| normalize_name(a) == normalized)
+        {
+            target.aliases.push(alias);
+        }
+    }
+    for tag in &item.tags {
+        if !target.tags.contains(tag) {
+            target.tags.push(tag.clone());
+        }
+    }
+    target.related.extend(item.related.iter().cloned());
+    if !item.summary.trim().is_empty() {
+        target.summary = format!("{}\n\n{}", target.summary, item.summary);
+    }
+}
+
+/// 名称集合相交判定（精确匹配、不区分大小写）。
+fn names_intersect(owned: &[String], title: &str, aliases: &[String]) -> bool {
+    let incoming: Vec<String> = std::iter::once(normalize_name(title))
+        .chain(aliases.iter().map(|n| normalize_name(n)))
+        .collect();
+    owned.iter().any(|o| incoming.contains(o))
+}
+
+// ---------------------------------------------------------------------------
+// 第二步：成文（strong 档）
+// ---------------------------------------------------------------------------
+
+/// 第二步 system 指令。
+const COMPOSE_SYSTEM: &str = "\
+You are a wiki page writer for an Obsidian-style knowledge vault. \
+For every page in the given plan, write a Markdown body: concise, durable, \
+knowledge-page oriented (not a chat reply). Follow the language of the raw \
+source (default to Chinese when unclear). Reference other pages from the plan \
+with [[wikilinks]] using exactly the paths given in the plan. The source page \
+(sources/…) body starts with a summary; do NOT list produced pages there \
+(the engine appends the index). Output contract — ONE JSON object and \
+nothing else: {\"pages\": [{\"path\": \"<path from plan, without .md>\", \
+\"body\": \"<markdown>\"}]}.";
+
+/// 第二步调用：一次生成全部页面正文；解析失败重试一次，再失败报错。
+async fn compose(
+    strong: &dyn LlmPort,
+    template: &WikiTemplate,
+    raw: &str,
+    raw_rel: &str,
+    planned: &[PlannedPage],
+) -> Result<HashMap<String, String>> {
+    let plan_json: Vec<serde_json::Value> = planned
+        .iter()
+        .map(|p| {
+            let mut item = serde_json::json!({
+                "path": p.path.strip_suffix(".md").unwrap_or(&p.path),
+                "type": p.kind.as_str(),
+                "title": p.title,
+                "aliases": p.aliases,
+                "summary": p.summary,
+                "related_links": p.related,
+            });
+            if let Some(existing) = &p.existing {
+                item["existing_body"] =
+                    serde_json::Value::String(truncate_chars(&existing.body, 2000));
+            }
+            item
+        })
+        .collect();
+    let user = format!(
+        "# Vault template\n{}\n\n# Page plan\n```json\n{}\n```\n\n# Raw source ({raw_rel})\n```text\n{raw}\n```\n",
+        template.schema_prompt,
+        serde_json::to_string_pretty(&plan_json)?,
+    );
+
+    let mut last_error = String::new();
+    for _attempt in 0..2 {
+        let output = strong.complete(Some(COMPOSE_SYSTEM), &user).await?;
+        match parse_written(&output) {
+            Ok(pages) => {
+                let mut bodies = HashMap::new();
+                for page in pages.pages {
+                    let key = page
+                        .path
+                        .strip_suffix(".md")
+                        .unwrap_or(&page.path)
+                        .to_string();
+                    bodies.insert(key, page.body);
+                }
+                return Ok(bodies);
+            }
+            Err(err) => last_error = err.to_string(),
+        }
+    }
+    Err(Error::BadLlmOutput(format!(
+        "成文输出两次均无法解析（最后一次：{last_error}）"
+    )))
+}
+
+fn parse_written(output: &str) -> Result<WrittenPages> {
+    let json = extract_json_object(output);
+    serde_json::from_str(json).map_err(|err| Error::BadLlmOutput(format!("JSON 解析失败：{err}")))
+}
+
+/// 按字符数截断（Unicode 安全；喂给 LLM 的既有正文限长用）。
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut truncated: String = text.chars().take(max_chars).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Draft 组装
+// ---------------------------------------------------------------------------
+
+/// 把计划 + 正文组装成 Draft：frontmatter 合并（update 保留 created、
+/// 并集 aliases/tags/related/sources）、Source 正文追加产出索引。
+fn build_draft(
+    raw_rel: &str,
+    plan: Vec<PlannedPage>,
+    bodies: &HashMap<String, String>,
+    fingerprint: &str,
+) -> IngestDraft {
+    let now = chrono::Local::now().to_rfc3339();
+    let source_link = plan
+        .first()
+        .map(|p| p.path.strip_suffix(".md").unwrap_or(&p.path).to_string());
+
+    let mut pages: Vec<PageDraft> = Vec::new();
+    for item in plan.iter().skip(1) {
+        pages.push(build_page_draft(item, &source_link, bodies, &now, None));
+    }
+
+    // Source page 放首位；正文尾部追加确定性产出索引（引擎生成非 LLM）。
+    let source_item = plan.first().expect("页面计划至少含 Source 页");
+    let mut source = build_page_draft(
+        source_item,
+        &source_link,
+        bodies,
+        &now,
+        Some((raw_rel, fingerprint)),
+    );
+    source.body.push_str(&produced_index(&pages_meta(&pages)));
+    let source_title = source.frontmatter.title.clone();
+    pages.insert(0, source);
+
+    IngestDraft {
+        source_title,
+        raw_path: raw_rel.to_string(),
+        fingerprint: fingerprint.to_string(),
+        pages,
+    }
+}
+
+/// 单个计划页面 → Draft 页面：字段合并与不变量兜底。
+///
+/// `raw_pointer` 仅 Source page 使用（raw 相对路径 + 指纹）。
+fn build_page_draft(
+    item: &PlannedPage,
+    source_link: &Option<String>,
+    bodies: &HashMap<String, String>,
+    now: &str,
+    raw_pointer: Option<(&str, &str)>,
+) -> PageDraft {
+    let action = if item.existing.is_some() {
+        PageAction::Update
+    } else {
+        PageAction::Create
+    };
+    let mut aliases = item.aliases.clone();
+    let mut tags = item.tags.clone();
+    let mut related = item.related.clone();
+    let (path, created, mut sources) = match &item.existing {
+        Some(old) => {
+            // 更新：保留 created 与 path；字段取并集（旧在前，保序去重）。
+            for alias in &old.frontmatter.aliases {
+                let normalized = normalize_name(alias);
+                if normalized != normalize_name(&item.title)
+                    && !aliases.iter().any(|a| normalize_name(a) == normalized)
+                {
+                    aliases.push(alias.clone());
+                }
+            }
+            for tag in &old.frontmatter.tags {
+                if !tags.contains(tag) {
+                    tags.push(tag.clone());
+                }
+            }
+            for r in &old.frontmatter.related {
+                if !related.contains(r) {
+                    related.push(r.clone());
+                }
+            }
+            (
+                old.path.clone(),
+                old.frontmatter.created.clone(),
+                old.frontmatter.sources.clone(),
+            )
+        }
+        None => (item.path.clone(), now.to_string(), Vec::new()),
+    };
+
+    // sources：Entity/Concept 指回本次 Source page；Source page 自身为空
+    //（它的原文指针是专有字段 raw_path + fingerprint）。
+    if item.kind != PageKind::Source {
+        if let Some(link) = source_link {
+            let link_ref = format!("[[{link}]]");
+            if !sources.contains(&link_ref) {
+                sources.push(link_ref);
+            }
+        }
+    }
+
+    // aliases 非空不变量兜底（title 必在别名集内）。
+    aliases.retain(|a| !a.trim().is_empty());
+    if !aliases
+        .iter()
+        .any(|a| normalize_name(a) == normalize_name(&item.title))
+    {
+        aliases.push(item.title.clone());
+    }
+    if aliases.is_empty() {
+        aliases.push(item.title.clone());
+    }
+
+    let (raw_path, fingerprint) = match raw_pointer {
+        Some((rel, sha)) => (Some(rel.to_string()), Some(sha.to_string())),
+        None => (None, None),
+    };
+
+    let frontmatter = PageFrontmatter {
+        page_type: item.kind,
+        title: item.title.clone(),
+        aliases,
+        tags,
+        related,
+        sources,
+        created,
+        updated: now.to_string(),
+        raw_path,
+        fingerprint,
+    };
+
+    let link = path.strip_suffix(".md").unwrap_or(&path).to_string();
+    let body = bodies
+        .get(&link)
+        .cloned()
+        .unwrap_or_else(|| fallback_body(item));
+    PageDraft {
+        path,
+        action,
+        frontmatter,
+        body: body.trim_end().to_string(),
+    }
+}
+
+/// 第二步漏掉某页时的兜底正文（管道继续，不阻断 Apply）。
+fn fallback_body(item: &PlannedPage) -> String {
+    format!(
+        "（本页正文暂缺，以分析摘要代替）\n\n## 摘要\n\n{}",
+        item.summary.trim()
+    )
+}
+
+/// Source page 正文末尾的产出页面索引（确定性，引擎生成而非 LLM）。
+fn produced_index(pages: &[(String, String, PageAction)]) -> String {
+    let mut out = String::from("\n\n## 产出页面\n\n");
+    for (link, title, action) in pages {
+        let alias = if link == title {
+            String::new()
+        } else {
+            format!("|{title}")
+        };
+        let verb = match action {
+            PageAction::Create => "新建",
+            PageAction::Update => "更新",
+        };
+        out.push_str(&format!("- [[{link}{alias}]]（{verb}）\n"));
+    }
+    out
+}
+
+fn pages_meta(pages: &[PageDraft]) -> Vec<(String, String, PageAction)> {
+    pages
+        .iter()
+        .map(|p| (p.link().to_string(), p.frontmatter.title.clone(), p.action))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Apply 事务：原子写 + git 提交 + log/index 维护
+// ---------------------------------------------------------------------------
+
+/// 写前快照：`None` 表示文件原本不存在（恢复时删除）。
+#[derive(Debug)]
+struct FileSnapshot {
+    path: PathBuf,
+    old_content: Option<String>,
+}
+
+fn snapshot(path: PathBuf) -> FileSnapshot {
+    let old_content = fs::read_to_string(&path).ok();
+    FileSnapshot { path, old_content }
+}
+
+/// 恢复快照：写回旧内容或删除新建文件（best-effort，失败追加到错误消息）。
+fn restore_all(snapshots: &[FileSnapshot]) {
+    for snap in snapshots {
+        let result = match &snap.old_content {
+            Some(content) => atomic_write(&snap.path, content),
+            None => match fs::remove_file(&snap.path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err.into()),
+            },
+        };
+        if let Err(err) = result {
+            eprintln!(
+                "Apply 失败后的快照恢复出错（{}：{err}），请用 git 检查工作区",
+                snap.path.display()
+            );
+        }
+    }
+}
+
+/// index.md 增量更新（纯函数，便于单测）：首次清掉「（暂无页面）」占位，
+/// 已有条目按 link 原位替换，新条目按提交顺序追加。
+fn update_index(existing: &str, entries: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|line| line.trim() != "（暂无页面）")
+        .map(str::to_string)
+        .collect();
+    for (link, title) in entries {
+        let prefix = format!("- [[{link}]]");
+        let prefix_alias = format!("- [[{link}|");
+        let rendered = if link == title {
+            prefix.clone()
+        } else {
+            format!("- [[{link}|{title}]]")
+        };
+        match lines
+            .iter()
+            .position(|line| line.starts_with(&prefix) || line.starts_with(&prefix_alias))
+        {
+            Some(idx) => lines[idx] = rendered,
+            None => lines.push(rendered),
+        }
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// log.md 追加一条可 grep 的时序记录：`## [YYYY-MM-DD] ingest | <标题>`。
+fn append_log(existing: &str, title: &str) -> String {
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let mut out = existing.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("## [{today}] {INGEST_COMMIT_PREFIX} | {title}\n"));
+    out
+}
+
+/// Apply：全部页面 tempfile persist 原子写 + log/index 更新 + 恰好一个
+/// git 提交。任一步失败恢复快照，文件系统与 git 回到提交点。
+fn apply(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
+    let wiki = vault_root.join("wiki");
+
+    // 先在内存生成全部新内容：render 失败（schema 违规）时零写入。
+    let mut writes: Vec<(PathBuf, String)> = Vec::new();
+    for page in &draft.pages {
+        writes.push((wiki.join(&page.path), page.render()?));
+    }
+    let index_entries: Vec<(String, String)> = draft
+        .pages
+        .iter()
+        .map(|p| (p.link().to_string(), p.frontmatter.title.clone()))
+        .collect();
+    let index_path = wiki.join("index.md");
+    let index_new = update_index(
+        &fs::read_to_string(&index_path).unwrap_or_default(),
+        &index_entries,
+    );
+    let log_path = wiki.join("log.md");
+    let log_new = append_log(
+        &fs::read_to_string(&log_path).unwrap_or_default(),
+        &draft.source_title,
+    );
+    writes.push((index_path, index_new));
+    writes.push((log_path, log_new));
+
+    // 快照 → 建目录 → 逐文件原子写 → git add 指定文件 + 单次提交。
+    let snapshots: Vec<FileSnapshot> = writes
+        .iter()
+        .map(|(path, _)| snapshot(path.clone()))
+        .collect();
+    for (path, content) in &writes {
+        let result = (|| -> Result<()> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?; // wiki/sources 等子目录骨架未建
+            }
+            atomic_write(path, content)
+        })();
+        if let Err(err) = result {
+            restore_all(&snapshots);
+            return Err(err);
+        }
+    }
+    let files: Vec<String> = draft
+        .pages
+        .iter()
+        .map(|p| format!("wiki/{}", p.path))
+        .chain([
+            "wiki/index.md".to_string(),
+            "wiki/log.md".to_string(),
+            // raw 随本次提交入库：Source page 的指纹指针需要原文可溯。
+            draft.raw_path.clone(),
+        ])
+        .collect();
+    let message = format!("{INGEST_COMMIT_PREFIX} | {}", draft.source_title);
+    match git::commit_files(vault_root, &files, &message) {
+        Ok(commit) => Ok(commit),
+        Err(err) => {
+            restore_all(&snapshots);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_json_object_tolerates_fences_and_prose() {
+        assert_eq!(
+            extract_json_object(r#"```json {"a": 1} ```"#),
+            r#"{"a": 1}"#
+        );
+        assert_eq!(
+            extract_json_object("好的，结果如下：\n{\"a\": {\"b\": 2}}\n以上。"),
+            r#"{"a": {"b": 2}}"#
+        );
+        assert_eq!(extract_json_object("完全不是 JSON"), "");
+    }
+
+    #[test]
+    fn parse_analysis_accepts_valid_and_rejects_garbage() {
+        let ok = parse_analysis(r#"{"source_title":"T","entities":[{"title":"E","aliases":["e"],"summary":"s"}],"concepts":[]}"#)
+            .expect("合法输出应通过");
+        assert_eq!(ok.source_title, "T");
+        assert_eq!(ok.entities.len(), 1);
+        assert_eq!(ok.entities[0].title, "E");
+        // 缺字段走 serde default：不报错
+        let partial = parse_analysis("{}").expect("空对象合法（全默认值）");
+        assert!(partial.entities.is_empty());
+        assert!(parse_analysis("垃圾输出").is_err());
+    }
+
+    #[test]
+    fn update_index_replaces_placeholder_then_upserts_lines() {
+        let initial = "# Wiki Index\n\n说明。\n\n## 页面\n\n（暂无页面）\n";
+        let v1 = update_index(initial, &[("entities/a".into(), "A".into())]);
+        assert!(!v1.contains("（暂无页面）"), "占位行应被清除");
+        assert!(v1.contains("- [[entities/a|A]]"));
+
+        // 同 link 更新标题 → 原位替换不重复追加
+        let v2 = update_index(&v1, &[("entities/a".into(), "A2".into())]);
+        assert_eq!(v2.matches("[[entities/a").count(), 1);
+        assert!(v2.contains("- [[entities/a|A2]]"));
+        assert!(!v2.contains("A]]"));
+
+        // 新条目追加（link != title 时带别名形式）
+        let v3 = update_index(&v2, &[("sources/s".into(), "s".into())]);
+        assert!(v3.contains("- [[sources/s|s]]"));
+        // link == title 时用短形式
+        let v4 = update_index(&v3, &[("concepts/c".into(), "concepts/c".into())]);
+        assert!(v4.trim_end().ends_with("- [[concepts/c]]"));
+    }
+
+    #[test]
+    fn append_log_adds_greppable_entry() {
+        let initial = "# Wiki Log\n\n## [2026-01-01] init | Vault\n";
+        let out = append_log(initial, "Attention Is All You Need");
+        let last = out.lines().last().unwrap();
+        assert!(
+            last.starts_with("## [")
+                && last.contains("] corpus: ingest | Attention Is All You Need"),
+            "记录行应为 `## [日期] corpus: ingest | 标题`：{last}"
+        );
+        // 日期是今天（本地）
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(last.contains(&today));
+    }
+
+    #[test]
+    fn truncate_chars_is_unicode_safe() {
+        assert_eq!(truncate_chars("短文", 10), "短文");
+        let long = "知识库知识库知识库";
+        let cut = truncate_chars(long, 4);
+        assert_eq!(cut, "知识库知…");
+    }
+}
