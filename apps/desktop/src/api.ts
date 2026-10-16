@@ -62,13 +62,19 @@ export interface IngestedPage {
   action: PageAction
 }
 
-/** ingest_file 的结果：跳过路径（指纹命中）或完整产出快照。 */
+/** ingest_file 的结果：跳过路径（指纹命中）、已落盘或人审未落盘的快照。 */
 export interface IngestReport {
   skipped: boolean
+  /** Draft 是否已落盘（指纹跳过与人审模式为 false）。 */
+  applied: boolean
   fingerprint: string
   source_title: string
   pages: IngestedPage[]
   commit: string | null
+  /** 人审模式（apply_mode=manual）：Draft 人读检视清单。 */
+  summary_lines: string[]
+  /** 人审模式注明（Draft 未落盘，完整人审流程属 T5）。 */
+  note: string | null
 }
 
 /** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。 */

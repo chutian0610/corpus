@@ -30,10 +30,13 @@ interface IngestedPage {
 
 interface IngestReport {
   skipped: boolean
+  applied: boolean
   fingerprint: string
   source_title: string
   pages: IngestedPage[]
   commit: string | null
+  summary_lines: string[]
+  note: string | null
 }
 
 type IngestProgress =
@@ -76,8 +79,9 @@ function upsertRecent(path: string, templateId: string): void {
 }
 
 /**
- * 假摄取：按 400ms 间隔推进四阶段进度事件（走 mock 事件通道），
- * 最后 resolve 假报告。不写任何文件。
+ * 假摄取（模拟默认配置 apply_mode=manual）：按 400ms 间隔推进进度事件
+ * （走 mock 事件通道；人审模式无落盘阶段），最后 resolve 未落盘的
+ * Draft 检视清单。不写任何文件。
  */
 async function fakeIngest(rawPath: string): Promise<IngestReport> {
   const { emit } = await import('@tauri-apps/api/event')
@@ -85,7 +89,6 @@ async function fakeIngest(rawPath: string): Promise<IngestReport> {
     { stage: 'reading', raw: rawPath },
     { stage: 'analyzing' },
     { stage: 'generating', pages: FAKE_INGEST_PAGES.length },
-    { stage: 'applying', pages: FAKE_INGEST_PAGES.length },
   ]
   for (const step of script) {
     await new Promise((resolve) => setTimeout(resolve, 400))
@@ -93,10 +96,18 @@ async function fakeIngest(rawPath: string): Promise<IngestReport> {
   }
   return {
     skipped: false,
+    applied: false,
     fingerprint: 'browser-mock-fingerprint',
     source_title: 'Attention Is All You Need',
     pages: FAKE_INGEST_PAGES,
-    commit: 'deadbee',
+    commit: null,
+    summary_lines: [
+      'source: Attention Is All You Need (raw: raw/paper.md, sha256: browser-mock-fingerprint)',
+      'Create sources/attention-is-all-you-need.md: Attention Is All You Need',
+      'Create entities/transformer.md: Transformer',
+      'Create concepts/自注意力.md: 自注意力',
+    ],
+    note: '人审模式：Draft 未落盘，完整人审流程属 T5',
   }
 }
 
