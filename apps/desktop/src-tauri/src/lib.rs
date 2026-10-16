@@ -140,16 +140,10 @@ async fn ingest_file(
     let fast = corpus_engine::build_llm_port(&config.fast).map_err(|e| e.to_string())?;
     let strong = corpus_engine::build_llm_port(&config.strong).map_err(|e| e.to_string())?;
 
-    corpus_engine::ingest_file(
-        &vault_path,
-        &raw_path,
-        &fast,
-        &strong,
-        |stage| {
-            // 事件推送失败只影响进度展示，不阻断摄取
-            let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
-        },
-    )
+    corpus_engine::ingest_file(&vault_path, &raw_path, &fast, &strong, |stage| {
+        // 事件推送失败只影响进度展示，不阻断摄取
+        let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
+    })
     .await
     .map_err(|e| e.to_string())
 }
