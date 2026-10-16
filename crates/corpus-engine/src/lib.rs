@@ -7,12 +7,14 @@
 //!   Vault 注册表（[`registry`]）、LLM 窄端口 [`LlmPort`] 与连通测试协议，
 //!   以及 `rig` feature 之后的 Rig 真实实现（[`rig_llm`]）。
 
+mod atomic;
 mod git;
 
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod llm;
+pub mod page;
 pub mod provider;
 pub mod registry;
 #[cfg(feature = "rig")]
@@ -24,6 +26,10 @@ pub use config::{AppConfig, ApplyMode, ConfigStore, ModelTier, ProviderKind};
 pub use engine::Engine;
 pub use error::{Error, Result};
 pub use llm::{ConnectionReport, LlmPort};
+pub use page::{
+    parse_page, slugify, split_frontmatter, wikilink, PageAction, PageDraft, PageFrontmatter,
+    PageKind,
+};
 pub use provider::{NullProvider, Provider};
 pub use registry::RecentVault;
 #[cfg(feature = "rig")]
