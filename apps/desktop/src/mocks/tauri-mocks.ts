@@ -146,6 +146,19 @@ function fakePageContent(relPath: string): string {
   ].join('\n')
 }
 
+/** read_page 的路径校验（引擎 resolve_page_path 语义的 JS 简化版）：
+ *  拒绝绝对路径（前导 `/`、`\` 或 Windows 盘符 `C:`）、段级 `..` 与
+ *  非 `.md` 后缀。段级判断只认整段等于 `..`，不误伤 `a..b.md` 这类
+ *  文件名（引擎侧由逐组件校验等价保证；symlink 逃逸在浏览器 mock 无
+ *  文件系统，无从模拟）。 */
+function isValidPagePath(relPath: string): boolean {
+  const isAbsolute = /^(\/|\\|[A-Za-z]:)/.test(relPath)
+  const hasParentSegment = relPath
+    .split(/[\\/]/)
+    .some((segment) => segment === '..')
+  return !isAbsolute && !hasParentSegment && relPath.endsWith('.md')
+}
+
 /**
  * 假摄取（模拟默认配置 apply_mode=manual）：按 400ms 间隔推进进度事件
  * （走 mock 事件通道；人审模式无落盘阶段），最后 resolve 未落盘的
@@ -274,7 +287,7 @@ mockIPC(
         if (!knownVaults.has(vaultPath)) {
           throw `路径不是有效的 Corpus Vault：${vaultPath}（缺 wiki/ 目录）`
         }
-        if (relPath.includes('..') || !relPath.endsWith('.md')) {
+        if (!isValidPagePath(relPath)) {
           throw `非法页面路径：${relPath}（必须是 wiki/ 内的相对 .md 路径）`
         }
         const known = fakePageTree().groups.some((g) => g.pages.some((p) => p.path === relPath))

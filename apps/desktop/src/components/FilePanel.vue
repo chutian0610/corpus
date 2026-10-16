@@ -4,15 +4,8 @@
  *  pagesVersion bump，本面板据此自动重拉。点条目 → 主区只读预览。 */
 import { onMounted, ref, watch } from 'vue'
 import { listPages, type PageEntry, type PageGroup } from '../api'
-import { errorMessage, pageDisplayName } from '../display'
+import { errorMessage, PAGE_TYPE_LABELS, pageDisplayName } from '../display'
 import { currentVault, pagesVersion } from '../vault-state'
-
-/** 类型分组标签（与 IngestPage 的 PAGE_TYPE_LABELS 口径一致）。 */
-const GROUP_LABELS: Record<PageGroup['kind'], string> = {
-  source: 'Source 页',
-  entity: 'Entity',
-  concept: 'Concept',
-}
 
 const props = defineProps<{
   /** 当前选中的页面路径（高亮；null = 未选中）。 */
@@ -64,7 +57,7 @@ watch(
 )
 
 function label(group: PageGroup): string {
-  return GROUP_LABELS[group.kind] ?? group.kind
+  return PAGE_TYPE_LABELS[group.kind] ?? group.kind
 }
 </script>
 

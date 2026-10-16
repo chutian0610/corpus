@@ -1,13 +1,14 @@
-//! Wiki 浏览：`list_pages` 纯文件系统遍历的页面树（应用壳 T-UX）。
+//! Wiki 浏览：`list_pages` 纯文件系统遍历的页面树 + `resolve_page_path`
+//! 只读入口的路径安全校验（应用壳 T-UX）。
 //!
 //! 与 Ingest 管道的 [`crate::ingest::scan_existing_pages`]（全量解析
 //! frontmatter 供精确名去重）分工：本模块只回答「wiki/ 下有哪些页面
-//! 文件、各自最后更新于何时」，供文件面板与状态栏展示——零 LLM、
-//! 零写入；`updated` 只做宽松窥探（只读该字段，页面 schema 不合规
-//! 不影响列出，只是该项为 `None`）。
+//! 文件、各自最后更新于何时」与「这个相对路径能不能安全地读」，供
+//! 文件面板与预览面板使用——零 LLM、零写入；`updated` 只做宽松窥探
+//! （只读该字段，页面 schema 不合规不影响列出，只是该项为 `None`）。
 
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +84,49 @@ pub fn list_pages(vault_root: impl AsRef<Path>) -> Result<PageTree> {
         }
     }
     Ok(PageTree { groups })
+}
+
+/// 解析并校验 `wiki/` 下的页面相对路径（公共 API）：通过全部校验后
+/// 返回该页面的规范化绝对路径，供 `read_page` 等只读入口安全读取。
+///
+/// 这是页面路径安全的单一关口，前置拒绝 + 解析后断言逐层设防，全部
+/// 失败均报 [`Error::InvalidPagePath`]：
+/// - `rel_path` 必须是纯相对路径：拒绝绝对路径，逐组件只放行
+///   `Component::Normal`——`..`（逃逸）、`Component::Prefix`（Windows
+///   盘符 `C:foo.md`）、`Component::RootDir`（根分隔符 `\foo.md`）、
+///   开头 `.` 一律拒绝，`is_absolute` 抓不到后两类 Windows 形态；
+/// - 仅接受 `.md` 后缀（页面文件是 Markdown）；
+/// - 拼接 `wiki/` 后 canonicalize 并断言真实路径仍在 Vault 根的
+///   canonicalize 路径之下——symlink 指到 Vault 外（逃逸）与
+///   canonicalize 失败（页面不存在 / broken symlink）都按错误处理。
+pub fn resolve_page_path(vault_root: impl AsRef<Path>, rel_path: &str) -> Result<PathBuf> {
+    let root = vault_root.as_ref();
+    let invalid = |reason: String| Error::InvalidPagePath {
+        path: rel_path.to_string(),
+        reason,
+    };
+    let rel = Path::new(rel_path);
+    if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(invalid(
+            "必须是 wiki/ 内的相对 .md 路径（不允许绝对路径、..、盘符前缀或根分隔符）".to_string(),
+        ));
+    }
+    if rel.extension().and_then(|e| e.to_str()) != Some("md") {
+        return Err(invalid("必须是 .md 页面路径".to_string()));
+    }
+    let page = root.join("wiki").join(rel);
+    // canonicalize 落到「真实」路径：broken symlink / 不存在在此报错，
+    // symlink 逃逸在随后的包含断言被拒。
+    let canonical_page = page
+        .canonicalize()
+        .map_err(|err| invalid(format!("无法解析真实路径：{err}")))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|err| invalid(format!("无法解析 Vault 根的真实路径：{err}")))?;
+    if !canonical_page.starts_with(&canonical_root) {
+        return Err(invalid("解析结果逃出 Vault（symlink？）".to_string()));
+    }
+    Ok(canonical_page)
 }
 
 /// 递归收集 `dir` 下的 `.md` 文件为页面条目（读内容窥探 `updated`）。

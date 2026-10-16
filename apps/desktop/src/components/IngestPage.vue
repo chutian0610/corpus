@@ -8,7 +8,7 @@ import {
   type IngestReport,
   type PageKind,
 } from '../api'
-import { errorMessage } from '../display'
+import { errorMessage, PAGE_TYPE_LABELS } from '../display'
 import { bumpPages, currentVault } from '../vault-state'
 
 /** 四阶段步骤条（引擎 IngestStage 的 UI 映射）。 */
@@ -18,12 +18,6 @@ const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
   { key: 'generating', label: '生成' },
   { key: 'applying', label: '落盘' },
 ]
-
-const PAGE_TYPE_LABELS: Record<PageKind, string> = {
-  source: 'Source 页',
-  entity: 'Entity',
-  concept: 'Concept',
-}
 
 type Phase = 'idle' | IngestProgress['stage'] | 'done' | 'error'
 
