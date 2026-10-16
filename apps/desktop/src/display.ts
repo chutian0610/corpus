@@ -29,6 +29,17 @@ export function formatDateTime(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
 }
 
+/** 路径最后一段（目录名 / 文件名），兼容 Windows 分隔符 */
+export function pathBasename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  return parts.length > 0 ? parts[parts.length - 1] : path
+}
+
+/** 页面路径（相对 wiki/）的展示名：末段文件名去 .md 后缀 */
+export function pageDisplayName(path: string): string {
+  return pathBasename(path).replace(/\.md$/, '')
+}
+
 /** 把 Tauri invoke 抛出的错误统一转为可展示文本。
  *
  * Tauri 命令错误多为字符串，但结构化错误会以对象抛出——统一收敛到
