@@ -3,12 +3,17 @@
 //! T2：setup 中解析 `app_data_dir()` 并注入 [`ConfigStore`]（引擎只认
 //! 目录参数，见 T2 调研笔记第 6 节），新增配置 / 连通测试 / 最近 Vault
 //! 命令。
+//! T3：`ingest_file` 命令——引擎进度回调桥接为 `ingest-progress` 事件
+//! （AppHandle: Emitter，见 T3 调研笔记第 4 节）。
 
 use corpus_engine::{
-    AppConfig, ConfigStore, ConnectionReport, ModelTier, RecentVault, TemplateId, TemplateInfo,
-    VaultInfo,
+    AppConfig, ConfigStore, ConnectionReport, IngestReport, ModelTier, RecentVault, TemplateId,
+    TemplateInfo, VaultInfo,
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// 前端 listen 的 Ingest 进度事件名。
+pub const INGEST_PROGRESS_EVENT: &str = "ingest-progress";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,6 +37,7 @@ pub fn run() {
             list_recent_vaults,
             add_recent_vault,
             remove_recent_vault,
+            ingest_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -115,4 +121,29 @@ async fn remove_recent_vault(store: State<'_, ConfigStore>, path: String) -> Res
         .remove_recent_vault(&path)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 摄取一个 raw 文件：指纹检查 → 两步 LLM → Draft → 自动 Apply。
+///
+/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文）；
+/// 引擎的 `on_progress` 回调在这里桥接为全局 `ingest-progress` 事件
+/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。
+/// 模板取自 Vault 创建时绑定的 `.corpus/vault.json`。
+#[tauri::command]
+async fn ingest_file(
+    app: AppHandle,
+    store: State<'_, ConfigStore>,
+    vault_path: String,
+    raw_path: String,
+) -> Result<IngestReport, String> {
+    let config: AppConfig = store.get_config().map_err(|e| e.to_string())?;
+    let fast = corpus_engine::build_llm_port(&config.fast).map_err(|e| e.to_string())?;
+    let strong = corpus_engine::build_llm_port(&config.strong).map_err(|e| e.to_string())?;
+
+    corpus_engine::ingest_file(&vault_path, &raw_path, &fast, &strong, |stage| {
+        // 事件推送失败只影响进度展示，不阻断摄取
+        let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
+    })
+    .await
+    .map_err(|e| e.to_string())
 }

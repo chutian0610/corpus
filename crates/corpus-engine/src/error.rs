@@ -23,6 +23,32 @@ pub enum Error {
         available: String,
     },
 
+    /// 路径不是本引擎管理的有效 Vault（缺骨架 / 缺元数据）。
+    #[error("路径不是有效的 Corpus Vault：{}（{reason}）", path.display())]
+    NotAVault {
+        /// 被拒绝的 Vault 根路径。
+        path: PathBuf,
+        /// 具体原因（缺哪个文件 / 什么校验失败）。
+        reason: String,
+    },
+
+    /// Ingest 的 raw 文件不在 Vault 的 raw/ 目录内。
+    #[error("raw 文件必须在 Vault 的 raw/ 目录内：{}（Vault：{}）", raw.display(), vault.display())]
+    RawNotInVault {
+        /// 传入的 raw 文件路径。
+        raw: PathBuf,
+        /// Vault 根路径。
+        vault: PathBuf,
+    },
+
+    /// LLM 返回的输出无法解析为引擎期望的结构（重试耗尽后）。
+    #[error("LLM 输出无法解析：{0}")]
+    BadLlmOutput(String),
+
+    /// YAML frontmatter 序列化/反序列化失败。
+    #[error("YAML frontmatter 错误：{0}")]
+    Yaml(#[from] serde_yaml_ng::Error),
+
     /// 文件系统 IO 错误。
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),

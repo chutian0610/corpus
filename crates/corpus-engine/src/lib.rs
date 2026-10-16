@@ -7,12 +7,16 @@
 //!   Vault 注册表（[`registry`]）、LLM 窄端口 [`LlmPort`] 与连通测试协议，
 //!   以及 `rig` feature 之后的 Rig 真实实现（[`rig_llm`]）。
 
+mod atomic;
 mod git;
 
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod fingerprint;
+pub mod ingest;
 pub mod llm;
+pub mod page;
 pub mod provider;
 pub mod registry;
 #[cfg(feature = "rig")]
@@ -23,7 +27,16 @@ pub mod vault;
 pub use config::{AppConfig, ApplyMode, ConfigStore, ModelTier, ProviderKind};
 pub use engine::Engine;
 pub use error::{Error, Result};
+pub use fingerprint::{sha256_hex, StateStore, STATE_DB_FILENAME};
+pub use ingest::{
+    ingest_file, AnalysisOutcome, AnalyzedPage, IngestReport, IngestStage, IngestedPage,
+    INGEST_COMMIT_PREFIX,
+};
 pub use llm::{ConnectionReport, LlmPort};
+pub use page::{
+    parse_page, slugify, split_frontmatter, wikilink, PageAction, PageDraft, PageFrontmatter,
+    PageKind,
+};
 pub use provider::{NullProvider, Provider};
 pub use registry::RecentVault;
 #[cfg(feature = "rig")]
@@ -32,4 +45,4 @@ pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, PageTypeSpec, TemplateId,
     TemplateInfo, WikiTemplate, GENERIC, READING, RESEARCH,
 };
-pub use vault::{create_vault, VaultInfo};
+pub use vault::{create_vault, vault_template_id, VaultInfo, VaultMeta};

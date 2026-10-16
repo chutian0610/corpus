@@ -59,3 +59,29 @@ pub(super) fn init_with_initial_commit(repo: &Path, message: &str) -> Result<()>
     )?;
     Ok(())
 }
+
+/// `git add <files>` + 单次提交，返回新提交的短 hash。
+///
+/// 只 add 显式给出的文件（而非 `--all`）：指纹缓存等 `.corpus/` 下的
+/// 可再生数据即使未被 .gitignore 覆盖也不会混入提交。每次 Apply 恰好
+/// 产生一个提交（Ingest 事务语义，见票据 T3）。
+pub(crate) fn commit_files(repo: &Path, files: &[String], message: &str) -> Result<String> {
+    let mut add_args = vec!["add".to_string()];
+    add_args.extend(files.iter().cloned());
+    let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
+    run_git(repo, &add_args)?;
+    run_git_with_fallback(
+        repo,
+        &["commit", "--message", message],
+        &[
+            "-c",
+            "user.name=Corpus",
+            "-c",
+            "user.email=corpus@localhost",
+            "commit",
+            "--message",
+            message,
+        ],
+    )?;
+    run_git(repo, &["rev-parse", "--short", "HEAD"])
+}
