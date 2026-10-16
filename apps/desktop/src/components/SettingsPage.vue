@@ -1,35 +1,19 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import {
+  addRecentVault,
+  getConfig,
+  listRecentVaults,
+  removeRecentVault,
+  setConfig,
+  testConnection,
+  type AppConfig,
+  type ConnectionReport,
+  type ModelTier,
+  type RecentVault,
+} from '../api'
 import { PROVIDER_OPTIONS, errorMessage, formatDateTime, templateDisplayName } from '../display'
 import { currentVault } from '../vault-state'
-
-/** 引擎 serde 的 snake_case 结构 */
-
-interface ModelTier {
-  provider: string
-  model: string
-  base_url: string | null
-  api_key_env: string | null
-}
-
-interface AppConfig {
-  fast: ModelTier
-  strong: ModelTier
-  apply_mode: 'auto' | 'manual'
-  query_pages: boolean
-}
-
-interface ConnectionReport {
-  latency_ms: number
-  reply: string
-}
-
-interface RecentVault {
-  path: string
-  template_id: string
-  opened_at: string
-}
 
 /** 表单内的档位：可空字段用空串编辑，提交时转回 null */
 interface TierForm {
@@ -75,7 +59,7 @@ onMounted(async () => {
 
 async function loadConfig(): Promise<void> {
   try {
-    const config = await invoke<AppConfig>('get_config')
+    const config = await getConfig()
     form.fast = toTierForm(config.fast)
     form.strong = toTierForm(config.strong)
     form.apply_mode = config.apply_mode
@@ -87,7 +71,7 @@ async function loadConfig(): Promise<void> {
 
 async function loadRecentVaults(): Promise<void> {
   try {
-    recentVaults.value = await invoke<RecentVault[]>('list_recent_vaults')
+    recentVaults.value = await listRecentVaults()
   } catch (err) {
     vaultsError.value = errorMessage(err)
   }
@@ -121,7 +105,7 @@ async function saveConfig(): Promise<void> {
       apply_mode: form.apply_mode,
       query_pages: form.query_pages,
     }
-    await invoke('set_config', { config })
+    await setConfig(config)
     saveState.value = 'saved'
     setTimeout(() => {
       if (saveState.value === 'saved') saveState.value = 'idle'
@@ -138,9 +122,7 @@ async function runTestConnection(key: 'fast' | 'strong'): Promise<void> {
   testResult[key] = null
   testError[key] = null
   try {
-    testResult[key] = await invoke<ConnectionReport>('test_connection', {
-      tier: toModelTier(form[key]),
-    })
+    testResult[key] = await testConnection(toModelTier(form[key]))
   } catch (err) {
     testError[key] = errorMessage(err)
   } finally {
@@ -155,7 +137,7 @@ async function openRecentVault(v: RecentVault): Promise<void> {
   openingPath.value = v.path
   vaultsError.value = null
   try {
-    await invoke('add_recent_vault', { path: v.path, templateId: v.template_id })
+    await addRecentVault(v.path, v.template_id)
     currentVault.value = { path: v.path, templateId: v.template_id }
     await loadRecentVaults()
   } catch (err) {
@@ -165,11 +147,11 @@ async function openRecentVault(v: RecentVault): Promise<void> {
   }
 }
 
-async function removeRecentVault(path: string): Promise<void> {
+async function handleRemoveRecent(path: string): Promise<void> {
   removingPath.value = path
   vaultsError.value = null
   try {
-    await invoke('remove_recent_vault', { path })
+    await removeRecentVault(path)
     recentVaults.value = recentVaults.value.filter((v) => v.path !== path)
     if (currentVault.value?.path === path) currentVault.value = null
   } catch (err) {
@@ -325,7 +307,7 @@ async function removeRecentVault(path: string): Promise<void> {
                 type="button"
                 class="btn small"
                 :disabled="removingPath === v.path || openingPath === v.path"
-                @click="removeRecentVault(v.path)"
+                @click="handleRemoveRecent(v.path)"
               >
                 {{ removingPath === v.path ? '移除中…' : '移除' }}
               </button>
