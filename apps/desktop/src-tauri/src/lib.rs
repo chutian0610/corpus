@@ -7,10 +7,16 @@
 //! （AppHandle: Emitter，见 T3 调研笔记第 4 节），并按全局配置
 //! `apply_mode` 分支：`auto` 显式 apply，`manual` 不落盘返回 Draft 检视
 //! 清单（完整人审流程属票据 T5）。
+//! T-UX：应用壳两级结构（启动页 + 工作区）的支撑命令——`open_vault`
+//! （引擎校验 + 最近列表登记）、`list_pages`（页面树）、`read_page`
+//! （预览用只读取文）；`add_recent_vault` 退役（「打开」统一走
+//! `open_vault` 的校验口径，不再允许无校验登记）。
+
+use std::path::{Component, Path};
 
 use corpus_engine::{
     AppConfig, ApplyMode, ConfigStore, ConnectionReport, IngestOutcome, IngestReport, IngestStage,
-    ModelTier, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    ModelTier, OpenedVault, PageTree, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -42,8 +48,10 @@ pub fn run() {
             set_config,
             test_connection,
             list_recent_vaults,
-            add_recent_vault,
             remove_recent_vault,
+            open_vault,
+            list_pages,
+            read_page,
             ingest_file,
         ])
         .run(tauri::generate_context!())
@@ -109,18 +117,6 @@ async fn list_recent_vaults(store: State<'_, ConfigStore>) -> Result<Vec<RecentV
     store.list_recent_vaults().map_err(|e| e.to_string())
 }
 
-/// 手动登记一个已存在的 Vault（「打开已有 Vault」入口，后续票据接续）。
-#[tauri::command]
-async fn add_recent_vault(
-    store: State<'_, ConfigStore>,
-    path: String,
-    template_id: TemplateId,
-) -> Result<(), String> {
-    store
-        .add_recent_vault(&path, &template_id)
-        .map_err(|e| e.to_string())
-}
-
 /// 从最近列表移除一个 Vault（只动注册表，不删文件）。
 #[tauri::command]
 async fn remove_recent_vault(store: State<'_, ConfigStore>, path: String) -> Result<(), String> {
@@ -128,6 +124,49 @@ async fn remove_recent_vault(store: State<'_, ConfigStore>, path: String) -> Res
         .remove_recent_vault(&path)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 打开一个已有 Vault（T-UX 启动页 / 工作区的核心入口）。
+///
+/// 引擎 `open_vault` 做只读校验（`.corpus/vault.json` 存在且模板 id 可
+/// 解析），通过后由本命令登记最近列表（全局配置层职责：引擎不越权，
+/// 壳层攒齐两份数据再写）。登记失败不阻断打开——Vault 已真实有效，
+/// 只是「最近」少了这条记录，打日志即可。
+#[tauri::command]
+async fn open_vault(store: State<'_, ConfigStore>, path: String) -> Result<OpenedVault, String> {
+    let opened = corpus_engine::open_vault(&path).map_err(|e| e.to_string())?;
+    if let Err(e) = store.add_recent_vault(&path, &opened.template_id) {
+        eprintln!("写入最近 Vault 注册表失败（不影响打开结果）：{e}");
+    }
+    Ok(opened)
+}
+
+/// 列出当前 Vault 的 wiki/ 页面树（文件面板数据源）。
+///
+/// 纯文件系统遍历（引擎零 LLM 零写入），路径不合法 / 非 Vault 由引擎
+/// 报中文错误。
+#[tauri::command]
+async fn list_pages(vault_path: String) -> Result<PageTree, String> {
+    corpus_engine::list_pages(&vault_path).map_err(|e| e.to_string())
+}
+
+/// 只读读取 `wiki/` 下某页面的原始文本（预览面板；正式渲染属 T4）。
+///
+/// 路径安全：`rel_path` 必须是不含 `..` 的相对 `.md` 路径，拼接后
+/// 不会逃出 `wiki/`。
+#[tauri::command]
+async fn read_page(vault_path: String, rel_path: String) -> Result<String, String> {
+    let rel = Path::new(&rel_path);
+    if rel.is_absolute()
+        || rel.components().any(|c| matches!(c, Component::ParentDir))
+        || rel.extension().and_then(|e| e.to_str()) != Some("md")
+    {
+        return Err(format!(
+            "非法页面路径：{rel_path}（必须是 wiki/ 内的相对 .md 路径）"
+        ));
+    }
+    let full = Path::new(&vault_path).join("wiki").join(rel);
+    std::fs::read_to_string(&full).map_err(|e| format!("读取 {} 失败：{e}", full.display()))
 }
 
 /// ingest_file 命令响应：引擎 [`IngestReport`] 平铺 + Apply 模式语义。
