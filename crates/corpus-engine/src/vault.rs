@@ -62,12 +62,13 @@ const SKELETON: &[&str] = &[
 /// 生成目录骨架：`raw/`、`wiki/index.md`、`wiki/log.md`、`purpose.md`、
 /// `.corpus/`，随后 `git init` 并完成初始提交。
 ///
-/// - `path` 已存在（文件或目录）时报 [`Error::VaultPathExists`]，不覆盖；
+/// - `path` 已存在且非空（文件或含内容的目录）时报 [`Error::VaultPathExists`]，不覆盖；
+/// - `path` 已存在但为空目录时允许（目录选择对话框只能选中已存在的目录）；
 /// - `template_id` 非内置模板时报 [`Error::UnknownTemplate`]，不创建任何文件；
 /// - T1 阶段本操作不调用 LLM。
 pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result<VaultInfo> {
     let root = path.as_ref();
-    if root.exists() {
+    if root.exists() && !is_empty_dir(root) {
         return Err(Error::VaultPathExists {
             path: root.to_path_buf(),
         });
@@ -110,4 +111,12 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result
         template_name: template.name.to_string(),
         created_paths: SKELETON.iter().map(|p| (*p).to_string()).collect(),
     })
+}
+
+/// 路径是「空目录」吗？读取失败按非空处理（保守：宁可拒绝也不覆盖）。
+fn is_empty_dir(path: &Path) -> bool {
+    path.is_dir()
+        && fs::read_dir(path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
 }

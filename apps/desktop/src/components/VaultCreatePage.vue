@@ -160,7 +160,7 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
           浏览…
         </button>
       </div>
-      <p class="hint">目标目录必须不存在，Corpus 会新建它并完成 git 初始提交。</p>
+      <p class="hint">可选择已存在的空目录，或输入尚不存在的新路径；Corpus 会初始化目录骨架并完成 git 初始提交。</p>
     </section>
 
     <div class="actions">

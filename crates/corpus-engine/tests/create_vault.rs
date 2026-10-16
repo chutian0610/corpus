@@ -135,6 +135,22 @@ fn existing_path_is_rejected_without_overwrite() {
 }
 
 #[test]
+fn existing_empty_directory_is_accepted() {
+    // 目录选择对话框只能选中已存在的目录：空目录应可作为 Vault 根
+    let (_dir, root) = fresh_vault_path("vault");
+    fs::create_dir_all(&root).unwrap();
+
+    let info = create_vault(&root, &TemplateId::from("generic")).unwrap();
+    assert_eq!(info.root, root);
+    // 骨架与 git 初始提交与全新路径完全一致
+    assert!(root.join("raw/.gitkeep").exists());
+    assert!(root.join("purpose.md").exists());
+    assert!(root.join("wiki/index.md").exists());
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "工作区不干净：{status}");
+}
+
+#[test]
 fn unknown_template_is_rejected_without_creating_anything() {
     let (_dir, root) = fresh_vault_path("vault");
     let err = create_vault(&root, &TemplateId::from("no-such-template")).unwrap_err();
