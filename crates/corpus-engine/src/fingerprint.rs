@@ -40,7 +40,7 @@ impl StateStore {
     pub fn open(vault_root: impl AsRef<Path>) -> Result<Self> {
         let dir = vault_root.as_ref().join(".corpus");
         std::fs::create_dir_all(&dir)?;
-        Self::open_at(&dir.join(STATE_DB_FILENAME))
+        Self::open_at(dir.join(STATE_DB_FILENAME))
     }
 
     /// 直接按 db 文件路径打开（测试 / 非标准布局用）。

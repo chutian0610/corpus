@@ -14,6 +14,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod fingerprint;
+pub mod ingest;
 pub mod llm;
 pub mod page;
 pub mod provider;
@@ -27,6 +28,10 @@ pub use config::{AppConfig, ApplyMode, ConfigStore, ModelTier, ProviderKind};
 pub use engine::Engine;
 pub use error::{Error, Result};
 pub use fingerprint::{sha256_hex, StateStore, STATE_DB_FILENAME};
+pub use ingest::{
+    ingest_file, AnalysisOutcome, AnalyzedPage, IngestReport, IngestStage, IngestedPage,
+    INGEST_COMMIT_PREFIX,
+};
 pub use llm::{ConnectionReport, LlmPort};
 pub use page::{
     parse_page, slugify, split_frontmatter, wikilink, PageAction, PageDraft, PageFrontmatter,
