@@ -1,19 +1,17 @@
 <script setup lang="ts">
+/** 设置面板（工作区主区）：模型接入与全局行为配置。
+ *  T-UX 起「最近 Vault」卡片删除（职责移交启动页），本面板只管
+ *  全局模型 / 行为配置；保存成功 emit('saved')，App 据此刷新状态栏。 */
 import { onMounted, reactive, ref } from 'vue'
 import {
-  addRecentVault,
   getConfig,
-  listRecentVaults,
-  removeRecentVault,
   setConfig,
   testConnection,
   type AppConfig,
   type ConnectionReport,
   type ModelTier,
-  type RecentVault,
 } from '../api'
-import { PROVIDER_OPTIONS, errorMessage, formatDateTime, templateDisplayName } from '../display'
-import { currentVault } from '../vault-state'
+import { PROVIDER_OPTIONS, errorMessage } from '../display'
 
 /** 表单内的档位：可空字段用空串编辑，提交时转回 null */
 interface TierForm {
@@ -27,6 +25,10 @@ const TIERS: ReadonlyArray<{ key: 'fast' | 'strong'; label: string; hint: string
   { key: 'fast', label: '快速档', hint: '高频、低延迟任务（页面路由、摘要等）' },
   { key: 'strong', label: '强力档', hint: '复杂推理任务（成文、矛盾检测等）' },
 ]
+
+const emit = defineEmits<{
+  (e: 'saved'): void
+}>()
 
 const form = reactive({
   fast: { provider: 'openai', model: '', base_url: '', api_key_env: '' } as TierForm,
@@ -47,13 +49,8 @@ const testResult = reactive({
 })
 const testError = reactive({ fast: null as string | null, strong: null as string | null })
 
-const recentVaults = ref<RecentVault[]>([])
-const vaultsError = ref<string | null>(null)
-const removingPath = ref<string | null>(null)
-const openingPath = ref<string | null>(null)
-
 onMounted(async () => {
-  await Promise.all([loadConfig(), loadRecentVaults()])
+  await loadConfig()
   loading.value = false
 })
 
@@ -66,14 +63,6 @@ async function loadConfig(): Promise<void> {
     form.query_pages = config.query_pages
   } catch (err) {
     loadError.value = errorMessage(err)
-  }
-}
-
-async function loadRecentVaults(): Promise<void> {
-  try {
-    recentVaults.value = await listRecentVaults()
-  } catch (err) {
-    vaultsError.value = errorMessage(err)
   }
 }
 
@@ -107,6 +96,7 @@ async function saveConfig(): Promise<void> {
     }
     await setConfig(config)
     saveState.value = 'saved'
+    emit('saved')
     setTimeout(() => {
       if (saveState.value === 'saved') saveState.value = 'idle'
     }, 2000)
@@ -127,37 +117,6 @@ async function runTestConnection(key: 'fast' | 'strong'): Promise<void> {
     testError[key] = errorMessage(err)
   } finally {
     testing[key] = false
-  }
-}
-
-/** 打开最近列表中的一个 Vault：设为应用「当前 Vault」并刷新
- * last-opened 时间戳（经 add_recent_vault upsert，列表按最近重排）。
- * T2 到此为止——Vault 浏览 / 工作区是 T4 的范围。 */
-async function openRecentVault(v: RecentVault): Promise<void> {
-  openingPath.value = v.path
-  vaultsError.value = null
-  try {
-    await addRecentVault(v.path, v.template_id)
-    currentVault.value = { path: v.path, templateId: v.template_id }
-    await loadRecentVaults()
-  } catch (err) {
-    vaultsError.value = errorMessage(err)
-  } finally {
-    openingPath.value = null
-  }
-}
-
-async function handleRemoveRecent(path: string): Promise<void> {
-  removingPath.value = path
-  vaultsError.value = null
-  try {
-    await removeRecentVault(path)
-    recentVaults.value = recentVaults.value.filter((v) => v.path !== path)
-    if (currentVault.value?.path === path) currentVault.value = null
-  } catch (err) {
-    vaultsError.value = errorMessage(err)
-  } finally {
-    removingPath.value = null
   }
 }
 </script>
@@ -272,49 +231,6 @@ async function handleRemoveRecent(path: string): Promise<void> {
           {{ saveState === 'saving' ? '保存中…' : '保存配置' }}
         </button>
       </div>
-
-      <section class="card">
-        <div class="section-head">
-          <h3>最近打开的 Vault</h3>
-          <span class="hint-inline">「打开」设为当前 Vault 并置顶；移除只动列表，不删文件</span>
-        </div>
-        <p v-if="vaultsError" class="test-err">{{ vaultsError }}</p>
-        <p v-else-if="recentVaults.length === 0" class="hint">暂无记录。</p>
-        <ul v-else class="vault-list">
-          <li
-            v-for="v in recentVaults"
-            :key="v.path"
-            class="vault-row"
-            :class="{ current: currentVault?.path === v.path }"
-          >
-            <div class="vault-info">
-              <code class="vault-path" :title="v.path">{{ v.path }}</code>
-              <span class="vault-meta">
-                {{ templateDisplayName(v.template_id) }} · {{ formatDateTime(v.opened_at) }}
-                <em v-if="currentVault?.path === v.path" class="current-mark">当前</em>
-              </span>
-            </div>
-            <div class="vault-actions">
-              <button
-                type="button"
-                class="btn small primary"
-                :disabled="openingPath === v.path || removingPath === v.path"
-                @click="openRecentVault(v)"
-              >
-                {{ openingPath === v.path ? '打开中…' : '打开' }}
-              </button>
-              <button
-                type="button"
-                class="btn small"
-                :disabled="removingPath === v.path || openingPath === v.path"
-                @click="handleRemoveRecent(v.path)"
-              >
-                {{ removingPath === v.path ? '移除中…' : '移除' }}
-              </button>
-            </div>
-          </li>
-        </ul>
-      </section>
     </template>
   </main>
 </template>
@@ -324,7 +240,7 @@ async function handleRemoveRecent(path: string): Promise<void> {
   width: 100%;
   max-width: 760px;
   margin: 0 auto;
-  padding: 40px 24px 64px;
+  padding: 28px 24px 48px;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -503,66 +419,5 @@ async function handleRemoveRecent(path: string): Promise<void> {
 
 .btn.primary:hover:not(:disabled) {
   filter: brightness(1.08);
-}
-
-.btn.small {
-  padding: 4px 12px;
-  font-size: 13px;
-}
-
-.vault-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.vault-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-
-.vault-row.current {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-}
-
-.vault-actions {
-  display: flex;
-  gap: 8px;
-  flex: none;
-}
-
-.current-mark {
-  margin-left: 4px;
-  font-style: normal;
-  color: var(--accent);
-  font-size: 12px;
-}
-
-.vault-info {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-}
-
-.vault-path {
-  font-size: 13px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.vault-meta {
-  font-size: 12px;
-  color: var(--text-muted);
 }
 </style>
