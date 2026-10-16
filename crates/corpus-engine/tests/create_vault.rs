@@ -51,12 +51,34 @@ fn create_vault_creates_complete_skeleton_for_every_template() {
             "{}: 缺 .corpus/.gitkeep",
             template.id
         );
+        assert!(
+            root.join(".corpus/.gitignore").is_file(),
+            "{}: 缺 .corpus/.gitignore",
+            template.id
+        );
+        assert!(
+            root.join(".corpus/vault.json").is_file(),
+            "{}: 缺 .corpus/vault.json",
+            template.id
+        );
+
+        // .corpus/.gitignore 忽略指纹缓存 state.db（可再生，不入库）
+        assert_eq!(
+            fs::read_to_string(root.join(".corpus/.gitignore")).unwrap(),
+            "state.db\n"
+        );
+
+        // vault.json 记录模板绑定，且可经公共 API 读回
+        assert_eq!(
+            corpus_engine::vault_template_id(&root).unwrap(),
+            template.id
+        );
 
         // 返回值与所选模板一致
         assert_eq!(info.root, root);
         assert_eq!(info.template_id, template.id);
         assert_eq!(info.template_name, template.name);
-        assert_eq!(info.created_paths.len(), 8);
+        assert_eq!(info.created_paths.len(), 10);
         assert!(info.created_paths.contains(&"raw/.gitkeep".to_string()));
         assert!(info.created_paths.contains(&".corpus/.gitkeep".to_string()));
 
@@ -88,6 +110,8 @@ fn vault_is_a_git_repository_with_initial_commit() {
         "wiki/log.md",
         "purpose.md",
         ".corpus/.gitkeep",
+        ".corpus/.gitignore",
+        ".corpus/vault.json",
     ] {
         assert!(
             tracked.lines().any(|line| line == file),
@@ -164,6 +188,15 @@ fn unknown_template_is_rejected_without_creating_anything() {
             && available.contains("reading")
     );
     assert!(!root.exists(), "未知模板时不应创建任何文件");
+}
+
+#[test]
+fn vault_template_id_rejects_missing_metadata() {
+    // 缺 .corpus/vault.json 的目录不是有效 Vault：报 NotAVault 而非 panic
+    let (_dir, root) = fresh_vault_path("not-a-vault");
+    fs::create_dir_all(&root).unwrap();
+    let err = corpus_engine::vault_template_id(&root).unwrap_err();
+    assert!(matches!(err, Error::NotAVault { .. }), "got: {err:?}");
 }
 
 #[test]
