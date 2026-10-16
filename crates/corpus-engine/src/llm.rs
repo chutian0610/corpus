@@ -1,0 +1,153 @@
+//! LlmPort：引擎到 LLM 的窄端口 trait + 「测试连通」协议。
+//!
+//! rig 0.x 每个 minor 都破坏 API 且无稳定公开 mock trait（T2 调研笔记
+//! 第 4 节），因此引擎依赖的只是这个手写窄端口：
+//! - 真实实现 [`crate::rig_llm::RigLlmPort`] 在 `rig` feature 之后；
+//! - 测试用手写 Fake 注入，协议完全离线、确定性。
+//!
+//! 这是隔离上游破坏性变更的常规防线：rig 升级只改一个文件。
+
+use std::time::Instant;
+
+use serde::Serialize;
+
+use crate::error::Result;
+
+/// LLM 端口：一次文本补全（可选 system prompt + user prompt）。
+///
+/// object-safe（`Box<dyn LlmPort>` / `&dyn LlmPort`），实现必须
+/// `Send + Sync`（Tauri 线程池上跨线程调用）。
+#[async_trait::async_trait]
+pub trait LlmPort: Send + Sync {
+    /// 请求一次补全：`system` 是可选的系统指令（Rig 实现映射到
+    /// `AgentBuilder::preamble`），`user` 是用户消息；返回模型输出文本。
+    async fn complete(&self, system: Option<&str>, user: &str) -> Result<String>;
+}
+
+/// 连通测试的结果快照。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionReport {
+    /// 从发出请求到收到回复的耗时（毫秒）。
+    pub latency_ms: u64,
+    /// 模型回复样例（截断后的原文）。
+    pub reply: String,
+}
+
+/// 连通测试用的 system 指令：约束模型只回一个词，最小化 token 消耗。
+pub const TEST_SYSTEM_PROMPT: &str =
+    "You are a connectivity probe. Answer with exactly the requested token and nothing else.";
+
+/// 连通测试用的 user 消息。
+pub const TEST_USER_PROMPT: &str = "Reply with exactly: OK";
+
+/// 连通测试回复在报告中的最大保留长度。
+const REPORT_REPLY_MAX_CHARS: usize = 200;
+
+/// 对注入的 [`LlmPort`] 发一次最小补全并计时（协议层，可离线用 Fake 驱动）。
+///
+/// 真实版本 [`crate::rig_llm::test_connection`]（`rig` feature）由配置
+/// 构造 Rig 端口后委托本函数。
+pub async fn test_connection_with(port: &dyn LlmPort) -> Result<ConnectionReport> {
+    let start = Instant::now();
+    let reply = port
+        .complete(Some(TEST_SYSTEM_PROMPT), TEST_USER_PROMPT)
+        .await?;
+    Ok(ConnectionReport {
+        latency_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        reply: truncate(&reply, REPORT_REPLY_MAX_CHARS),
+    })
+}
+
+/// 按字符数截断（Unicode 安全）。
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut truncated: String = text.chars().take(max_chars).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+    use std::sync::Mutex;
+
+    /// 手写 Fake：记录收到的调用并回放固定脚本（见模块文档：rig 无稳定
+    /// mock trait，测试不走真实网络）。
+    struct FakeLlmPort {
+        calls: Mutex<Vec<(Option<String>, String)>>,
+        script: String,
+    }
+
+    impl FakeLlmPort {
+        fn ok(script: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                script: script.to_string(),
+            }
+        }
+
+        fn recorded_calls(&self) -> Vec<(Option<String>, String)> {
+            self.calls.lock().expect("fake 调用记录锁中毒").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmPort for FakeLlmPort {
+        async fn complete(&self, system: Option<&str>, user: &str) -> Result<String> {
+            self.calls
+                .lock()
+                .expect("fake 调用记录锁中毒")
+                .push((system.map(str::to_string), user.to_string()));
+            Ok(self.script.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_sends_probe_prompts_and_reports_reply() {
+        let fake = FakeLlmPort::ok("OK");
+        let report = test_connection_with(&fake).await.expect("连通测试失败");
+
+        // 协议：恰好一次调用，system/user 为探针常量
+        let calls = fake.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.as_deref(), Some(TEST_SYSTEM_PROMPT));
+        assert_eq!(calls[0].1, TEST_USER_PROMPT);
+        // 报告：回复原文透传，延迟非负（必然 >= 0，这里确认字段可用）
+        assert_eq!(report.reply, "OK");
+        let _ = report.latency_ms;
+    }
+
+    #[tokio::test]
+    async fn test_connection_relays_port_error() {
+        struct FailingPort;
+        #[async_trait::async_trait]
+        impl LlmPort for FailingPort {
+            async fn complete(&self, _system: Option<&str>, _user: &str) -> Result<String> {
+                Err(Error::Llm("模拟远端故障".into()))
+            }
+        }
+        let err = test_connection_with(&FailingPort)
+            .await
+            .expect_err("应透传错误");
+        assert!(matches!(err, Error::Llm(msg) if msg.contains("模拟远端故障")));
+    }
+
+    #[tokio::test]
+    async fn long_reply_is_truncated_in_report() {
+        let long_reply = "x".repeat(1000);
+        let fake = FakeLlmPort::ok(&long_reply);
+        let report = test_connection_with(&fake).await.expect("连通测试失败");
+        assert!(report.reply.chars().count() <= 201, "超长回复应被截断");
+        assert!(report.reply.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_is_unicode_safe() {
+        assert_eq!(truncate("中文回复", 2), "中文…");
+        assert_eq!(truncate("ab", 5), "ab");
+    }
+}
