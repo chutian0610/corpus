@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/corpus-engine",
+    "crates/corpus-server",
     "apps/desktop/src-tauri",
 ]
 
@@ -27,3 +28,11 @@ tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["rt", "macros"] }
+# corpus-server（axum 0.8 线，2026-10 crates.io 最新 0.8.9；tower-http 0.6
+# 线是 axum 0.8 生态的配对版本且已在依赖图内，0.7 线暂不引入）
+axum = "0.8.9"
+dirs = "6"
+getrandom = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
