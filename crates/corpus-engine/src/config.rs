@@ -300,6 +300,35 @@ pub fn corpus_home(fallback: impl AsRef<Path>) -> PathBuf {
     }
 }
 
+/// 加载 `{dir}/.env`（存在则）中的 `KEY=VALUE` 行到进程环境变量。
+///
+/// 规则：已存在的环境变量**不覆盖**（真实环境优先于文件）；`#` 注释与
+/// 空行跳过；值两侧空白修剪，不去引号。供壳层启动时调用（server main /
+/// 桌面 setup），把 API key 等放在 `CORPUS_HOME/.env` 即可，免去每次
+/// export，也覆盖 GUI 从 Dock 启动不继承 shell 环境的场景。文件缺失或
+/// 单行非法静默跳过（诊断数据不能反噬启动）。
+pub fn load_dotenv(dir: impl AsRef<Path>) {
+    let path = dir.as_ref().join(".env");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+        std::env::set_var(key, value);
+    }
+}
+
 /// 全局配置与 Vault 注册表的 sqlite 存储。
 ///
 /// 线程安全：`Mutex<Connection>` 包裹同步连接，Tauri command /
@@ -744,5 +773,44 @@ mod corpus_home_tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(corpus_home(dir.path()), dir.path());
         std::env::remove_var("CORPUS_HOME");
+    }
+}
+
+#[cfg(test)]
+mod load_dotenv_tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn loads_missing_keys_skips_comments_and_existing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("DOTENV_TEST_NEW");
+        std::env::set_var("DOTENV_TEST_EXISTING", "real");
+
+        fs::write(
+            dir.path().join(".env"),
+            "# 注释\nDOTENV_TEST_NEW=hello\nDOTENV_TEST_EXISTING=from-file\n\nBAD LINE\n",
+        )
+        .unwrap();
+
+        load_dotenv(dir.path());
+
+        assert_eq!(std::env::var("DOTENV_TEST_NEW").unwrap(), "hello");
+        assert_eq!(
+            std::env::var("DOTENV_TEST_EXISTING").unwrap(),
+            "real",
+            "已有环境变量不得被文件覆盖"
+        );
+        std::env::remove_var("DOTENV_TEST_NEW");
+        std::env::remove_var("DOTENV_TEST_EXISTING");
+    }
+
+    #[test]
+    fn missing_file_is_silent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        load_dotenv(dir.path()); // 不存在 .env：不 panic 不报错
     }
 }

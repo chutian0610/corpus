@@ -34,6 +34,9 @@ pub fn run() {
             // 未设置走平台默认。目录不存在则创建，随后打开全局 config.db。
             let dir = corpus_engine::corpus_home(app.path().app_data_dir()?);
             std::fs::create_dir_all(&dir)?;
+            // CORPUS_HOME/.env（若存在）注入环境变量：API key 等放文件
+            // 即可，覆盖 GUI 从 Dock 启动不继承 shell 环境的场景。
+            corpus_engine::load_dotenv(&dir);
             let store = ConfigStore::open(&dir)?;
             app.manage(store);
             Ok(())
