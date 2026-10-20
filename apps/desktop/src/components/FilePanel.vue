@@ -99,7 +99,7 @@ function label(group: PageGroup): string {
       <div v-if="loading && groups.length === 0" class="hint">正在读取页面树…</div>
       <p v-else-if="loadError" class="error-text">{{ loadError }}</p>
       <div v-else-if="groups.length === 0" class="hint empty">
-        Wiki 暂无页面——先在摄取面板摄取一个文档。
+        Wiki 暂无页面——先摄取一个文档。
       </div>
 
       <section v-for="group in groups" :key="group.kind" class="group">

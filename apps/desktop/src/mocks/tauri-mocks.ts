@@ -13,6 +13,8 @@
  * 会长出一页 source）、create_vault 对已知 Vault 报「请从启动页打开」。
  * Ingest 流程修正：ingest_file 先假导入（任意位置 → raw/，内存账本
  * 去重 / 后缀递增），文件对话框返回 Vault 外路径（不再引导进 raw/）。
+ * 进度透明度：分析/生成两步用假流式按 ~300ms 间隔吐递增 chars（镜像
+ * 引擎流式上报的负载形状），浏览器模式能看到步骤卡上的字数跳动。
  *
  * 事件：mockIPC 开启 shouldMockEvents 后，前端 `emit` 会触达 `listen`
  * 注册的回调——ingest_file 的假进度借此走真实事件路径（不落盘）。
@@ -49,8 +51,8 @@ interface IngestReport {
 
 type IngestProgress =
   | { stage: 'reading'; raw: string }
-  | { stage: 'analyzing' }
-  | { stage: 'generating'; pages: number }
+  | { stage: 'analyzing'; chars: number }
+  | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
 interface PageEntry {
@@ -187,28 +189,52 @@ function fakeImport(srcPath: string): { imported_raw_path: string; newly_importe
     counter += 1
     candidate = `${stem}-${counter}${ext}`
   }
-  importedRawBySrc.set(srcPath, candidate)
+  importedRawBySrc.set(srcPath, `raw/${candidate}`)
   return { imported_raw_path: `raw/${candidate}`, newly_imported: true }
 }
 
 /**
+ * 假流式（镜像引擎流式 chars 上报的形状）：按 ~12 段把 total 字吐完，
+ * 每段间隔 stepMs——浏览器模式能看到步骤卡上的字数跳动（引擎侧真实
+ * 节流是 200ms / 50 字，这里取整为等距分段便于演示）。
+ */
+async function emitStreamedChars(
+  stage: 'analyzing' | 'generating',
+  total: number,
+  stepMs: number,
+  pages?: number,
+): Promise<void> {
+  const { emit } = await import('@tauri-apps/api/event')
+  const step = Math.max(1, Math.ceil(total / 12))
+  for (let chars = step; ; chars = Math.min(total, chars + step)) {
+    await new Promise((resolve) => setTimeout(resolve, stepMs))
+    const payload: IngestProgress =
+      stage === 'analyzing' ? { stage, chars } : { stage, pages: pages ?? 0, chars }
+    await emit('ingest-progress', payload)
+    if (chars >= total) break
+  }
+}
+
+/**
  * 假摄取（模拟默认配置 apply_mode=manual）：先假导入（任意位置 →
- * raw/），再按 400ms 间隔推进进度事件（走 mock 事件通道；人审模式无
- * 落盘阶段），最后 resolve 未落盘的 Draft 检视清单。不写任何文件；
- * apply_mode=auto 时模拟落盘成功并让页面树长出一页 source。
+ * raw/），再推进进度事件（走 mock 事件通道；分析/生成两步用假流式
+ * 吐递增 chars，人审模式无落盘阶段），最后 resolve 未落盘的 Draft
+ * 检视清单。不写任何文件；apply_mode=auto 时模拟落盘成功并让页面树
+ * 长出一页 source。
  */
 async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestReport> {
   const { imported_raw_path, newly_imported } = fakeImport(srcPath)
   const { emit } = await import('@tauri-apps/api/event')
-  const script: IngestProgress[] = [
-    { stage: 'reading', raw: imported_raw_path },
-    { stage: 'analyzing' },
-    { stage: 'generating', pages: FAKE_INGEST_PAGES.length },
-  ]
-  for (const step of script) {
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    await emit('ingest-progress', step)
-  }
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  await emit('ingest-progress', { stage: 'reading', raw: imported_raw_path })
+  // 第一步（分析）：假流式增量
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  await emit('ingest-progress', { stage: 'analyzing', chars: 0 })
+  await emitStreamedChars('analyzing', 512, 300)
+  // 第二步（生成）：同上，携带计划页面数
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  await emit('ingest-progress', { stage: 'generating', pages: FAKE_INGEST_PAGES.length, chars: 0 })
+  await emitStreamedChars('generating', 1836, 300, FAKE_INGEST_PAGES.length)
   if (applyMode === 'auto') {
     await new Promise((resolve) => setTimeout(resolve, 400))
     await emit('ingest-progress', { stage: 'applying', pages: FAKE_INGEST_PAGES.length })

@@ -22,6 +22,25 @@ pub trait LlmPort: Send + Sync {
     /// 请求一次补全：`system` 是可选的系统指令（Rig 实现映射到
     /// `AgentBuilder::preamble`），`user` 是用户消息；返回模型输出文本。
     async fn complete(&self, system: Option<&str>, user: &str) -> Result<String>;
+
+    /// 流式补全：模型的文本增量一到达就经 `on_delta` 回调，返回值仍是
+    /// 聚合后的完整输出（与 [`LlmPort::complete`] 语义一致）。
+    ///
+    /// 默认实现回退到 [`LlmPort::complete`]，把整体结果作为一次
+    /// `on_delta` 回调——既有实现者（含 `--no-default-features` 的测试
+    /// 路径）零改动获得该接口；支持真流式的实现（如
+    /// [`crate::rig_llm::RigLlmPort`]）覆写之。回调要求 `Send`：流式
+    /// future 会被装箱跨线程轮询（Tauri 线程池）。
+    async fn complete_stream(
+        &self,
+        system: Option<&str>,
+        user: &str,
+        on_delta: &mut (dyn for<'s> FnMut(&'s str) + Send),
+    ) -> Result<String> {
+        let output = self.complete(system, user).await?;
+        on_delta(&output);
+        Ok(output)
+    }
 }
 
 /// 连通测试的结果快照。
@@ -134,6 +153,22 @@ mod tests {
             .await
             .expect_err("应透传错误");
         assert!(matches!(err, Error::Llm(msg) if msg.contains("模拟远端故障")));
+    }
+
+    /// 默认流式实现回退 complete：整体结果作为一次 on_delta 回调，
+    /// 返回值与非流式完全一致（只实现 complete 的 port 零改动可用）。
+    #[tokio::test]
+    async fn default_complete_stream_falls_back_to_single_delta() {
+        let fake = FakeLlmPort::ok("分段不了的整体回复");
+        let mut deltas: Vec<String> = Vec::new();
+        let output = fake
+            .complete_stream(Some("s"), "u", &mut |delta| {
+                deltas.push(delta.to_string());
+            })
+            .await
+            .expect("默认流式实现应成功");
+        assert_eq!(output, "分段不了的整体回复");
+        assert_eq!(deltas, vec!["分段不了的整体回复".to_string()]);
     }
 
     #[tokio::test]

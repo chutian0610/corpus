@@ -32,7 +32,8 @@ impl Provider for FakeProvider {
 ///
 /// T3 Ingest 管道的确定性测试接缝——两步（fast 分析 / strong 成文）各
 /// 注入一个实例，断言调用次数与 prompt 内容；脚本耗尽报错以便测试
-/// 察觉未预期的额外调用。
+/// 察觉未预期的额外调用。只实现 `complete`：`complete_stream` 走 trait
+/// 默认回退（整体结果一次 on_delta），即默认路径的测试形态。
 #[derive(Default)]
 pub struct ScriptedLlmPort {
     /// 全部收到的调用（system, user）原样记录。
@@ -58,11 +59,9 @@ impl ScriptedLlmPort {
     pub fn call_count(&self) -> usize {
         self.calls.lock().unwrap().len()
     }
-}
 
-#[async_trait::async_trait]
-impl LlmPort for ScriptedLlmPort {
-    async fn complete(&self, system: Option<&str>, user: &str) -> Result<String> {
+    /// 弹出下一条脚本回复并记录调用。
+    fn record_and_pop(&self, system: Option<&str>, user: &str) -> Result<String> {
         self.calls
             .lock()
             .unwrap()
@@ -72,6 +71,64 @@ impl LlmPort for ScriptedLlmPort {
             .unwrap()
             .pop_front()
             .ok_or_else(|| corpus_engine::Error::Llm("Fake 脚本耗尽".to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmPort for ScriptedLlmPort {
+    async fn complete(&self, system: Option<&str>, user: &str) -> Result<String> {
+        self.record_and_pop(system, user)
+    }
+}
+
+/// 流式包装 [`ScriptedLlmPort`]：`complete_stream` 把脚本回复按
+/// `chunk_chars` 字符分段、每段间隔 `chunk_delay_ms` 毫秒吐增量
+///（模拟真模型的分段输出；0 = 不等待）。
+///
+/// 进度透明度测试接缝——驱动 ingest 管道的节流上报分支。
+pub struct StreamingLlmPort {
+    inner: ScriptedLlmPort,
+    chunk_chars: usize,
+    chunk_delay_ms: u64,
+}
+
+impl StreamingLlmPort {
+    /// 包一个按序回放脚本的流式端口（调用记录语义同 ScriptedLlmPort）。
+    pub fn over(replies: Vec<String>, chunk_chars: usize, chunk_delay_ms: u64) -> Self {
+        Self {
+            inner: ScriptedLlmPort::new(replies),
+            chunk_chars,
+            chunk_delay_ms,
+        }
+    }
+
+    /// 已记录的调用数（透传内部 ScriptedLlmPort）。
+    pub fn call_count(&self) -> usize {
+        self.inner.call_count()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmPort for StreamingLlmPort {
+    async fn complete(&self, system: Option<&str>, user: &str) -> Result<String> {
+        self.inner.complete(system, user).await
+    }
+
+    async fn complete_stream(
+        &self,
+        system: Option<&str>,
+        user: &str,
+        on_delta: &mut (dyn for<'s> FnMut(&'s str) + Send),
+    ) -> Result<String> {
+        let reply = self.inner.complete(system, user).await?;
+        let chars: Vec<char> = reply.chars().collect();
+        for piece in chars.chunks(self.chunk_chars) {
+            if self.chunk_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.chunk_delay_ms)).await;
+            }
+            on_delta(&piece.iter().collect::<String>());
+        }
+        Ok(reply)
     }
 }
 

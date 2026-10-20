@@ -37,6 +37,11 @@ use crate::vault::vault_template_id;
 pub const INGEST_COMMIT_PREFIX: &str = "corpus: ingest";
 
 /// 进度阶段：粗粒度、低频（读取/分析/生成/落盘），壳层映射为 UI 步骤。
+///
+/// 分析/生成两步的 LLM 输出经流式增量上报：同阶段会重复发出携带递增
+/// `chars`（模型已输出字符数）的事件（节流见 [`with_retry_stream`]）；
+/// `chars: 0` 表示阶段开始。增量只报字数不报内容——分析输出是 JSON、
+/// 生成输出会剧透 Wiki 正文，展示原文无意义且可能闪烁。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum IngestStage {
@@ -45,12 +50,17 @@ pub enum IngestStage {
         /// raw 文件相对 Vault 的路径。
         raw: String,
     },
-    /// 第一步：fast 档结构化分析。
-    Analyzing,
-    /// 第二步：strong 档成文（`pages` 为计划页面数）。
+    /// 第一步：fast 档结构化分析（流式）。
+    Analyzing {
+        /// 模型已输出的字符数（0 = 阶段开始）。
+        chars: usize,
+    },
+    /// 第二步：strong 档成文（流式；`pages` 为计划页面数）。
     Generating {
         /// 计划生成正文的页面数。
         pages: usize,
+        /// 模型已输出的字符数（0 = 阶段开始）。
+        chars: usize,
     },
     /// 落盘：原子写 + git 提交 + log/index 更新。
     Applying {
@@ -231,6 +241,9 @@ pub struct IngestedPage {
 /// `raw_path` 接受绝对路径或相对 `vault_root` 的路径，必须位于 Vault 的
 /// `raw/` 目录内（否则 [`Error::RawNotInVault`]）。`fast` / `strong` 分别
 /// 是两步所用档位的 [`LlmPort`]（注入方决定真实或 fake）。
+///
+/// `on_progress` 要求 `Send`：LLM 流式 future 跨线程轮询（见
+/// [`LlmPort::complete_stream`]），进度回调随之进入 `Send` 上下文。
 pub async fn ingest<F>(
     vault_root: impl AsRef<Path>,
     raw_path: impl AsRef<Path>,
@@ -239,7 +252,7 @@ pub async fn ingest<F>(
     mut on_progress: F,
 ) -> Result<IngestOutcome>
 where
-    F: FnMut(IngestStage),
+    F: FnMut(IngestStage) + Send,
 {
     let vault_root = vault_root.as_ref();
     if !vault_root.join("wiki").is_dir() {
@@ -283,9 +296,12 @@ where
             .join(", "),
     })?;
 
-    // 第一步：结构化分析（fast 档）。
-    on_progress(IngestStage::Analyzing);
-    let mut analysis = analyze(fast, template, &raw_text).await?;
+    // 第一步：结构化分析（fast 档，流式增量经节流上报 chars）。
+    on_progress(IngestStage::Analyzing { chars: 0 });
+    let mut analysis = analyze(fast, template, &raw_text, &mut |chars| {
+        on_progress(IngestStage::Analyzing { chars });
+    })
+    .await?;
     if analysis.source_title.trim().is_empty() {
         analysis.source_title = raw_file_stem(&raw_rel);
     }
@@ -294,9 +310,18 @@ where
     let existing = scan_existing_pages(vault_root)?;
     let plan = build_plan(&analysis, &raw_rel, &existing)?;
 
-    // 第二步：成文（strong 档）。
-    on_progress(IngestStage::Generating { pages: plan.len() });
-    let bodies = compose(strong, template, &raw_text, &raw_rel, &plan).await?;
+    // 第二步：成文（strong 档，流式增量经节流上报 chars）。
+    on_progress(IngestStage::Generating {
+        pages: plan.len(),
+        chars: 0,
+    });
+    let bodies = compose(strong, template, &raw_text, &raw_rel, &plan, &mut |chars| {
+        on_progress(IngestStage::Generating {
+            pages: plan.len(),
+            chars,
+        })
+    })
+    .await?;
 
     Ok(IngestOutcome::Draft(build_draft(
         &raw_rel,
@@ -397,18 +422,47 @@ no code fences). Shape:
 Every item MUST have a non-empty title; aliases must contain at least the \
 title itself when no better alias exists; use [] when a list is empty.";
 
-/// LLM 调用 + 解析的重试助手（两步共用）：解析失败重试一次，两次都
+/// 流式进度节流：距上次上报至少这么久（时间阈值）……
+const REPORT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// ……或累计新增至少这么多字符（字符阈值），二者满足其一才上报。
+const REPORT_MIN_NEW_CHARS: usize = 50;
+
+/// LLM 流式调用 + 解析的重试助手（两步共用）：解析失败重试一次，两次都
 /// 失败报 [`Error::BadLlmOutput`]（`what` 为步骤名，进错误消息）。
-async fn with_retry<T>(
+///
+/// 文本增量经 [`LlmPort::complete_stream`] 即时到达，`on_chars` 是节流后
+/// 的 chars 上报（模型已输出字符数）：距上次上报 ≥[`REPORT_MIN_INTERVAL`]
+/// 或累计新增 ≥[`REPORT_MIN_NEW_CHARS`] 才放行——连续小增量合并成一报，
+/// 避免高频回调淹没进度通道。流结束后补一次终值（尾部增量可能未达阈值）。
+/// 每次尝试独立计数（重试的输出与上次无关）。
+async fn with_retry_stream<T>(
     port: &dyn LlmPort,
     system: Option<&str>,
     user: &str,
     what: &str,
     parse: impl Fn(&str) -> Result<T>,
+    on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<T> {
     let mut last_error = String::new();
     for _attempt in 0..2 {
-        let output = port.complete(system, user).await?;
+        let mut chars = 0usize;
+        let mut reported_chars = 0usize;
+        let mut last_report = std::time::Instant::now();
+        let output = port
+            .complete_stream(system, user, &mut |delta| {
+                chars += delta.chars().count();
+                if last_report.elapsed() >= REPORT_MIN_INTERVAL
+                    || chars - reported_chars >= REPORT_MIN_NEW_CHARS
+                {
+                    on_chars(chars);
+                    reported_chars = chars;
+                    last_report = std::time::Instant::now();
+                }
+            })
+            .await?;
+        if chars != reported_chars {
+            on_chars(chars);
+        }
         match parse(&output) {
             Ok(parsed) => return Ok(parsed),
             Err(err) => last_error = err.to_string(),
@@ -421,14 +475,24 @@ async fn with_retry<T>(
 
 /// 第一步调用：schema_prompt 注入 system，raw 全文作为 user；
 /// 解析失败重试一次，再失败报 [`Error::BadLlmOutput`]（零写入）。
+/// `on_chars` 收到节流后的流式 chars 上报。
 async fn analyze(
     fast: &dyn LlmPort,
     template: &WikiTemplate,
     raw: &str,
+    on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<AnalysisOutcome> {
     let system = format!("{}\n\n{ANALYSIS_JSON_INSTRUCTIONS}", template.schema_prompt);
     let user = format!("# Raw source\n\n```text\n{raw}\n```\n");
-    with_retry(fast, Some(&system), &user, "结构化分析", parse_analysis).await
+    with_retry_stream(
+        fast,
+        Some(&system),
+        &user,
+        "结构化分析",
+        parse_analysis,
+        on_chars,
+    )
+    .await
 }
 
 /// 容错解析分析输出：截取首个 `{` 到最后一个 `}` 再走 serde_json。
@@ -756,12 +820,14 @@ nothing else: {\"pages\": [{\"path\": \"<path from plan, without .md>\", \
 \"body\": \"<markdown>\"}]}.";
 
 /// 第二步调用：一次生成全部页面正文；解析失败重试一次，再失败报错。
+/// `on_chars` 收到节流后的流式 chars 上报。
 async fn compose(
     strong: &dyn LlmPort,
     template: &WikiTemplate,
     raw: &str,
     raw_rel: &str,
     planned: &[PlannedPage],
+    on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<HashMap<String, String>> {
     let plan_json: Vec<serde_json::Value> = planned
         .iter()
@@ -787,7 +853,15 @@ async fn compose(
         serde_json::to_string_pretty(&plan_json)?,
     );
 
-    let written = with_retry(strong, Some(COMPOSE_SYSTEM), &user, "成文", parse_written).await?;
+    let written = with_retry_stream(
+        strong,
+        Some(COMPOSE_SYSTEM),
+        &user,
+        "成文",
+        parse_written,
+        on_chars,
+    )
+    .await?;
     let mut bodies = HashMap::new();
     for page in written.pages {
         let key = page

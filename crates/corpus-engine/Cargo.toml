@@ -7,11 +7,13 @@ edition.workspace = true
 default = ["rig"]
 # Rig 真实 LLM 实现（provider 工厂与真实连通测试）。
 # 关闭后引擎仍可完整编译测试（LlmPort 协议层用 Fake 覆盖）。
-rig = ["dep:rig"]
+# futures-util 仅供流式实现消费 rig 的 stream（与 rig 同开关）。
+rig = ["dep:rig", "dep:futures-util"]
 
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
+futures-util = { workspace = true, optional = true }
 rig = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -23,4 +25,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 pulldown-cmark = { workspace = true }
-tokio = { workspace = true }
+# time：测试里假流式端口按间隔吐增量（节流时间阈值分支）
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

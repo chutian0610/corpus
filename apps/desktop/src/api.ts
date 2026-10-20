@@ -107,11 +107,14 @@ export interface IngestReport {
   note: string | null
 }
 
-/** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。 */
+/** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。
+ *
+ *  分析/生成两步是 LLM 流式：同阶段重复事件携带递增 chars（模型已输出
+ *  字符数，引擎侧已节流合并），chars=0 表示阶段开始。 */
 export type IngestProgress =
   | { stage: 'reading'; raw: string }
-  | { stage: 'analyzing' }
-  | { stage: 'generating'; pages: number }
+  | { stage: 'analyzing'; chars: number }
+  | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
 export function listTemplates(): Promise<TemplateInfo[]> {

@@ -8,9 +8,12 @@
 //! - system prompt 经 `AgentBuilder::preamble()` 注入；
 //! - DynModel 是 `Clone`（Arc 内部），端口持有一次构造的模型即可。
 
+use futures_util::StreamExt;
+use rig::agent::MultiTurnStreamItem;
 use rig::operation::Completion;
 use rig::providers::anthropic::AnthropicConfig;
 use rig::providers::openai::{OpenAIConfig, Route};
+use rig::streaming::{Item, StreamEvent};
 use rig::{AgentBuilder, DynModel};
 
 use crate::config::{ModelTier, ProviderKind};
@@ -36,6 +39,48 @@ impl LlmPort for RigLlmPort {
             .await
             .map_err(|e| Error::Llm(e.to_string()))?;
         Ok(response.output())
+    }
+
+    /// 真流式：`agent.prompt(..).stream()` 循环消费 [`MultiTurnStreamItem`]，
+    /// 文本增量一到达就回调 `on_delta`；终值以 `FinalResponse` 的聚合文本
+    /// 为准（`PromptResponse::output()` 与非流式 [`LlmPort::complete`]
+    /// 同源，返回语义一致）。流意外提前结束时以已聚合增量兜底。
+    async fn complete_stream(
+        &self,
+        system: Option<&str>,
+        user: &str,
+        on_delta: &mut (dyn for<'s> FnMut(&'s str) + Send),
+    ) -> Result<String> {
+        let mut builder = AgentBuilder::new(self.model.clone());
+        if let Some(system) = system {
+            builder = builder.preamble(system);
+        }
+        let agent = builder.build();
+        let mut stream = agent.prompt(user.to_string()).max_turns(1).stream();
+        let mut aggregated = String::new();
+        while let Some(item) = stream.next().await {
+            match item.map_err(|e| Error::Llm(e.to_string()))? {
+                MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                    text,
+                    ..
+                })) => {
+                    aggregated.push_str(&text);
+                    on_delta(&text);
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    return Ok(response.output());
+                }
+                _ => {}
+            }
+        }
+        if aggregated.is_empty() {
+            Err(Error::Llm(
+                "流式响应提前结束（未产生任何文本与最终结果）".to_string(),
+            ))
+        } else {
+            // 无 FinalResponse 的异常结束：增量聚合兜底，不丢已到手的输出
+            Ok(aggregated)
+        }
     }
 }
 

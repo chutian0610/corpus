@@ -193,7 +193,9 @@ struct IngestFileReport {
 ///
 /// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文）；
 /// 引擎的 `on_progress` 回调在这里桥接为全局 `ingest-progress` 事件
-/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。
+/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。分析/
+/// 生成两步的 LLM 输出走引擎流式增量：同阶段重复事件携带递增 `chars`
+/// （模型已输出字符数，引擎侧已节流），本命令原样 emit 不再加工。
 /// 模板取自 Vault 创建时绑定的 `.corpus/vault.json`。
 /// - `auto`：显式 apply（原子写 + 恰好一个 git 提交 + 指纹记录）；
 /// - `manual`：不落盘不提交，返回 Draft 的 summary_lines 并注明
