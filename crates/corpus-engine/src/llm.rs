@@ -102,10 +102,11 @@ pub enum LlmCallOutcome {
 
 /// 单次 LLM 调用的统计快照。
 ///
-/// 隐私设计：**不含任何 prompt / 输出原文**，只有长度与耗时——因此可以
-/// 安全落盘为 Vault 的 `.corpus/llm-calls.log` JSON 行（该文件在
-/// `.corpus/.gitignore` 忽略范围内），事后可 grep 排查「模型到底吐了
-/// 多少字、卡在哪一步」。
+/// 隐私设计：成功调用**不含任何 prompt / 输出原文**，只有长度与耗时；
+/// 失败调用（解析失败 / 超限）额外记录输出首尾片段（见
+/// [`LlmCallStats::output_head`] 的隐私取舍）。落盘为 Vault 本地的
+/// `.corpus/llm-calls.log` JSON 行（该文件在 `.corpus/.gitignore` 忽略
+/// 范围内），事后可 grep 排查「模型到底吐了多少字、卡在哪一步」。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallStats {
     /// 调用完成时刻（RFC 3339，本地时区）。
@@ -126,9 +127,25 @@ pub struct LlmCallStats {
     pub duration_ms: u64,
     /// 结果分类。
     pub outcome: LlmCallOutcome,
-    /// 失败原因摘要（截断 200 字；成功时无此字段）。
+    /// 失败原因摘要（截断 200 字，末尾附输出摘录；成功时无此字段）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 失败诊断：输出前 300 字符（仅解析失败 / 超限时记录）。
+    ///
+    /// 隐私取舍：片段仅在失败时落盘（成功调用保持 `None` 且不序列化）、
+    /// 只存 Vault 本地 `.corpus/llm-calls.log`（git 忽略），用于诊断推理
+    /// 模型思考混流 / 输出截断——如思考 token 挤占 `max_tokens` 预算导致
+    /// JSON 中途截断时，截断点在哪一眼可见。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_head: Option<String>,
+    /// 失败诊断：输出后 300 字符（隐私取舍同 [`LlmCallStats::output_head`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    /// 失败诊断：输出是否含 `<think>` / `</think>` 思考标签——判断推理
+    /// 模型的思考文本是否内联进了输出流（隐私取舍同
+    /// [`LlmCallStats::output_head`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_think_tag: Option<bool>,
 }
 
 /// 分析步（fast 档）的服务端输出上限（token）。

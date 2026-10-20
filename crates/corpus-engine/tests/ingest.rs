@@ -1170,9 +1170,119 @@ async fn llm_calls_log_records_all_steps_without_raw_content() {
     for line in &log {
         let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
         assert!(v["tier"].is_string() && v["purpose"].is_string() && v["output_chars"].is_u64());
+        // 成功调用不携带失败诊断字段（serde 序列化不含 key）
+        assert!(
+            v.get("output_head").is_none()
+                && v.get("output_tail").is_none()
+                && v.get("has_think_tag").is_none(),
+            "成功调用不得序列化失败诊断字段：{line}"
+        );
         assert!(
             !line.contains("RAW_MARKER_XYZ"),
             "日志不得包含 raw 原文：{line}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 思考块剥离与失败诊断（推理模型思考混流 / 截断场景）
+// ---------------------------------------------------------------------------
+
+/// 推理模型内联思考 + 中途截断的分析输出（模拟思考 token 挤占
+/// max_tokens：`<think>` 混流在前，JSON 在列表中间戛然而止）。
+fn think_wrapped_truncated_analysis() -> String {
+    let mut json = String::from("{\"source_title\":\"T\",\"source_summary\":\"");
+    json.push_str(&"长".repeat(300));
+    json.push_str(
+        "\",\"entities\":[{\"title\":\"X\",\"summary\":\"Y\"}],\"concepts\":[{\"title\":\"Z\",\"summ",
+    );
+    format!("<think>\n用户给了一篇论文，让我先想想结构……\n好，开始输出。\n</think>\n{json}")
+}
+
+/// 验收：`<think>` 块包裹的合法输出（分析 + 成文两步都有）剥离后解析
+/// 成功，整单走通落盘；成功调用不携带失败诊断字段。
+#[tokio::test]
+async fn think_wrapped_output_parses_after_stripping() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let wrapped_analysis = format!(
+        "<think>\n先想想这篇论文讲什么……\n自注意力是核心。\n</think>\n{analysis}",
+        analysis = analysis_json()
+    );
+    let wrapped_bodies = format!("<think>成文思路……</think>{bodies}", bodies = bodies_json());
+    let fast = ScriptedLlmPort::new(vec![wrapped_analysis]);
+    let strong = ScriptedLlmPort::new(vec![wrapped_bodies]);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("思考块包裹的输出应剥离后解析成功"),
+    );
+    // 两步各一次调用、全部 ok（思考块不触发解析失败重试）
+    assert_eq!(fast.call_count(), 1);
+    assert_eq!(strong.call_count(), 1);
+    assert!(
+        draft
+            .llm_calls
+            .iter()
+            .all(|s| s.outcome == corpus_engine::LlmCallOutcome::Ok),
+        "{:?}",
+        draft.llm_calls
+    );
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2);
+    for line in &log {
+        let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
+        assert!(
+            v.get("output_head").is_none()
+                && v.get("output_tail").is_none()
+                && v.get("has_think_tag").is_none(),
+            "成功调用即使输出含 <think> 也不得序列化诊断字段：{line}"
+        );
+    }
+
+    // 整单走通：apply 落盘成功
+    apply(&root, &draft, no_progress()).expect("apply 失败");
+    assert!(root.join("wiki/sources").is_dir());
+}
+
+/// 验收：截断 JSON（思考混流在前、列表中途戛然而止）两次均失败 →
+/// ParseFailed 记录含 output_head / output_tail / has_think_tag，日志行
+/// JSON 可解析且这些字段齐全：head 保留思考块起点、tail 停在截断点、
+/// 错误摘要附开头/结尾摘录。
+#[tokio::test]
+async fn parse_failure_log_records_output_diagnostics() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let truncated = think_wrapped_truncated_analysis();
+    let fast = ScriptedLlmPort::new(vec![truncated.clone(), truncated]);
+    let strong = ScriptedLlmPort::new(vec![]);
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
+        .await
+        .expect_err("两次截断输出必须报错");
+    assert!(matches!(err, Error::BadLlmOutput(_)), "got: {err:?}");
+    assert_eq!(fast.call_count(), 2);
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2, "失败路径日志不丢：{log:?}");
+    for line in &log {
+        let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
+        assert_eq!(v["outcome"], "parse_failed");
+        assert_eq!(v["has_think_tag"], true, "输出含 <think> 应被检出：{line}");
+        let head = v["output_head"].as_str().expect("head 应为字符串");
+        let tail = v["output_tail"].as_str().expect("tail 应为字符串");
+        assert_eq!(head.chars().count(), 300, "head 应为前 300 字符：{head}");
+        assert_eq!(tail.chars().count(), 300, "tail 应为后 300 字符：{tail}");
+        assert!(head.starts_with("<think>"), "head 应保留思考块起点：{head}");
+        assert!(
+            tail.ends_with("\"summ"),
+            "tail 应停在 JSON 截断点（一眼可见断在哪）：{tail}"
+        );
+        // 错误摘要末尾附开头/结尾摘录（前端悬停 title 直接可见）
+        let error = v["error"].as_str().expect("error 应为字符串");
+        assert!(
+            error.contains("JSON 解析失败") && error.contains("开头：") && error.contains("结尾："),
+            "错误摘要应附输出摘录：{error}"
         );
     }
 }
