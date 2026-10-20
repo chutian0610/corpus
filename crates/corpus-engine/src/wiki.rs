@@ -1,5 +1,5 @@
 //! Wiki 浏览：`list_pages` 纯文件系统遍历的页面树 + `resolve_page_path`
-//! 只读入口的路径安全校验（应用壳 T-UX）。
+//! 只读入口的路径安全校验与 `read_page` 页面读取唯一入口（应用壳 T-UX）。
 //!
 //! 与 Ingest 管道的 [`crate::ingest::scan_existing_pages`]（全量解析
 //! frontmatter 供精确名去重）分工：本模块只回答「wiki/ 下有哪些页面
@@ -127,6 +127,27 @@ pub fn resolve_page_path(vault_root: impl AsRef<Path>, rel_path: &str) -> Result
         return Err(invalid("解析结果逃出 Vault（symlink？）".to_string()));
     }
     Ok(canonical_page)
+}
+
+/// 读取 `wiki/` 下某页面的原始文本（公共 API）。
+///
+/// **桌面壳与 corpus-server 共用的页面读取唯一入口**——三段全部在引擎：
+/// 先 [`crate::open_vault`] 级校验（`.corpus/vault.json` 存在且模板可
+/// 解析，与「打开」同一口径），再 [`resolve_page_path`] 路径安全单一
+/// 关口（拒绝绝对路径 / `..` / 非 `.md` / symlink 逃逸），最后读取文件
+/// 原文。壳层只做委托与错误映射，不再各写一份胶水。
+///
+/// 失败情形：非 Vault 报 [`Error::NotAVault`]；路径非法报
+/// [`Error::InvalidPagePath`]；校验通过但读取失败（权限 / 竞争删除）报
+/// [`Error::PageUnreadable`]。
+pub fn read_page(vault_root: impl AsRef<Path>, rel_path: &str) -> Result<String> {
+    let root = vault_root.as_ref();
+    crate::open_vault(root)?;
+    let page = resolve_page_path(root, rel_path)?;
+    fs::read_to_string(&page).map_err(|err| Error::PageUnreadable {
+        path: page,
+        reason: err.to_string(),
+    })
 }
 
 /// 递归收集 `dir` 下的 `.md` 文件为页面条目（读内容窥探 `updated`）。

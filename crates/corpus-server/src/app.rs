@@ -20,9 +20,9 @@ use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 
 use corpus_engine::{
-    builtin_template_infos, create_vault, ingest_file, list_pages, open_vault, resolve_page_path,
-    test_connection, AppConfig, ConnectionReport, IngestFileReport, IngestStage, ModelTier,
-    OpenedVault, PageTree, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    builtin_template_infos, create_vault, ingest_file, list_pages, open_vault, test_connection,
+    AppConfig, ConnectionReport, IngestFileReport, IngestStage, ModelTier, OpenedVault, PageTree,
+    RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
 
 use crate::error::{ApiError, ApiJson};
@@ -33,6 +33,15 @@ pub const TOKEN_HEADER: &str = "X-Corpus-Token";
 
 /// SSE 进度事件名（前端 EventSource addEventListener 同名）。
 pub const INGEST_PROGRESS_SSE_EVENT: &str = "ingest-progress";
+
+/// 广播对（事件名 + JSON payload）→ SSE 事件的单一映射：按事件名输出
+/// `event: <名>`（data 为 payload 的 JSON）。payload 序列化失败丢弃该
+/// 事件（进度语义可容忍，不让单个坏事件断流）。
+fn sse_event((name, payload): (String, serde_json::Value)) -> Option<Result<Event, Infallible>> {
+    serde_json::to_string(&payload)
+        .ok()
+        .map(|data| Ok(Event::default().event(name).data(data)))
+}
 
 /// 组装完整 Router：/api（token 中间件内校验）+ dist 静态资源。
 pub fn build_router(state: AppState, dist: &Path) -> Router {
@@ -54,6 +63,11 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
     // index 规则或 404 处理），「禁用目录列出」由此满足；显式开启
     // append_index_html_on_directories 让 `/` 直接出壳页面。静态资源
     // 不要求 token——它只是公开的应用壳，数据入口全部在 /api 后面。
+    //
+    // 符号链接（评审接受项）：不做 canonicalize。dist 由应用自身
+    // `pnpm build` 产出，诱出符号链接需要本机写权限；URL 中的 `..`
+    // 段 tower-http 0.6 已直接拒绝。残留的「目录内手工放置 symlink 指
+    // 向外部」风险接受，不为此增加路径规范化复杂度。
     let assets = tower_http::services::ServeDir::new(dist)
         .append_index_html_on_directories(true)
         .fallback(tower_http::services::ServeFile::new(
@@ -200,18 +214,14 @@ async fn pages(Query(q): Query<HashMap<String, String>>) -> Result<Json<PageTree
 
 /// 只读读取 wiki/ 某页面原始文本（对应 read_page 命令，预览用）。
 ///
-/// 路径安全完全经引擎 [`corpus_engine::resolve_page_path`] 单一关口
-/// （拒绝绝对路径 / `..` 逃逸 / 非 `.md`，canonicalize 断言不逃出
-/// Vault）——HTTP 层不重复造轮子，也不因「服务只绑本机」而绕过校验；
-/// 读取前先跑 `open_vault` 级校验，与桌面命令同一口径。
+/// 全部校验与读取都在引擎 [`corpus_engine::read_page`] 单一入口（open_vault
+/// 级 Vault 校验 + resolve_page_path 路径安全关口 + 读原文三段：拒绝绝对
+/// 路径 / `..` 逃逸 / 非 `.md` / symlink 逃逸）——HTTP 层不重复造轮子，
+/// 也不因「服务只绑本机」而绕过校验，与桌面壳同一口径。
 async fn read_page(Query(q): Query<HashMap<String, String>>) -> Result<Json<String>, ApiError> {
     let vault = q_param(&q, "vault")?;
     let rel = q_param(&q, "rel")?;
-    open_vault(&vault)?;
-    let full = resolve_page_path(&vault, &rel)?;
-    let content = std::fs::read_to_string(&full)
-        .map_err(|e| ApiError::bad_request(format!("读取 {} 失败：{e}", full.display())))?;
-    Ok(Json(content))
+    Ok(Json(corpus_engine::read_page(&vault, &rel)?))
 }
 
 /// 读取全局配置（对应 get_config 命令）。
@@ -270,28 +280,29 @@ async fn ingest(
         &req.src_path,
         &config,
         move |stage: IngestStage| {
-            // 无订阅者 / 通道满时 send 出错只丢进度，不阻断摄取
-            let _ = progress_tx.send(stage);
+            // 引擎 IngestStage 即纯数据 enum，序列化不会失败（失败落 Null
+            // 只影响该条进度展示）；无订阅者 / 通道满时 send 出错只丢
+            // 进度，不阻断摄取。
+            let payload = serde_json::to_value(&stage).unwrap_or(serde_json::Value::Null);
+            let _ = progress_tx.send((INGEST_PROGRESS_SSE_EVENT.to_string(), payload));
         },
     )
     .await?;
     Ok(Json(report))
 }
 
-/// SSE 事件流：把 ingest 进度广播转成 `event: ingest-progress`（data
-/// 为引擎 IngestStage 的 JSON，tag=stage）。token 经 `?token=` 查询
-/// 参数（EventSource 无法自定义头，见 token_auth 注释）。订阅晚于
-/// 摄取开始时拿不到先前事件（进度语义可容忍）；通道为 T9 查询流式
-/// 扩展预留（新增事件类型即可，不重设计）。
+/// SSE 事件流：把广播通道的「事件名 + JSON payload」对经 [`sse_event`]
+/// 转成 `event: <名>` 逐条输出。token 经 `?token=` 查询参数（EventSource
+/// 无法自定义头，见 token_auth 注释）。订阅晚于事件发出时拿不到先前
+/// 事件（进度语义可容忍）；新增事件类型即发新的名字对，本写循环与
+/// 通道零改动（T9 查询流式的扩展点）。
 async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.progress_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|item| async move {
         match item {
-            Ok(stage) => serde_json::to_string(&stage).ok().map(|data| {
-                Ok::<_, Infallible>(Event::default().event(INGEST_PROGRESS_SSE_EVENT).data(data))
-            }),
+            Ok(pair) => sse_event(pair),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(skipped)) => {
                 eprintln!("SSE 进度订阅者落后，丢弃 {skipped} 条进度事件");
                 None
@@ -312,6 +323,7 @@ async fn events(
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -589,6 +601,56 @@ mod tests {
 
         let (status, _) = send(&env.app, get("/api/events?token=wrong", None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 验收：通道承载「事件名 + JSON payload」对，SSE 写循环按事件名
+    /// 输出（`event: <名>` + `data: <JSON>`）——新增事件类型即发新名字
+    /// 对，通道与写循环零改动。逐帧读流（流因 keep-alive 不主动结束，
+    /// 不能 to_bytes 等流尾）；事件不重放（进度语义），故每对事件各开
+    /// 一条连接、订阅建立后再发送。
+    #[tokio::test]
+    async fn sse_stream_writes_named_events_from_channel_pairs() {
+        let env = test_env();
+        for (name, payload) in [
+            (
+                INGEST_PROGRESS_SSE_EVENT.to_string(),
+                json!({"stage": "analyzing", "chars": 12}),
+            ),
+            ("query-progress".to_string(), json!({"n": 1})),
+        ] {
+            let res = env
+                .app
+                .clone()
+                .oneshot(get(&format!("/api/events?token={TEST_TOKEN}"), None))
+                .await
+                .expect("oneshot 失败");
+            assert_eq!(res.status(), StatusCode::OK);
+
+            env.state
+                .progress_tx
+                .send((name.clone(), payload))
+                .expect("通道发送失败");
+            let mut body = res.into_body();
+            let frame = body
+                .frame()
+                .await
+                .expect("SSE 流应产出事件帧")
+                .expect("SSE 帧不应出错");
+            let bytes = frame.into_data().expect("SSE 事件帧应为 data");
+            let text = std::str::from_utf8(&bytes).expect("SSE 帧应为 UTF-8");
+            let event_line = text
+                .lines()
+                .find(|l| l.starts_with("event: "))
+                .unwrap_or_else(|| panic!("SSE 帧缺 event 行：{text}"));
+            assert_eq!(event_line, format!("event: {name}"));
+            let data_line = text
+                .lines()
+                .find(|l| l.starts_with("data: "))
+                .unwrap_or_else(|| panic!("SSE 帧缺 data 行：{text}"));
+            let decoded: serde_json::Value =
+                serde_json::from_str(data_line.trim_start_matches("data: ")).expect("data 非 JSON");
+            assert!(decoded.is_object(), "data 应为 payload JSON：{text}");
+        }
     }
 
     /// 验收：并发摄取返回 409。可行方案：**手动预锁全局互斥**再请求

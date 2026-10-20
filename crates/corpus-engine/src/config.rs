@@ -20,6 +20,22 @@ use crate::error::{Error, Result};
 /// config.db 文件名（位于传入目录下）。
 pub const CONFIG_DB_FILENAME: &str = "config.db";
 
+/// config.db 权限收紧为 `0600`（unix，ADR-0003 补偿措施 2）：新建文件
+/// 的 umask 默认权限不可靠，显式 set_permissions 挡住多用户机器上其他
+/// 账户读取。非 unix（Windows 走 ACL，无此语义）为空操作，直接跳过。
+#[cfg(unix)]
+fn restrict_db_permissions(db_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(db_path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// 非 unix 平台无 chmod 语义（Windows 文件权限走 ACL），不做任何事。
+#[cfg(not(unix))]
+fn restrict_db_permissions(_db_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// 配置在 `config` 表中的 key（值为整个 [`AppConfig`] 的 JSON）。
 const CONFIG_KEY: &str = "app_config";
 
@@ -302,10 +318,17 @@ impl ConfigStore {
     /// 打开 `{dir}/config.db`（不存在则创建）并执行迁移。
     ///
     /// `dir` 不存在时会先创建；壳层传入 `app_data_dir()`，测试传 tempdir。
+    ///
+    /// 文件权限（unix，ADR-0003 补偿措施 2 / 票据 #18 验收项）：无论新建
+    /// 还是打开既有库，一律把 config.db 收紧为 `0600`——sqlite 新建文件
+    /// 按 umask 落盘（常见 0644，组 / 其他可读），显式 chmod 挡住多用户
+    /// 机器上其他账户；旧版本遗留的宽松权限在再次打开时一并纠正。
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        let conn = Connection::open(dir.join(CONFIG_DB_FILENAME))?;
+        let db_path = dir.join(CONFIG_DB_FILENAME);
+        let conn = Connection::open(&db_path)?;
+        restrict_db_permissions(&db_path)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -563,6 +586,48 @@ mod tests {
 
         let reopened = ConfigStore::open(dir.path()).expect("重开失败");
         assert_eq!(reopened.get_config().expect("读取失败"), config);
+    }
+
+    /// ADR-0003 补偿措施 2（票据 #18 验收项提前落地）：open 新建
+    /// config.db 后权限必须是 0600（挡住多用户机器上其他账户读取）。
+    #[cfg(unix)]
+    #[test]
+    fn open_restricts_new_config_db_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _store) = ConfigStore::test_open();
+        let mode = fs::metadata(dir.path().join(CONFIG_DB_FILENAME))
+            .expect("config.db 应存在")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "config.db 应为 0600，实际 {:o}",
+            mode & 0o777
+        );
+    }
+
+    /// 旧库遗留的宽松权限（如 0644）在再次 open 时一并纠正为 0600。
+    #[cfg(unix)]
+    #[test]
+    fn open_corrects_preexisting_loose_config_db_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = ConfigStore::test_open();
+        let db = dir.path().join(CONFIG_DB_FILENAME);
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).expect("放宽权限失败");
+        drop(store);
+
+        ConfigStore::open(dir.path()).expect("重开失败");
+        let mode = fs::metadata(&db)
+            .expect("config.db 应存在")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "旧库宽松权限应在打开时纠正，实际 {:o}",
+            mode & 0o777
+        );
     }
 
     #[test]

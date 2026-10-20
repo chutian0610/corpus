@@ -7,8 +7,10 @@
 //!   Vault 注册表（[`registry`]）、LLM 窄端口 [`LlmPort`] 与连通测试协议，
 //!   以及 `rig` feature 之后的 Rig 真实实现（[`rig_llm`]）。
 //! - T-UX 范围：[`vault::open_vault`]（打开已有 Vault 的只读校验）、
-//!   [`wiki::list_pages`]（页面树纯文件系统遍历）与
-//!   [`wiki::resolve_page_path`]（read_page 等只读入口的路径安全校验）。
+//!   [`wiki::list_pages`]（页面树纯文件系统遍历）、
+//!   [`wiki::resolve_page_path`]（read_page 等只读入口的路径安全校验）
+//!   与 [`wiki::read_page`]（页面读取唯一入口：Vault 校验 + 路径安全 +
+//!   读原文三段全在引擎，桌面壳与 corpus-server 薄委托共用）。
 //!   以及 [`import::import_raw`]（从任意位置复制进 raw/ 的唯一写入口，
 //!   Ingest 流程「选文件 → 导入 → 摄取」的第一段）。
 //! - T-W 范围：`ingest_file` 编排（import → 带上限端口 → ingest → 按
@@ -65,4 +67,4 @@ pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, TemplateId, TemplateInfo,
 };
 pub use vault::{create_vault, open_vault, vault_template_id, OpenedVault, VaultInfo};
-pub use wiki::{list_pages, resolve_page_path, PageEntry, PageGroup, PageTree};
+pub use wiki::{list_pages, read_page, resolve_page_path, PageEntry, PageGroup, PageTree};

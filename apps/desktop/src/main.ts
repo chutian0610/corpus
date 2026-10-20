@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 import './style.css'
 import App from './App.vue'
+import { CORPUS_TOKEN_KEY, isTauri } from './api'
 
 /**
  * 壳与后端的接线顺序（票据 #17 v1，双壳架构）：
@@ -18,12 +19,12 @@ import App from './App.vue'
  *
  * token 引导：?token= 一次性写入 sessionStorage 后用
  * history.replaceState 从地址栏清除——token 不留在历史 / 分享链接里，
- * 后续请求只走 X-Corpus-Token 头。
+ * 后续请求只走 X-Corpus-Token 头。isTauri 与 token 键均复用 api.ts 的
+ * 模块级单次判定（不在本文件重复声明）。
  */
-const isTauri = typeof (window as any).__TAURI_INTERNALS__ !== 'undefined'
 const urlToken = new URLSearchParams(window.location.search).get('token')
 if (urlToken) {
-  sessionStorage.setItem('corpus-token', urlToken)
+  sessionStorage.setItem(CORPUS_TOKEN_KEY, urlToken)
   window.history.replaceState(null, '', window.location.pathname)
 }
 
@@ -31,7 +32,7 @@ function mount() {
   createApp(App).mount('#app')
 }
 
-const hasToken = Boolean(urlToken) || Boolean(sessionStorage.getItem('corpus-token'))
+const hasToken = Boolean(urlToken) || Boolean(sessionStorage.getItem(CORPUS_TOKEN_KEY))
 
 if (isTauri) {
   mount()

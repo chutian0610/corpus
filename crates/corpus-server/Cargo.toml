@@ -19,3 +19,5 @@ tower-http = { workspace = true }
 tempfile = { workspace = true }
 # oneshot：单测直接驱动 Router（不起真实端口，离线确定性）
 tower = { workspace = true, features = ["util"] }
+# SSE 逐帧读响应体（axum 已带入依赖图；keep-alive 流不会结束，to_bytes 等不到流尾）
+http-body-util = "0.1"

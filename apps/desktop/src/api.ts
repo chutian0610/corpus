@@ -9,6 +9,10 @@
  *   引导进 sessionStorage，见 main.ts）。
  * 组件层零改动：导出的函数签名与响应字段形状完全不变。
  *
+ * 运行环境在页面生命周期内不会切换，`isTauri` 判定与 transport 选择都
+ * 只在模块加载时做一次（见文件末尾的 `transport` 常量）——导出函数一律
+ * 一行委托，不再各自分叉。
+ *
  * 响应字段均为引擎 serde 的 snake_case。
  */
 import { invoke } from '@tauri-apps/api/core'
@@ -36,7 +40,7 @@ export function storeToken(token: string): void {
 // ---------------------------------------------------------------------------
 
 function tokenHeaders(): Record<string, string> {
-  return isTauri ? {} : { 'X-Corpus-Token': readToken() }
+  return { 'X-Corpus-Token': readToken() }
 }
 
 /**
@@ -76,6 +80,10 @@ function httpPost<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   })
 }
+
+// ---------------------------------------------------------------------------
+// 响应类型（引擎 serde 形状的 TS 镜像）
+// ---------------------------------------------------------------------------
 
 export interface TemplateInfo {
   id: string
@@ -212,89 +220,47 @@ export type IngestProgress =
   | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
-export function listTemplates(): Promise<TemplateInfo[]> {
-  if (isTauri) return invoke<TemplateInfo[]>('list_templates')
-  return httpJson<TemplateInfo[]>('/api/templates')
+// ---------------------------------------------------------------------------
+// 双 transport：模块级一次性选择
+// ---------------------------------------------------------------------------
+
+/** 双 transport 的公共形状（与文件末尾的导出函数一一对应）。 */
+interface Transport {
+  listTemplates(): Promise<TemplateInfo[]>
+  createVault(path: string, templateId: string): Promise<VaultInfo>
+  getConfig(): Promise<AppConfig>
+  setConfig(config: AppConfig): Promise<AppConfig>
+  testConnection(tier: ModelTier): Promise<ConnectionReport>
+  listRecentVaults(): Promise<RecentVault[]>
+  removeRecentVault(path: string): Promise<void>
+  openVault(path: string): Promise<OpenedVault>
+  listPages(vaultPath: string): Promise<PageTree>
+  readPage(vaultPath: string, relPath: string): Promise<string>
+  ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport>
+  onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn>
 }
 
-export function createVault(path: string, templateId: string): Promise<VaultInfo> {
-  if (isTauri) return invoke<VaultInfo>('create_vault', { path, templateId })
-  return httpPost<VaultInfo>('/api/vaults', { path, template_id: templateId })
+/** Tauri IPC transport：命令名与参数键遵循 Tauri 的 camelCase 约定。 */
+const tauriTransport: Transport = {
+  listTemplates: () => invoke<TemplateInfo[]>('list_templates'),
+  createVault: (path, templateId) => invoke<VaultInfo>('create_vault', { path, templateId }),
+  getConfig: () => invoke<AppConfig>('get_config'),
+  setConfig: (config) => invoke<AppConfig>('set_config', { config }),
+  testConnection: (tier) => invoke<ConnectionReport>('test_connection', { tier }),
+  listRecentVaults: () => invoke<RecentVault[]>('list_recent_vaults'),
+  removeRecentVault: (path) => invoke<void>('remove_recent_vault', { path }),
+  openVault: (path) => invoke<OpenedVault>('open_vault', { path }),
+  listPages: (vaultPath) => invoke<PageTree>('list_pages', { vaultPath }),
+  readPage: (vaultPath, relPath) => invoke<string>('read_page', { vaultPath, relPath }),
+  ingestFile: (vaultPath, rawPath) => invoke<IngestReport>('ingest_file', { vaultPath, rawPath }),
+  onIngestProgress: (handler) =>
+    listen<IngestProgress>('ingest-progress', (e) => handler(e.payload)),
 }
 
-export function getConfig(): Promise<AppConfig> {
-  if (isTauri) return invoke<AppConfig>('get_config')
-  return httpJson<AppConfig>('/api/config')
-}
-
-export function setConfig(config: AppConfig): Promise<AppConfig> {
-  if (isTauri) return invoke<AppConfig>('set_config', { config })
-  return httpJson<AppConfig>('/api/config', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(config),
-  })
-}
-
-export function testConnection(tier: ModelTier): Promise<ConnectionReport> {
-  if (isTauri) return invoke<ConnectionReport>('test_connection', { tier })
-  return httpPost<ConnectionReport>('/api/config/test-connection', tier)
-}
-
-export function listRecentVaults(): Promise<RecentVault[]> {
-  if (isTauri) return invoke<RecentVault[]>('list_recent_vaults')
-  return httpJson<RecentVault[]>('/api/vaults/recent')
-}
-
-export function removeRecentVault(path: string): Promise<void> {
-  if (isTauri) return invoke('remove_recent_vault', { path })
-  // path 经 query 传（server 端取舍：DELETE body 的客户端/代理兼容性差）
-  return httpJson<void>(`/api/vaults/recent?path=${encodeURIComponent(path)}`, {
-    method: 'DELETE',
-  })
-}
-
-/** 打开一个已有 Vault：引擎校验 + 壳层登记最近列表，非 Vault 明确报错。 */
-export function openVault(path: string): Promise<OpenedVault> {
-  if (isTauri) return invoke<OpenedVault>('open_vault', { path })
-  return httpPost<OpenedVault>('/api/vaults/open', { path })
-}
-
-/** 当前 Vault 的 wiki/ 页面树（文件面板数据源）。 */
-export function listPages(vaultPath: string): Promise<PageTree> {
-  if (isTauri) return invoke<PageTree>('list_pages', { vaultPath })
-  return httpJson<PageTree>(`/api/vaults/pages?vault=${encodeURIComponent(vaultPath)}`)
-}
-
-/** 只读读取 wiki/ 下某页面的原始文本（预览用；正式渲染属 T4）。 */
-export function readPage(vaultPath: string, relPath: string): Promise<string> {
-  if (isTauri) return invoke<string>('read_page', { vaultPath, relPath })
-  return httpJson<string>(
-    `/api/vaults/page?vault=${encodeURIComponent(vaultPath)}&rel=${encodeURIComponent(relPath)}`,
-  )
-}
-
-/** 摄取一个文档（任意位置）：先 import_raw 导入 raw/，再走 Ingest 管道。
- *
- * 浏览器 transport：POST /api/ingest 阻塞到摄取完成，响应即完整报告
- * （进度不经本响应，走 onIngestProgress 的 SSE）。 */
-export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport> {
-  if (isTauri) return invoke<IngestReport>('ingest_file', { vaultPath, rawPath })
-  return httpPost<IngestReport>('/api/ingest', { vault_path: vaultPath, src_path: rawPath })
-}
-
-/**
- * 订阅 Ingest 进度事件；返回的 unlisten 必须在组件卸载时调用
- * （SPA 路由切换不会自动注销，见 T3 调研笔记第 4 节）。
- *
- * 浏览器 transport：EventSource（SSE）。EventSource 无法自定义请求头，
- * token 只能走 ?token= 查询参数（server 端仅对 /api/events 放行该
- * 方式，取舍见 server token_auth 注释）；unlisten = 关闭连接。
- */
-export function onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
-  if (isTauri) {
-    return listen<IngestProgress>('ingest-progress', (e) => handler(e.payload))
-  }
+/** 浏览器订阅 Ingest 进度：EventSource（SSE）。EventSource 无法自定义
+ * 请求头，token 只能走 ?token= 查询参数（server 端仅对 /api/events 放行
+ * 该方式，取舍见 server token_auth 注释）；unlisten = 关闭连接。 */
+function sseIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
   const source = new EventSource(`/api/events?token=${encodeURIComponent(readToken())}`)
   source.addEventListener(INGEST_PROGRESS_SSE_EVENT, (ev) => {
     try {
@@ -315,4 +281,100 @@ export function onIngestProgress(handler: (payload: IngestProgress) => void): Pr
   // 的「注册完成」信号，立即 resolve unlisten 即可（连接在后台建立，
   // 早到的进度事件有组件级 loading 态兜底）。
   return Promise.resolve(unlisten)
+}
+
+/** HTTP transport（浏览器壳）：同源 fetch（query 参数直拼，经
+ * encodeURIComponent；server 端字段为 snake_case）。 */
+const webTransport: Transport = {
+  listTemplates: () => httpJson<TemplateInfo[]>('/api/templates'),
+  createVault: (path, templateId) =>
+    httpPost<VaultInfo>('/api/vaults', { path, template_id: templateId }),
+  getConfig: () => httpJson<AppConfig>('/api/config'),
+  setConfig: (config) =>
+    httpJson<AppConfig>('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    }),
+  testConnection: (tier) => httpPost<ConnectionReport>('/api/config/test-connection', tier),
+  listRecentVaults: () => httpJson<RecentVault[]>('/api/vaults/recent'),
+  // path 经 query 传（server 端取舍：DELETE body 的客户端/代理兼容性差）
+  removeRecentVault: (path) =>
+    httpJson<void>(`/api/vaults/recent?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
+  openVault: (path) => httpPost<OpenedVault>('/api/vaults/open', { path }),
+  listPages: (vaultPath) =>
+    httpJson<PageTree>(`/api/vaults/pages?vault=${encodeURIComponent(vaultPath)}`),
+  readPage: (vaultPath, relPath) =>
+    httpJson<string>(
+      `/api/vaults/page?vault=${encodeURIComponent(vaultPath)}&rel=${encodeURIComponent(relPath)}`,
+    ),
+  ingestFile: (vaultPath, rawPath) =>
+    httpPost<IngestReport>('/api/ingest', { vault_path: vaultPath, src_path: rawPath }),
+  onIngestProgress: sseIngestProgress,
+}
+
+/** 模块级单次选择：壳内走 IPC，浏览器走同源 HTTP。 */
+const transport: Transport = isTauri ? tauriTransport : webTransport
+
+// ---------------------------------------------------------------------------
+// 导出 API（签名与响应字段形状不变，组件层零改动；一行委托 transport）
+// ---------------------------------------------------------------------------
+
+export function listTemplates(): Promise<TemplateInfo[]> {
+  return transport.listTemplates()
+}
+
+export function createVault(path: string, templateId: string): Promise<VaultInfo> {
+  return transport.createVault(path, templateId)
+}
+
+export function getConfig(): Promise<AppConfig> {
+  return transport.getConfig()
+}
+
+export function setConfig(config: AppConfig): Promise<AppConfig> {
+  return transport.setConfig(config)
+}
+
+export function testConnection(tier: ModelTier): Promise<ConnectionReport> {
+  return transport.testConnection(tier)
+}
+
+export function listRecentVaults(): Promise<RecentVault[]> {
+  return transport.listRecentVaults()
+}
+
+export function removeRecentVault(path: string): Promise<void> {
+  return transport.removeRecentVault(path)
+}
+
+/** 打开一个已有 Vault：引擎校验 + 壳层登记最近列表，非 Vault 明确报错。 */
+export function openVault(path: string): Promise<OpenedVault> {
+  return transport.openVault(path)
+}
+
+/** 当前 Vault 的 wiki/ 页面树（文件面板数据源）。 */
+export function listPages(vaultPath: string): Promise<PageTree> {
+  return transport.listPages(vaultPath)
+}
+
+/** 只读读取 wiki/ 下某页面的原始文本（预览用；正式渲染属 T4）。 */
+export function readPage(vaultPath: string, relPath: string): Promise<string> {
+  return transport.readPage(vaultPath, relPath)
+}
+
+/** 摄取一个文档（任意位置）：先 import_raw 导入 raw/，再走 Ingest 管道。
+ *
+ * 浏览器 transport：POST /api/ingest 阻塞到摄取完成，响应即完整报告
+ * （进度不经本响应，走 onIngestProgress 的 SSE）。 */
+export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport> {
+  return transport.ingestFile(vaultPath, rawPath)
+}
+
+/**
+ * 订阅 Ingest 进度事件；返回的 unlisten 必须在组件卸载时调用
+ * （SPA 路由切换不会自动注销，见 T3 调研笔记第 4 节）。
+ */
+export function onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
+  return transport.onIngestProgress(handler)
 }

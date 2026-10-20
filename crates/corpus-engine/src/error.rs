@@ -51,6 +51,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// read_page 的页面文件读取失败（路径校验已通过，读取时 IO 失败，
+    /// 如权限不足 / 读取瞬间被删——不存在与 symlink 逃逸已被前置校验挡下）。
+    #[error("页面无法读取：{}（{reason}）", path.display())]
+    PageUnreadable {
+        /// 读取失败页面的绝对路径。
+        path: PathBuf,
+        /// 底层错误描述。
+        reason: String,
+    },
+
     /// Ingest 的 raw 文件不在 Vault 的 raw/ 目录内。
     #[error("raw 文件必须在 Vault 的 raw/ 目录内：{}（Vault：{}）", raw.display(), vault.display())]
     RawNotInVault {

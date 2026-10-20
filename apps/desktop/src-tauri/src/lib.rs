@@ -8,7 +8,7 @@
 //! T-UX（Ingest 流程修正）：`ingest_file` 两段化（import → 管道）；
 //! T-UX 应用壳两级结构（启动页 + 工作区）的支撑命令——`open_vault`
 //! （引擎校验 + 最近列表登记）、`list_pages`（页面树）、`read_page`
-//! （预览用只读文本，路径安全由引擎 `resolve_page_path` 校验）；
+//! （预览用只读文本，校验与读取都在引擎唯一入口）；
 //! `add_recent_vault` 退役（「打开」统一走 `open_vault` 的校验口径）。
 //! T-W（票据 #17 v1）：`ingest_file` 编排（import → 端口带上限 →
 //! ingest → 按 apply_mode apply）整体下沉为引擎公共 API
@@ -149,16 +149,13 @@ async fn list_pages(vault_path: String) -> Result<PageTree, String> {
 
 /// 只读读取 `wiki/` 下某页面的原始文本（预览面板；正式渲染属 T4）。
 ///
-/// 路径安全全部由引擎 [`corpus_engine::resolve_page_path`] 单一关口承担
-/// （拒绝绝对路径 / `..` / 非 `.md`，canonicalize 断言不逃出 Vault）；
-/// 读取前先对 `vault_path` 跑 `open_vault` 级校验（`.corpus/vault.json`
-/// 存在且模板可解析），与「打开」同一口径。
+/// 全部校验与读取都在引擎 [`corpus_engine::read_page`] 单一入口（open_vault
+/// 级 Vault 校验 + resolve_page_path 路径安全关口 + 读原文三段：拒绝绝对
+/// 路径 / `..` / 非 `.md` / symlink 逃逸）——本命令只做委托与错误字符串化，
+/// 与 corpus-server 双壳同一口径，不重复胶水。
 #[tauri::command]
 async fn read_page(vault_path: String, rel_path: String) -> Result<String, String> {
-    corpus_engine::open_vault(&vault_path).map_err(|e| e.to_string())?;
-    let full =
-        corpus_engine::resolve_page_path(&vault_path, &rel_path).map_err(|e| e.to_string())?;
-    std::fs::read_to_string(&full).map_err(|e| format!("读取 {} 失败：{e}", full.display()))
+    corpus_engine::read_page(&vault_path, &rel_path).map_err(|e| e.to_string())
 }
 
 /// 摄取一个文档（薄委托）：编排（`import_raw` 导入 → 双档位端口带上限
