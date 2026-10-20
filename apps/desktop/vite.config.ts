@@ -17,6 +17,17 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     host: host || false,
+    // 本地 web 真后端调试循环（票据 #17 v1）：`cargo run -p
+    // corpus-server` + `pnpm dev`，/api（含 SSE）代理到本机服务——
+    // 前端热更新 + 真引擎数据的开发闭环；浏览器从启动输出复制带
+    // token 的 5173 地址打开（token 停在 sessionStorage，代理不参与鉴权）。
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8619',
+        // SSE 需要直通流式转发：http-proxy 默认不缓冲响应，无需额外配置
+        ws: false,
+      },
+    },
     hmr: host
       ? {
           protocol: 'ws',
