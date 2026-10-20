@@ -35,10 +35,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::atomic_write;
+use crate::config::{AppConfig, ApplyMode};
 use crate::error::{Error, Result};
 use crate::fingerprint::{sha256_hex, StateStore};
 use crate::git;
-use crate::llm::{LlmCallOutcome, LlmCallPurpose, LlmCallStats, LlmPort, LlmTier};
+use crate::llm::{
+    LlmCallOutcome, LlmCallPurpose, LlmCallStats, LlmPort, LlmTier, ANALYSIS_MAX_TOKENS,
+    COMPOSE_MAX_TOKENS,
+};
 use crate::page::{
     parse_page, slugify, wikilink, PageAction, PageDraft, PageFrontmatter, PageKind,
 };
@@ -382,6 +386,140 @@ where
     let commit = write_and_commit(vault_root, draft)?;
     StateStore::open(vault_root)?.set_fingerprint(&draft.raw_path, &draft.fingerprint)?;
     Ok(commit)
+}
+
+// ---------------------------------------------------------------------------
+// 编排层：import → 带上限端口 → ingest → 按 apply_mode apply
+// ---------------------------------------------------------------------------
+
+/// manual 模式（apply_mode=manual）结果的注明：Draft 未落盘，完整的人审
+/// 流程（检视 / 编辑 / 放行）属票据 T5。原为桌面壳私有常量，随编排下沉
+/// 收敛进引擎（双壳共用同一文案）。
+pub const MANUAL_REVIEW_NOTE: &str = "人审模式：Draft 未落盘，完整人审流程属 T5";
+
+/// `ingest_file` 编排的响应：[`IngestReport`] 平铺（serde flatten，JSON
+/// 字段与两段式 API 完全一致）+ 导入信息 + Apply 模式语义。
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestFileReport {
+    /// 管道报告（页面清单 / 指纹 / LLM 统计等，字段平铺进本类型）。
+    #[serde(flatten)]
+    pub report: IngestReport,
+    /// 导入后的 raw 文件相对 Vault 路径（如 `raw/foo.md`，
+    /// [`import_raw`] 的结果；管道实际摄取的就是它）。
+    pub imported_raw_path: String,
+    /// 本次是否新导入进 raw/（false = 已在库 / 同内容去重命中既有文件）。
+    pub newly_imported: bool,
+    /// Draft 是否已落盘（指纹跳过与 manual 模式为 false）。
+    pub applied: bool,
+    /// manual 模式：Draft 人读检视清单（每页一行，降级页带标注）。
+    pub summary_lines: Vec<String>,
+    /// manual 模式注明（见 [`MANUAL_REVIEW_NOTE`]）。
+    pub note: Option<String>,
+}
+
+/// 摄取一个文档的完整编排（端口注入变体，公共 API）：把「选文件 → 导入
+/// → 摄取 → 按 `apply_mode` 落盘」收敛为一次调用——
+///
+/// 1. [`import_raw`]：把任意位置的源文件导入（复制）进 Vault 的 raw/
+///    （源文件不动；同名去重 / 后缀递增）；
+/// 2. [`ingest`]：既有管道（指纹检查 → 两步 LLM → Draft）；管道契约
+///    不变——只接受 raw/ 内路径，入口由第 1 步的导入段保证；
+/// 3. 按全局配置 `apply_mode` 分支：`auto` 显式 [`apply`]（原子写 +
+///    恰好一个 git 提交 + 指纹记录）；`manual` 不落盘不提交，返回
+///    Draft 的 [`IngestDraft::summary_lines`] 并注明
+///    [`MANUAL_REVIEW_NOTE`]。
+///
+/// 端口注入测试缝：`fast` / `strong` 由调用方构造——真实路径（
+/// [`ingest_file`]，rig 端口按档位带上限）与测试路径（Scripted Fake）
+/// 共用本函数的全部编排逻辑，行为一致可离线验证；引擎在
+/// `--no-default-features`（无 rig）下编排层依然可编译可测。
+///
+/// 传给 [`ingest`] 的是 `raw_rel`（相对 Vault 的导入路径）而非绝对路径：
+/// 绝对路径经 import_raw canonicalize 后可能与未 canonicalize 的
+/// `vault_root` 前缀不匹配（macOS tempdir 的 `/var` → `/private/var`），
+/// 相对路径交由 [`ingest`] 按 `vault_root` 解析，无此坑。
+pub async fn ingest_file_with_ports<F>(
+    vault_root: impl AsRef<Path>,
+    src_path: impl AsRef<Path>,
+    config: &AppConfig,
+    fast: &dyn LlmPort,
+    strong: &dyn LlmPort,
+    mut on_progress: F,
+) -> Result<IngestFileReport>
+where
+    F: FnMut(IngestStage) + Send,
+{
+    let vault_root = vault_root.as_ref();
+    // 第一段：导入（任意位置 → raw/；已在库则原样通过）。
+    let imported = crate::import_raw(vault_root, src_path)?;
+
+    // 第二段：既有 Ingest 管道（只接受 raw/ 内路径）。
+    match ingest(
+        vault_root,
+        &imported.raw_rel,
+        fast,
+        strong,
+        &mut on_progress,
+    )
+    .await?
+    {
+        IngestOutcome::Skipped(report) => Ok(IngestFileReport {
+            report,
+            imported_raw_path: imported.raw_rel,
+            newly_imported: imported.imported,
+            applied: false,
+            summary_lines: Vec::new(),
+            note: None,
+        }),
+        IngestOutcome::Draft(draft) => match config.apply_mode {
+            ApplyMode::Auto => {
+                let commit = apply(vault_root, &draft, on_progress)?;
+                Ok(IngestFileReport {
+                    report: draft.report(Some(commit)),
+                    imported_raw_path: imported.raw_rel,
+                    newly_imported: imported.imported,
+                    applied: true,
+                    summary_lines: Vec::new(),
+                    note: None,
+                })
+            }
+            // 人审模式：Draft 不落盘（零写入零提交），交还检视清单
+            ApplyMode::Manual => Ok(IngestFileReport {
+                report: draft.report(None),
+                imported_raw_path: imported.raw_rel,
+                newly_imported: imported.imported,
+                applied: false,
+                summary_lines: draft.summary_lines(),
+                note: Some(MANUAL_REVIEW_NOTE.to_string()),
+            }),
+        },
+    }
+}
+
+/// 摄取一个文档的完整编排（真实端口变体）：按全局配置的双模型档位构造
+/// 两步端口（fast 分析 / strong 成文），并按档位预设服务端输出上限
+/// （max_tokens：分析 [`ANALYSIS_MAX_TOKENS`] / 成文
+/// [`COMPOSE_MAX_TOKENS`]，见 [`crate::build_llm_port_with_cap`]——
+/// complete 协议无法按调用携带用途，按档位构造即等价于按用途设限），
+/// 其余编排语义与 [`ingest_file_with_ports`] 完全一致；引擎侧另有字符
+/// 熔断与调用统计（[`IngestReport::llm_calls`]，随报告透传）。
+///
+/// rig feature 之后（端口工厂属真实实现）；测试走
+/// [`ingest_file_with_ports`] 的 Fake 注入。桌面壳与 corpus-server 均
+/// 委托本函数，保证双壳行为一致。
+#[cfg(feature = "rig")]
+pub async fn ingest_file<F>(
+    vault_root: impl AsRef<Path>,
+    src_path: impl AsRef<Path>,
+    config: &AppConfig,
+    on_progress: F,
+) -> Result<IngestFileReport>
+where
+    F: FnMut(IngestStage) + Send,
+{
+    let fast = crate::rig_llm::build_llm_port_with_cap(&config.fast, Some(ANALYSIS_MAX_TOKENS))?;
+    let strong = crate::rig_llm::build_llm_port_with_cap(&config.strong, Some(COMPOSE_MAX_TOKENS))?;
+    ingest_file_with_ports(vault_root, src_path, config, &fast, &strong, on_progress).await
 }
 
 /// 归一化 raw 路径：相对 Vault 解析为绝对，并校验位于 `raw/` 内。
