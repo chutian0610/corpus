@@ -1,17 +1,24 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
+import { isTauri, type IngestProgress, type PageKind } from '../api'
 import {
-  ingestFile,
-  isTauri,
-  onIngestProgress,
-  type IngestProgress,
-  type IngestReport,
-  type PageKind,
-} from '../api'
-import { errorMessage, PAGE_TYPE_LABELS } from '../display'
+  ingesting,
+  ingestError,
+  lastDeltaAt,
+  llmChars,
+  now,
+  phase,
+  report,
+  runIngest as runIngestAction,
+  setSrcPath,
+  srcPath,
+  stageMarks,
+  type StageMark,
+} from '../ingest-state'
+import { PAGE_TYPE_LABELS } from '../display'
 import PathPicker from './PathPicker.vue'
-import { bumpPages, currentVault } from '../vault-state'
+import { currentVault } from '../vault-state'
 
 /** 四阶段步骤条（引擎 IngestStage 的 UI 映射）。 */
 const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
@@ -21,86 +28,12 @@ const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
   { key: 'applying', label: '落盘' },
 ]
 
-type Phase = 'idle' | IngestProgress['stage'] | 'done' | 'error'
-type StageKey = IngestProgress['stage']
-
-/** 一个阶段的时间标记：开始时刻 + 结束时刻（进行中为 null）。 */
-interface StageMark {
-  key: StageKey
-  start: number
-  end: number | null
-}
 
 /** LLM 阶段无新增量的提示阈值（毫秒）：超过即显示「仍在等待模型响应」。 */
 const STALL_HINT_THRESHOLD_MS = 15_000
-/** 计时器跳动间隔（毫秒）：驱动「分析中 · 23s」与无进展提示的刷新。 */
-const TICK_MS = 250
 
-const srcPath = ref<string | null>(null)
-const ingesting = ref(false)
-const phase = ref<Phase>('idle')
-const report = ref<IngestReport | null>(null)
-const ingestError = ref<string | null>(null)
 /** web 模式的服务器侧文件选择弹窗（Tauri 下弹系统对话框，不开本弹窗）。 */
 const pickerOpen = ref(false)
-
-/** 阶段时间线（按到达顺序；同阶段的 chars 更新不产生新标记）。 */
-const stageMarks = ref<StageMark[]>([])
-/** 跳动的当前时刻（setInterval 驱动，让耗时计算响应式刷新）。 */
-const now = ref(Date.now())
-/** 当前 LLM 阶段已接收字符数（引擎流式 chars，已节流）。 */
-const llmChars = ref(0)
-/** 最近一次 chars 增量到达时刻（无进展提示的计时起点）。 */
-const lastDeltaAt = ref<number | null>(null)
-
-let unlisten: (() => void) | null = null
-let ticker: number | null = null
-
-/** 阶段切换：闭合上一标记、开启新标记；LLM 阶段重置字数与等待计时。 */
-function enterStage(stage: StageKey): void {
-  const marks = stageMarks.value
-  const last = marks[marks.length - 1]
-  if (last !== undefined) {
-    if (last.key === stage) return // 同阶段的 chars 更新，不产生新标记
-    last.end = Date.now()
-  }
-  marks.push({ key: stage, start: Date.now(), end: null })
-  llmChars.value = 0
-  lastDeltaAt.value = Date.now()
-}
-
-/** 结束时间线（完成或失败）：定格最后阶段的耗时。 */
-function closeStages(): void {
-  const last = stageMarks.value[stageMarks.value.length - 1]
-  if (last !== undefined && last.end === null) last.end = Date.now()
-}
-
-onMounted(async () => {
-  ticker = window.setInterval(() => {
-    now.value = Date.now()
-  }, TICK_MS)
-  // 进度事件：命令执行中由后端 emit；卸载必须 unlisten（调研笔记第 4 节）
-  unlisten = await onIngestProgress((progress) => {
-    if (!ingesting.value) return
-    if (phase.value !== progress.stage) {
-      phase.value = progress.stage
-      enterStage(progress.stage)
-    }
-    if (progress.stage === 'analyzing' || progress.stage === 'generating') {
-      if (progress.chars > llmChars.value) {
-        llmChars.value = progress.chars
-        lastDeltaAt.value = Date.now()
-      }
-    }
-  })
-})
-
-onUnmounted(() => {
-  unlisten?.()
-  unlisten = null
-  if (ticker !== null) window.clearInterval(ticker)
-  ticker = null
-})
 
 /** 摄取只作用于当前打开的 Vault（工作区面板；无 Vault 时不会挂载）。 */
 const vault = computed(() => currentVault.value)
@@ -193,10 +126,7 @@ async function chooseDocFile(): Promise<void> {
       multiple: false,
       filters: [{ name: '文档（Markdown / 纯文本）', extensions: ['md', 'markdown', 'txt'] }],
     })
-    if (typeof picked === 'string') {
-      srcPath.value = picked
-      ingestError.value = null
-    }
+    if (typeof picked === 'string') setSrcPath(picked)
     return
   }
   pickerOpen.value = true
@@ -204,34 +134,14 @@ async function chooseDocFile(): Promise<void> {
 
 /** PathPicker 选中（.md / .markdown / .txt 文件）：即待摄取文档路径。 */
 function onPicked(path: string): void {
-  srcPath.value = path
-  ingestError.value = null
+  setSrcPath(path)
   pickerOpen.value = false
 }
 
-async function runIngest(): Promise<void> {
-  if (!canIngest.value || vault.value === null || srcPath.value === null) return
-  ingesting.value = true
-  // 进度时间线归零：读取阶段从点击开始计时（后端首事件同 key 自动去重）
-  stageMarks.value = []
-  llmChars.value = 0
-  lastDeltaAt.value = null
-  phase.value = 'reading'
-  enterStage('reading')
-  report.value = null
-  ingestError.value = null
-  try {
-    report.value = await ingestFile(vault.value.path, srcPath.value)
-    phase.value = 'done'
-    // 落盘成功：Wiki 有新页面，通知文件面板重拉页面树
-    if (report.value.applied) bumpPages()
-  } catch (err) {
-    ingestError.value = errorMessage(err)
-    phase.value = 'error'
-  } finally {
-    closeStages()
-    ingesting.value = false
-  }
+/** 运行摄取：状态与进度订阅在 ingest-state 应用层常驻（跨面板持续）。 */
+function runIngest(): void {
+  if (vault.value === null) return
+  void runIngestAction(vault.value.path)
 }
 
 function pageTypeLabel(kind: PageKind): string {
