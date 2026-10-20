@@ -30,8 +30,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 应用数据目录（data_dir/${bundle_identifier}），运行时解析、
-            // 不硬编码；目录不存在则创建，随后打开全局 config.db。
-            let dir = app.path().app_data_dir()?;
+            // 不硬编码；CORPUS_HOME 环境变量优先（e2e / 沙盒隔离），
+            // 未设置走平台默认。目录不存在则创建，随后打开全局 config.db。
+            let dir = corpus_engine::corpus_home(app.path().app_data_dir()?);
             std::fs::create_dir_all(&dir)?;
             let store = ConfigStore::open(&dir)?;
             app.manage(store);

@@ -35,7 +35,9 @@ fn print_usage() {
          --port      监听端口（默认 {DEFAULT_PORT}；只绑 127.0.0.1）\n\
          --dist      前端静态目录（默认依次探测 CWD 的 apps/desktop/dist\n\
                      与编译期相对路径，见 README/源码注释）\n\
-         -h, --help  显示本帮助"
+         -h, --help  显示本帮助\n\n\
+         环境变量：CORPUS_HOME 设置后 config.db 存 $CORPUS_HOME/（e2e
+         隔离 / 沙盒实例；未设置与桌面壳共用系统数据目录）"
     );
 }
 
@@ -101,11 +103,12 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 应用数据目录：`data_dir/dev.corpus.desktop`，与桌面壳
+/// 应用数据目录：`CORPUS_HOME` 环境变量优先（e2e / 沙盒隔离；设了即建），
+/// 未设置落回 `data_dir/dev.corpus.desktop`——与桌面壳
 /// （tauri app_data_dir）同一目录、同一 config.db。
 fn app_data_dir() -> Result<PathBuf, String> {
     let base = dirs::data_dir().ok_or("无法定位系统数据目录（dirs::data_dir 返回 None）")?;
-    let dir = base.join(BUNDLE_IDENTIFIER);
+    let dir = corpus_engine::corpus_home(base.join(BUNDLE_IDENTIFIER));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建数据目录 {} 失败：{e}", dir.display()))?;
     Ok(dir)
@@ -167,7 +170,15 @@ async fn main() {
         "静态目录：{}（刷新页面 404 时先 pnpm build 或检查 --dist）",
         dist.display()
     );
-    println!("数据目录：{}（config.db 与桌面壳共用）", data_dir.display());
+    let home_note = if std::env::var("CORPUS_HOME")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        "CORPUS_HOME 沙盒（与桌面壳数据隔离）"
+    } else {
+        "config.db 与桌面壳共用"
+    };
+    println!("数据目录：{}（{home_note}）", data_dir.display());
     println!("令牌为一次性随机值，重启服务即更换；请勿把带 token 的 URL 发给他人。");
 
     if let Err(err) = axum::serve(listener, router).await {

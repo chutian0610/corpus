@@ -9,7 +9,7 @@
 //! Vault 注册表（最近打开）与配置同库，见 [`crate::registry`]。
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
@@ -254,6 +254,33 @@ impl ModelTier {
             base_url: None,
             api_key_env: None,
         }
+    }
+}
+
+/// 全局数据目录解析：`CORPUS_HOME` 环境变量优先，未设置（或为空）时
+/// 落回壳层给定的平台默认（桌面 = Tauri `app_data_dir`；server =
+/// 系统数据目录下的 `dev.corpus.desktop`）。
+///
+/// 设了 `CORPUS_HOME` 就创建该目录——e2e / 沙盒常用全新临时目录，
+/// 调用方不必再判断存在性。config.db（配置 + Vault 注册表）跟随本目录；
+/// Vault 内的 `.corpus/`（指纹缓存、llm-calls.log）不在此列，本就
+/// 随 Vault 自包含。
+///
+/// 背景：shell 层的 e2e 曾因与桌面壳共用真实 config.db 而覆写用户
+/// 配置——本环境变量是数据面隔离的正式机制，任何起 server / 写
+/// 数据面的 e2e 都必须设 `CORPUS_HOME` 指向临时目录。
+pub fn corpus_home(fallback: impl AsRef<Path>) -> PathBuf {
+    match std::env::var("CORPUS_HOME") {
+        Ok(home) if !home.trim().is_empty() => {
+            let dir = PathBuf::from(home.trim());
+            if let Err(err) = fs::create_dir_all(&dir) {
+                // 建目录失败不在此处中断：ConfigStore::open 会以更明确的
+                // 错误失败，这里只保留路径语义。
+                eprintln!("CORPUS_HOME 目录创建失败（{}）：{err}", dir.display());
+            }
+            dir
+        }
+        _ => fallback.as_ref().to_path_buf(),
     }
 }
 
@@ -610,5 +637,47 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("nope"));
         assert!(msg.contains("openai_compatible"));
+    }
+}
+
+#[cfg(test)]
+mod corpus_home_tests {
+    use super::*;
+
+    /// env 是进程全局态：并发测试下用互斥锁串行化对本变量的读写。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_set_creates_and_wins_over_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CORPUS_HOME", home.path());
+        let fallback = home.path().join("fallback-should-not-be-used");
+
+        let resolved = corpus_home(&fallback);
+
+        assert_eq!(resolved, home.path());
+        assert!(home.path().is_dir(), "设了 CORPUS_HOME 应自动建目录");
+        assert!(!fallback.exists(), "fallback 不应被触碰");
+        std::env::remove_var("CORPUS_HOME");
+    }
+
+    #[test]
+    fn env_unset_or_blank_falls_back_without_creation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CORPUS_HOME");
+        let fallback = tempfile::tempdir().unwrap().path().join("not-created");
+
+        assert_eq!(corpus_home(&fallback), fallback);
+        assert!(
+            !fallback.exists(),
+            "未设 env 不应创建 fallback（创建是壳层职责）"
+        );
+
+        // 空串与纯空白等同未设置
+        std::env::set_var("CORPUS_HOME", "   ");
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(corpus_home(dir.path()), dir.path());
+        std::env::remove_var("CORPUS_HOME");
     }
 }
