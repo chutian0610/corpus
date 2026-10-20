@@ -36,6 +36,19 @@ interface IngestedPage {
   action: 'create' | 'update'
 }
 
+interface LlmCallStats {
+  ts: string
+  tier: 'fast' | 'strong'
+  purpose: 'analyze' | 'compose'
+  attempt: number
+  system_chars: number
+  user_chars: number
+  output_chars: number
+  duration_ms: number
+  outcome: 'ok' | 'parse_failed' | 'oversized' | 'error'
+  error?: string
+}
+
 interface IngestReport {
   skipped: boolean
   imported_raw_path: string
@@ -47,6 +60,7 @@ interface IngestReport {
   commit: string | null
   summary_lines: string[]
   note: string | null
+  llm_calls: LlmCallStats[]
 }
 
 type IngestProgress =
@@ -235,6 +249,11 @@ async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestRep
   await new Promise((resolve) => setTimeout(resolve, 300))
   await emit('ingest-progress', { stage: 'generating', pages: FAKE_INGEST_PAGES.length, chars: 0 })
   await emitStreamedChars('generating', 1836, 300, FAKE_INGEST_PAGES.length)
+  const now = new Date().toISOString()
+  const llm_calls: LlmCallStats[] = [
+    { ts: now, tier: 'fast', purpose: 'analyze', attempt: 1, system_chars: 420, user_chars: 8_512, output_chars: 1_864, duration_ms: 2_310, outcome: 'ok' },
+    { ts: now, tier: 'strong', purpose: 'compose', attempt: 1, system_chars: 380, user_chars: 9_120, output_chars: 4_437, duration_ms: 6_780, outcome: 'ok' },
+  ]
   if (applyMode === 'auto') {
     await new Promise((resolve) => setTimeout(resolve, 400))
     await emit('ingest-progress', { stage: 'applying', pages: FAKE_INGEST_PAGES.length })
@@ -256,6 +275,7 @@ async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestRep
       commit: 'abc1234',
       summary_lines: [],
       note: null,
+      llm_calls,
     }
   }
   return {
@@ -274,6 +294,7 @@ async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestRep
       'Create concepts/自注意力.md: 自注意力',
     ],
     note: '人审模式：Draft 未落盘，完整人审流程属 T5',
+    llm_calls,
   }
 }
 

@@ -1010,3 +1010,169 @@ async fn non_vault_directory_is_rejected() {
     assert!(matches!(err, Error::NotAVault { .. }), "got: {err:?}");
     let _ = dir;
 }
+
+// ---------------------------------------------------------------------------
+// LLM 输出治理：熔断 / 重试约束 / 调用统计与日志
+// ---------------------------------------------------------------------------
+
+/// 造一个超过分析熔断上限（30,000 字符）的分析输出（形状仍是 JSON——
+/// 熔断先于解析，形状无所谓，但保持 JSON 以证明「超限不看内容」）。
+fn oversized_analysis(extra: usize) -> String {
+    format!(
+        r#"{{"source_title":"T","source_summary":"{}","entities":[],"concepts":[]}}"#,
+        "长".repeat(30_000 + extra)
+    )
+}
+
+/// 读 Vault 的 llm-calls.log 全部行（文件须存在）。
+fn llm_calls_log(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(".corpus/llm-calls.log"))
+        .expect("llm-calls.log 应存在")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 验收：分析输出超熔断上限 → 该次按 Oversized 失败（不进解析），
+/// 重试的 user 消息追加强约束句，第二次正常输出则整单成功。
+#[tokio::test]
+async fn oversized_output_trips_breaker_then_retry_succeeds() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = StreamingLlmPort::over(vec![oversized_analysis(10), analysis_json()], 10_000, 0);
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("第二次输出正常，整单应成功"),
+    );
+
+    let analyze_stats: Vec<_> = draft
+        .llm_calls
+        .iter()
+        .filter(|s| s.purpose == corpus_engine::LlmCallPurpose::Analyze)
+        .collect();
+    assert_eq!(
+        analyze_stats.len(),
+        2,
+        "分析应恰好两次调用：{:?}",
+        draft.llm_calls
+    );
+    assert_eq!(
+        analyze_stats[0].outcome,
+        corpus_engine::LlmCallOutcome::Oversized
+    );
+    assert!(analyze_stats[0]
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("超过上限"));
+    assert!(analyze_stats[0].output_chars > 30_000);
+    assert_eq!(analyze_stats[1].outcome, corpus_engine::LlmCallOutcome::Ok);
+
+    // 重试的 user 消息追加强约束
+    let calls = fast.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[1].1.contains("禁止复述原文"),
+        "重试 user 应含强约束：{}",
+        calls[1].1
+    );
+    assert!(!calls[0].1.contains("禁止复述原文"), "首次尝试不应有约束句");
+
+    // 日志：两行 JSON、结果分别是 oversized / ok
+    let log = llm_calls_log(&root);
+    assert!(log.len() >= 2, "日志应至少记录两次分析调用：{log:?}");
+    assert!(log[0].contains("\"oversized\"") && log[1].contains("\"ok\""));
+}
+
+/// 验收：两次输出均超限 → BadLlmOutput，错误含两次输出字数；
+/// 日志仍留下两条 Oversized 记录（摄取失败日志不丢）。
+#[tokio::test]
+async fn both_attempts_oversized_reports_char_counts() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = StreamingLlmPort::over(
+        vec![oversized_analysis(100), oversized_analysis(50)],
+        10_000,
+        0,
+    );
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
+        .await
+        .expect_err("两次超限应报错");
+    let msg = err.to_string();
+    assert!(msg.contains("超过上限"), "错误应含上限说明：{msg}");
+    let first = oversized_analysis(100).chars().count();
+    let second = oversized_analysis(50).chars().count();
+    assert!(
+        msg.contains(&first.to_string()) && msg.contains(&second.to_string()),
+        "错误应含两次输出字数（{first}/{second}）：{msg}"
+    );
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2, "失败路径日志不丢：{log:?}");
+    assert!(log.iter().all(|l| l.contains("\"oversized\"")));
+}
+
+/// 验收：解析失败（非超限）重试同样追加强约束句，统计记录 ParseFailed。
+#[tokio::test]
+async fn parse_failure_retry_appends_constraint_and_stats() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = StreamingLlmPort::over(vec!["这不是 JSON".to_string(), analysis_json()], 10_000, 0);
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("第二次解析成功，整单应成功"),
+    );
+    let analyze_stats: Vec<_> = draft
+        .llm_calls
+        .iter()
+        .filter(|s| s.purpose == corpus_engine::LlmCallPurpose::Analyze)
+        .collect();
+    assert_eq!(
+        analyze_stats[0].outcome,
+        corpus_engine::LlmCallOutcome::ParseFailed
+    );
+    assert_eq!(analyze_stats[1].outcome, corpus_engine::LlmCallOutcome::Ok);
+    assert!(fast.recorded_calls()[1].1.contains("禁止复述原文"));
+}
+
+/// 验收：标准两步成功时统计齐全（fast/analyze + strong/compose、ok、
+/// 字数耗时 > 0），日志逐行可解析、且不含 raw 原文（隐私：只有长度）。
+#[tokio::test]
+async fn llm_calls_log_records_all_steps_without_raw_content() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "RAW_MARKER_XYZ 唯一标记的正文内容");
+    let report = ingest_ok(&root, &raw).await;
+
+    assert_eq!(
+        report.llm_calls.len(),
+        2,
+        "两步各一次：{:?}",
+        report.llm_calls
+    );
+    assert_eq!(report.llm_calls[0].tier, corpus_engine::LlmTier::Fast);
+    assert_eq!(report.llm_calls[1].tier, corpus_engine::LlmTier::Strong);
+    assert!(report
+        .llm_calls
+        .iter()
+        .all(|s| s.outcome == corpus_engine::LlmCallOutcome::Ok));
+    assert!(report.llm_calls.iter().all(|s| s.output_chars > 0));
+    // user_chars 随文档进入 prompt（必然包含标记）——但日志行绝不能含原文
+    assert!(report.llm_calls[0].user_chars > 0);
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2, "恰好两行：{log:?}");
+    for line in &log {
+        let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
+        assert!(v["tier"].is_string() && v["purpose"].is_string() && v["output_chars"].is_u64());
+        assert!(
+            !line.contains("RAW_MARKER_XYZ"),
+            "日志不得包含 raw 原文：{line}"
+        );
+    }
+}

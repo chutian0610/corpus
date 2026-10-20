@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -61,6 +61,88 @@ pub const TEST_USER_PROMPT: &str = "Reply with exactly: OK";
 
 /// 连通测试回复在报告中的最大保留长度。
 const REPORT_REPLY_MAX_CHARS: usize = 200;
+
+// ---------------------------------------------------------------------------
+// 调用统计（LlmCallStats）
+// ---------------------------------------------------------------------------
+
+/// LLM 档位（Ingest 两步各一档：fast 分析 / strong 成文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTier {
+    /// fast 档：第一步结构化分析。
+    Fast,
+    /// strong 档：第二步成文。
+    Strong,
+}
+
+/// LLM 调用用途（与档位一一对应：fast 只用于分析、strong 只用于成文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmCallPurpose {
+    /// 第一步：fast 档结构化分析。
+    Analyze,
+    /// 第二步：strong 档成文。
+    Compose,
+}
+
+/// 单次 LLM 调用的结果分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmCallOutcome {
+    /// 输出解析成功，结果被管道采纳。
+    Ok,
+    /// 输出无法解析为引擎期望的结构（JSON 违约）。
+    ParseFailed,
+    /// 输出超过字符熔断上限（疑似模型复述原文或陷入重复）。
+    Oversized,
+    /// 端口调用本身失败（网络 / 鉴权 / 远端错误）。
+    Error,
+}
+
+/// 单次 LLM 调用的统计快照。
+///
+/// 隐私设计：**不含任何 prompt / 输出原文**，只有长度与耗时——因此可以
+/// 安全落盘为 Vault 的 `.corpus/llm-calls.log` JSON 行（该文件在
+/// `.corpus/.gitignore` 忽略范围内），事后可 grep 排查「模型到底吐了
+/// 多少字、卡在哪一步」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmCallStats {
+    /// 调用完成时刻（RFC 3339，本地时区）。
+    pub ts: String,
+    /// 档位（fast / strong）。
+    pub tier: LlmTier,
+    /// 用途（analyze / compose）。
+    pub purpose: LlmCallPurpose,
+    /// 第几次尝试（1 起；解析失败 / 超限会重试一次）。
+    pub attempt: usize,
+    /// system 消息字符数（无 system 为 0）。
+    pub system_chars: usize,
+    /// user 消息字符数（重试会追加约束句，按实际发送的消息计）。
+    pub user_chars: usize,
+    /// 模型输出字符数（以端口返回的聚合文本为准）。
+    pub output_chars: usize,
+    /// 本次调用耗时（毫秒）。
+    pub duration_ms: u64,
+    /// 结果分类。
+    pub outcome: LlmCallOutcome,
+    /// 失败原因摘要（截断 200 字；成功时无此字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 分析步（fast 档）的服务端输出上限（token）。
+///
+/// 换算依据：分析输出熔断是 30,000 字符（见 [`crate::ingest`]），中文约
+/// 1.5 字/token，30,000 ÷ 1.5 = 20,000。这是 rig 端口 `AgentBuilder::
+/// max_tokens` 的第一道闸（服务端硬顶）；引擎侧字符熔断是第二道闸。
+pub const ANALYSIS_MAX_TOKENS: u64 = 20_000;
+
+/// 成文步（strong 档）的服务端输出上限（token）。
+///
+/// 换算依据：成文输出熔断是 60,000 字符（见 [`crate::ingest`]），
+/// 60,000 ÷ 1.5 = 40,000。
+pub const COMPOSE_MAX_TOKENS: u64 = 40_000;
 
 /// 对注入的 [`LlmPort`] 发一次最小补全并计时（协议层，可离线用 Fake 驱动）。
 ///

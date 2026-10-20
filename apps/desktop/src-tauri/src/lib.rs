@@ -191,7 +191,10 @@ struct IngestFileReport {
 /// `apply_mode` 决定是否落盘（CONTEXT.md「Apply」）。管道契约不变——
 /// 只接受 raw/ 内路径，入口由本命令的导入段保证。
 ///
-/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文）；
+/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文），
+/// 并按档位预设服务端输出上限（max_tokens：分析 20k / 成文 40k token，
+/// 见 [`corpus_engine::ANALYSIS_MAX_TOKENS`]）；引擎侧另有字符熔断与
+/// 调用统计（[`IngestReport::llm_calls`]，随报告透传到前端）。
 /// 引擎的 `on_progress` 回调在这里桥接为全局 `ingest-progress` 事件
 /// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。分析/
 /// 生成两步的 LLM 输出走引擎流式增量：同阶段重复事件携带递增 `chars`
@@ -211,8 +214,20 @@ async fn ingest_file(
     let imported = corpus_engine::import_raw(&vault_path, &raw_path).map_err(|e| e.to_string())?;
 
     let config: AppConfig = store.get_config().map_err(|e| e.to_string())?;
-    let fast = corpus_engine::build_llm_port(&config.fast).map_err(|e| e.to_string())?;
-    let strong = corpus_engine::build_llm_port(&config.strong).map_err(|e| e.to_string())?;
+    // 服务端输出硬顶（第一道闸）：fast 档只用于分析、strong 档只用于
+    // 成文，按档位构造即等价于按用途设限（complete 协议无法按调用携带
+    // 用途，取舍见引擎 build_llm_port_with_cap 文档）。引擎侧另有字符
+    // 熔断第二道闸。
+    let fast = corpus_engine::build_llm_port_with_cap(
+        &config.fast,
+        Some(corpus_engine::ANALYSIS_MAX_TOKENS),
+    )
+    .map_err(|e| e.to_string())?;
+    let strong = corpus_engine::build_llm_port_with_cap(
+        &config.strong,
+        Some(corpus_engine::COMPOSE_MAX_TOKENS),
+    )
+    .map_err(|e| e.to_string())?;
 
     let emit_progress = |stage: IngestStage| {
         // 事件推送失败只影响进度展示，不阻断摄取

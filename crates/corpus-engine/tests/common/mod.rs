@@ -106,6 +106,11 @@ impl StreamingLlmPort {
     pub fn call_count(&self) -> usize {
         self.inner.call_count()
     }
+
+    /// 已记录的调用快照（透传内部 ScriptedLlmPort）。
+    pub fn recorded_calls(&self) -> Vec<(Option<String>, String)> {
+        self.inner.recorded_calls()
+    }
 }
 
 #[async_trait::async_trait]

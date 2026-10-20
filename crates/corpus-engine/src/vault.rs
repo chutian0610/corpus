@@ -45,9 +45,10 @@ pub struct VaultMeta {
     pub template_id: TemplateId,
 }
 
-/// `.corpus/.gitignore` 内容：指纹缓存 `state.db` 可由 raw/ 全量重算，
-/// 属可再生数据，不入库（git 历史只承载 Wiki 与骨架）。
-const CORPUS_GITIGNORE: &str = "state.db\n";
+/// `.corpus/.gitignore` 内容：指纹缓存 `state.db` 与 LLM 调用日志
+/// `llm-calls.log` 均属可再生 / 本地诊断数据，不入库（git 历史只承载
+/// Wiki 与骨架）。
+const CORPUS_GITIGNORE: &str = "state.db\nllm-calls.log\n";
 
 /// `wiki/index.md` 初始内容（内容目录，由引擎维护）。
 const INDEX_MD: &str = "\

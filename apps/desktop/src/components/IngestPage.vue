@@ -331,6 +331,40 @@ function pageTypeLabel(kind: PageKind): string {
           </tr>
         </tbody>
       </table>
+
+      <template v-if="report.llm_calls && report.llm_calls.length > 0">
+        <h4 class="pages-title">LLM 调用统计（{{ report.llm_calls.length }} 次）</h4>
+        <table class="pages-table">
+          <thead>
+            <tr>
+              <th>档位</th>
+              <th>用途</th>
+              <th>尝试</th>
+              <th>输出字数</th>
+              <th>耗时</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(call, i) in report.llm_calls" :key="i">
+              <td>{{ call.tier === 'fast' ? '快速' : '强力' }}</td>
+              <td>{{ call.purpose === 'analyze' ? '分析' : '成文' }}</td>
+              <td>{{ call.attempt }}</td>
+              <td>{{ call.output_chars.toLocaleString() }}</td>
+              <td>{{ call.duration_ms >= 1000 ? `${(call.duration_ms / 1000).toFixed(1)}s` : `${call.duration_ms}ms` }}</td>
+              <td>
+                <span :title="call.error ?? ''">{{
+                  call.outcome === 'ok' ? '成功'
+                  : call.outcome === 'oversized' ? '超限熔断'
+                  : call.outcome === 'parse_failed' ? '解析失败'
+                  : '调用错误'
+                }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="hint">完整统计同步记录在 Vault 的 .corpus/llm-calls.log（不含任何 prompt / 输出原文）。</p>
+      </template>
     </section>
   </main>
 </template>

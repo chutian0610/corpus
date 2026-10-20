@@ -88,6 +88,32 @@ export interface IngestedPage {
   action: PageAction
 }
 
+/** LLM 档位（fast 分析 / strong 成文）。 */
+export type LlmTier = 'fast' | 'strong'
+
+/** LLM 调用用途。 */
+export type LlmCallPurpose = 'analyze' | 'compose'
+
+/** 单次 LLM 调用的结果分类。 */
+export type LlmCallOutcome = 'ok' | 'parse_failed' | 'oversized' | 'error'
+
+/** 单次 LLM 调用统计（引擎 LlmCallStats；无 prompt/输出原文，只有长度与耗时）。 */
+export interface LlmCallStats {
+  /** 调用完成时刻（RFC 3339）。 */
+  ts: string
+  tier: LlmTier
+  purpose: LlmCallPurpose
+  /** 第几次尝试（1 起；解析失败 / 超限会重试一次）。 */
+  attempt: number
+  system_chars: number
+  user_chars: number
+  output_chars: number
+  duration_ms: number
+  outcome: LlmCallOutcome
+  /** 失败原因摘要（成功时无此字段）。 */
+  error?: string
+}
+
 /** ingest_file 的结果：导入信息 + 跳过路径（指纹命中）、已落盘或人审未落盘的快照。 */
 export interface IngestReport {
   skipped: boolean
@@ -105,6 +131,8 @@ export interface IngestReport {
   summary_lines: string[]
   /** 人审模式注明（Draft 未落盘，完整人审流程属 T5）。 */
   note: string | null
+  /** 本次摄取的全部 LLM 调用统计（分析 + 成文，含重试；跳过路径为空）。 */
+  llm_calls: LlmCallStats[]
 }
 
 /** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。

@@ -42,12 +42,17 @@ pub use import::{import_raw, ImportOutcome};
 pub use ingest::{
     apply, ingest, IngestDraft, IngestOutcome, IngestReport, IngestStage, IngestedPage,
 };
-pub use llm::{ConnectionReport, LlmPort};
+pub use llm::{
+    ConnectionReport, LlmCallOutcome, LlmCallPurpose, LlmCallStats, LlmPort, LlmTier,
+    ANALYSIS_MAX_TOKENS, COMPOSE_MAX_TOKENS,
+};
 pub use page::{parse_page, PageAction, PageKind};
 pub use provider::Provider;
 pub use registry::RecentVault;
 #[cfg(feature = "rig")]
-pub use rig_llm::{build_llm_port, build_model, test_connection, RigLlmPort};
+pub use rig_llm::{
+    build_llm_port, build_llm_port_with_cap, build_model, test_connection, RigLlmPort,
+};
 pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, TemplateId, TemplateInfo,
 };
