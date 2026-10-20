@@ -11,6 +11,9 @@
 //!   [`wiki::resolve_page_path`]（read_page 等只读入口的路径安全校验）。
 //!   以及 [`import::import_raw`]（从任意位置复制进 raw/ 的唯一写入口，
 //!   Ingest 流程「选文件 → 导入 → 摄取」的第一段）。
+//! - T-W 范围：`ingest_file` 编排（import → 带上限端口 → ingest → 按
+//!   `apply_mode` apply）从桌面命令层下沉为公共 API（[`ingest::IngestFileReport`]），
+//!   桌面壳与 corpus-server 双壳共用，行为一致（票据 #17 v1）。
 
 mod atomic;
 mod git;
@@ -40,7 +43,8 @@ pub use error::{Error, Result};
 pub use fingerprint::sha256_hex;
 pub use import::{import_raw, ImportOutcome};
 pub use ingest::{
-    apply, ingest, IngestDraft, IngestOutcome, IngestReport, IngestStage, IngestedPage,
+    apply, ingest, ingest_file_with_ports, IngestDraft, IngestFileReport, IngestOutcome,
+    IngestReport, IngestStage, IngestedPage, MANUAL_REVIEW_NOTE,
 };
 pub use llm::{
     ConnectionReport, LlmCallOutcome, LlmCallPurpose, LlmCallStats, LlmPort, LlmTier,
@@ -53,6 +57,10 @@ pub use registry::RecentVault;
 pub use rig_llm::{
     build_llm_port, build_llm_port_with_cap, build_model, test_connection, RigLlmPort,
 };
+// 完整编排（真实端口变体）属 rig 真实实现；端口注入变体
+// `ingest_file_with_ports` 永远可用（见 ingest 模块文档）。
+#[cfg(feature = "rig")]
+pub use ingest::ingest_file;
 pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, TemplateId, TemplateInfo,
 };
