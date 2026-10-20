@@ -86,10 +86,11 @@ fn resolve_dist(explicit: Option<&Path>) -> Result<PathBuf, String> {
             return Ok(candidate.clone());
         }
     }
-    Err(format!(
+    Err(
         "未找到前端静态目录 apps/desktop/dist（CWD 相对与编译期相对均不存在）。\n\
          请先在 apps/desktop 下执行 `pnpm build`，或显式传 --dist <目录>。"
-    ))
+            .to_string(),
+    )
 }
 
 /// 一次性访问令牌：OS 熵源（CSPRNG）的 16 字节随机数 → 32 hex 字符
