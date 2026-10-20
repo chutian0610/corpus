@@ -9,6 +9,8 @@
 //! - T-UX 范围：[`vault::open_vault`]（打开已有 Vault 的只读校验）、
 //!   [`wiki::list_pages`]（页面树纯文件系统遍历）与
 //!   [`wiki::resolve_page_path`]（read_page 等只读入口的路径安全校验）。
+//!   以及 [`import::import_raw`]（从任意位置复制进 raw/ 的唯一写入口，
+//!   Ingest 流程「选文件 → 导入 → 摄取」的第一段）。
 
 mod atomic;
 mod git;
@@ -17,6 +19,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod fingerprint;
+pub mod import;
 pub mod ingest;
 pub mod llm;
 pub mod page;
@@ -35,6 +38,7 @@ pub use config::{AppConfig, ApplyMode, ConfigStore, ModelTier};
 pub use engine::Engine;
 pub use error::{Error, Result};
 pub use fingerprint::sha256_hex;
+pub use import::{import_raw, ImportOutcome};
 pub use ingest::{
     apply, ingest, IngestDraft, IngestOutcome, IngestReport, IngestStage, IngestedPage,
 };

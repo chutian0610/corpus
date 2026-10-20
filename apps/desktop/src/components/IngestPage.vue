@@ -21,7 +21,7 @@ const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
 
 type Phase = 'idle' | IngestProgress['stage'] | 'done' | 'error'
 
-const rawPath = ref<string | null>(null)
+const srcPath = ref<string | null>(null)
 const ingesting = ref(false)
 const phase = ref<Phase>('idle')
 const report = ref<IngestReport | null>(null)
@@ -45,7 +45,7 @@ onUnmounted(() => {
 const vault = computed(() => currentVault.value)
 
 const canIngest = computed(
-  () => vault.value !== null && rawPath.value !== null && !ingesting.value,
+  () => vault.value !== null && srcPath.value !== null && !ingesting.value,
 )
 
 /** 人审模式结果：Draft 未落盘（apply_mode=manual，完整人审流程属 T5）。 */
@@ -64,25 +64,26 @@ const currentStep = computed(() => {
   return idx
 })
 
-async function chooseRawFile(): Promise<void> {
+async function chooseDocFile(): Promise<void> {
+  // 任意位置的文档：导入 raw/ 由命令端自动完成（复制，源文件不动）
   const picked = await open({
     multiple: false,
     filters: [{ name: '文档（Markdown / 纯文本）', extensions: ['md', 'markdown', 'txt'] }],
   })
   if (typeof picked === 'string') {
-    rawPath.value = picked
+    srcPath.value = picked
     ingestError.value = null
   }
 }
 
 async function runIngest(): Promise<void> {
-  if (!canIngest.value || vault.value === null || rawPath.value === null) return
+  if (!canIngest.value || vault.value === null || srcPath.value === null) return
   ingesting.value = true
   phase.value = 'reading'
   report.value = null
   ingestError.value = null
   try {
-    report.value = await ingestFile(vault.value.path, rawPath.value)
+    report.value = await ingestFile(vault.value.path, srcPath.value)
     phase.value = 'done'
     // 落盘成功：Wiki 有新页面，通知文件面板重拉页面树
     if (report.value.applied) bumpPages()
@@ -103,20 +104,20 @@ function pageTypeLabel(kind: PageKind): string {
   <main class="page">
     <header class="page-header">
       <h2>摄取（Ingest）</h2>
-      <p class="subtitle">把 raw/ 中的文档编译进 Wiki：指纹检查 → 两步 LLM → Draft → Apply（自动或人审由配置决定）</p>
+      <p class="subtitle">从任意位置选文件 → 自动导入 raw/ → 编译进 Wiki：指纹检查 → 两步 LLM → Draft → Apply（自动或人审由配置决定）</p>
       <p v-if="vault" class="subtitle vault-line">
         当前 Vault：<code :title="vault.path">{{ vault.path }}</code>
       </p>
     </header>
 
     <section class="card step">
-      <h3>1 · 选择 raw 文件</h3>
-      <label class="field-label" for="raw-path">raw 文件（须位于当前 Vault 的 raw/ 目录内）</label>
+      <h3>1 · 选择文档（任意位置）</h3>
+      <label class="field-label" for="raw-path">文档（任意位置；摄取时自动复制进当前 Vault 的 raw/，源文件不动）</label>
       <div class="path-row">
-        <output id="raw-path" class="path-box" :title="rawPath ?? undefined">
-          {{ rawPath ?? '尚未选择文件' }}
+        <output id="raw-path" class="path-box" :title="srcPath ?? undefined">
+          {{ srcPath ?? '尚未选择文件' }}
         </output>
-        <button type="button" class="btn" :disabled="ingesting" @click="chooseRawFile">
+        <button type="button" class="btn" :disabled="ingesting" @click="chooseDocFile">
           浏览…
         </button>
       </div>
@@ -160,6 +161,10 @@ function pageTypeLabel(kind: PageKind): string {
     <section v-if="report && phase === 'done'" class="card result success">
       <h3>{{ report.skipped ? '指纹命中，已跳过' : manualPending ? '摄取完成（Draft 未落盘）' : '摄取完成' }}</h3>
       <dl class="meta">
+        <div class="meta-row">
+          <dt>导入</dt>
+          <dd>{{ report.newly_imported ? `已导入 ${report.imported_raw_path}` : `已在库：${report.imported_raw_path}` }}</dd>
+        </div>
         <div class="meta-row">
           <dt>Source</dt>
           <dd>{{ report.source_title }}</dd>

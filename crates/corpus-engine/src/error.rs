@@ -60,6 +60,22 @@ pub enum Error {
         vault: PathBuf,
     },
 
+    /// import_raw 的源是目录：目录批量导入属票据 T8，当前明确拒绝。
+    #[error("导入源是目录，暂不支持目录批量导入（属票据 T8）：{path}")]
+    ImportSourceIsDirectory {
+        /// 被拒绝的目录路径。
+        path: PathBuf,
+    },
+
+    /// import_raw 的源文件无法读取（不存在 / 无权限等）。
+    #[error("导入源无法读取：{path}（{reason}）")]
+    ImportSourceUnreadable {
+        /// 源文件路径。
+        path: PathBuf,
+        /// 底层错误描述。
+        reason: String,
+    },
+
     /// LLM 返回的输出无法解析为引擎期望的结构（重试耗尽后）。
     #[error("LLM 输出无法解析：{0}")]
     BadLlmOutput(String),

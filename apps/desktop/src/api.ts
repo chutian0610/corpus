@@ -88,9 +88,13 @@ export interface IngestedPage {
   action: PageAction
 }
 
-/** ingest_file 的结果：跳过路径（指纹命中）、已落盘或人审未落盘的快照。 */
+/** ingest_file 的结果：导入信息 + 跳过路径（指纹命中）、已落盘或人审未落盘的快照。 */
 export interface IngestReport {
   skipped: boolean
+  /** 导入后的 raw 文件相对 Vault 路径（如 raw/foo.md；引擎 import_raw 结果，管道摄取的就是它）。 */
+  imported_raw_path: string
+  /** 本次是否新导入进 raw/（false = 已在库或同内容去重命中既有文件）。 */
+  newly_imported: boolean
   /** Draft 是否已落盘（指纹跳过与人审模式为 false）。 */
   applied: boolean
   fingerprint: string
@@ -153,6 +157,7 @@ export function readPage(vaultPath: string, relPath: string): Promise<string> {
   return invoke<string>('read_page', { vaultPath, relPath })
 }
 
+/** 摄取一个文档（任意位置）：命令内先 import_raw 导入 raw/，再走 Ingest 管道。 */
 export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport> {
   return invoke<IngestReport>('ingest_file', { vaultPath, rawPath })
 }

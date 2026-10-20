@@ -11,6 +11,8 @@
  * T-UX 同步：open_vault（假校验——只认「已知 Vault」集合，非 Vault 目录
  * 报含路径的中文错误）、list_pages / read_page（假页面树，摄取成功后
  * 会长出一页 source）、create_vault 对已知 Vault 报「请从启动页打开」。
+ * Ingest 流程修正：ingest_file 先假导入（任意位置 → raw/，内存账本
+ * 去重 / 后缀递增），文件对话框返回 Vault 外路径（不再引导进 raw/）。
  *
  * 事件：mockIPC 开启 shouldMockEvents 后，前端 `emit` 会触达 `listen`
  * 注册的回调——ingest_file 的假进度借此走真实事件路径（不落盘）。
@@ -34,6 +36,8 @@ interface IngestedPage {
 
 interface IngestReport {
   skipped: boolean
+  imported_raw_path: string
+  newly_imported: boolean
   applied: boolean
   fingerprint: string
   source_title: string
@@ -159,16 +163,45 @@ function isValidPagePath(relPath: string): boolean {
   return !isAbsolute && !hasParentSegment && relPath.endsWith('.md')
 }
 
+/** 「导入账本」：源路径 → 已占用的 raw 文件名（浏览器模式的内存态）。 */
+const importedRawBySrc = new Map<string, string>()
+
 /**
- * 假摄取（模拟默认配置 apply_mode=manual）：按 400ms 间隔推进进度事件
- * （走 mock 事件通道；人审模式无落盘阶段），最后 resolve 未落盘的
- * Draft 检视清单。不写任何文件；apply_mode=auto 时模拟落盘成功并
- * 让页面树长出一页 source。
+ * 假导入（引擎 import_raw 语义的浏览器简化版）：任意位置的源文件
+ * 「复制」进 raw/（内存记账，不写文件系统）——文件名保留；同一源
+ * 再次导入去重（newly_imported=false）；不同源同名（视为不同内容）
+ * 则后缀递增（foo.md → foo-2.md）。无文件系统，无从比对内容哈希，
+ * 以「同一源路径」近似「同内容」。
  */
-async function fakeIngest(rawPath: string, applyMode: string): Promise<IngestReport> {
+function fakeImport(srcPath: string): { imported_raw_path: string; newly_imported: boolean } {
+  const known = importedRawBySrc.get(srcPath)
+  if (known !== undefined) {
+    return { imported_raw_path: known, newly_imported: false }
+  }
+  const name = srcPath.split('/').pop() ?? 'untitled.md'
+  const stem = name.replace(/(\.[^.]+)$/, '')
+  const ext = name.match(/(\.[^.]+)$/)?.[1] ?? ''
+  let candidate = name
+  let counter = 1
+  while ([...importedRawBySrc.values()].includes(candidate)) {
+    counter += 1
+    candidate = `${stem}-${counter}${ext}`
+  }
+  importedRawBySrc.set(srcPath, candidate)
+  return { imported_raw_path: `raw/${candidate}`, newly_imported: true }
+}
+
+/**
+ * 假摄取（模拟默认配置 apply_mode=manual）：先假导入（任意位置 →
+ * raw/），再按 400ms 间隔推进进度事件（走 mock 事件通道；人审模式无
+ * 落盘阶段），最后 resolve 未落盘的 Draft 检视清单。不写任何文件；
+ * apply_mode=auto 时模拟落盘成功并让页面树长出一页 source。
+ */
+async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestReport> {
+  const { imported_raw_path, newly_imported } = fakeImport(srcPath)
   const { emit } = await import('@tauri-apps/api/event')
   const script: IngestProgress[] = [
-    { stage: 'reading', raw: rawPath },
+    { stage: 'reading', raw: imported_raw_path },
     { stage: 'analyzing' },
     { stage: 'generating', pages: FAKE_INGEST_PAGES.length },
   ]
@@ -181,12 +214,15 @@ async function fakeIngest(rawPath: string, applyMode: string): Promise<IngestRep
     await emit('ingest-progress', { stage: 'applying', pages: FAKE_INGEST_PAGES.length })
     // 模拟落盘：页面树长出一页 source（真实引擎由文件系统驱动）
     const stamp = new Date().toISOString()
+    const rawName = imported_raw_path.split('/').pop() ?? 'browser-mock.md'
     extraSourcePages = [
       ...extraSourcePages,
-      { path: `sources/${rawPath.split('/').pop()?.replace(/\.(md|txt)$/, '') ?? 'browser-mock'}.md`, updated: stamp },
+      { path: `sources/${rawName.replace(/\.(md|markdown|txt)$/, '')}.md`, updated: stamp },
     ]
     return {
       skipped: false,
+      imported_raw_path,
+      newly_imported,
       applied: true,
       fingerprint: 'browser-mock-fingerprint',
       source_title: 'Attention Is All You Need',
@@ -198,13 +234,15 @@ async function fakeIngest(rawPath: string, applyMode: string): Promise<IngestRep
   }
   return {
     skipped: false,
+    imported_raw_path,
+    newly_imported,
     applied: false,
     fingerprint: 'browser-mock-fingerprint',
     source_title: 'Attention Is All You Need',
     pages: FAKE_INGEST_PAGES,
     commit: null,
     summary_lines: [
-      'source: Attention Is All You Need (raw: raw/paper.md, sha256: browser-mock-fingerprint)',
+      `source: Attention Is All You Need (raw: ${imported_raw_path}, sha256: browser-mock-fingerprint)`,
       'Create sources/attention-is-all-you-need.md: Attention Is All You Need',
       'Create entities/transformer.md: Transformer',
       'Create concepts/自注意力.md: 自注意力',
@@ -300,10 +338,12 @@ mockIPC(
         const { rawPath } = args as { rawPath: string }
         return fakeIngest(rawPath, DEFAULT_CONFIG.apply_mode)
       }
-      // 对话框：目录选择返回演示 Vault；文件选择返回演示 raw 文件
+      // 对话框：目录选择返回演示 Vault；文件选择返回 Vault 外的演示
+      // 文档（Ingest 流程「任意位置选文件 → 自动导入 raw/」，对话框
+      // 不再引导进 raw/）
       case 'plugin:dialog|open': {
         const { options } = args as { options?: { directory?: boolean } }
-        return options?.directory ? '/tmp/demo-vault' : '/tmp/demo-vault/raw/paper.md'
+        return options?.directory ? '/tmp/demo-vault' : '/Users/demo/Downloads/paper.md'
       }
       default:
         throw `浏览器模式未实现该命令的 mock：${cmd}`

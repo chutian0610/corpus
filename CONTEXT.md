@@ -15,7 +15,7 @@ _Avoid_: project；workspace（指磁盘上的知识库本体时——「工作�
 _Avoid_: 与 Vault 混用（指磁盘上的知识库本体时一律说 Vault，Workspace 只指界面形态）
 
 **Raw source**:
-用户策展、引擎只读的不可变原始文档，存放于 Vault 的 `raw/` 目录。
+用户策展、引擎只读的不可变原始文档，存放于 Vault 的 `raw/` 目录。文件经 Ingest 导入（复制）进入 Vault，是策展动作；「只读」指引擎不改写 raw/ 内既有内容——导入复制是唯一入口。
 _Avoid_: 原文、资料（作为术语使用时）
 
 **Wiki**:
