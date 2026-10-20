@@ -220,6 +220,22 @@ export type IngestProgress =
   | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
+/** 服务器侧目录浏览的单个条目（server GET /api/fs/list 的 entries 项）。
+ *
+ *  `path` 为 server 拼好的绝对路径（canonical），前端直接用它下钻或选中。 */
+export interface FsEntry {
+  name: string
+  path: string
+  is_dir: boolean
+}
+
+/** 一次目录列举：当前目录（canonical）+ 其下条目（隐藏项已跳过，
+ *  目录在前、名称升序）。首次请求缺省 path 即得用户主目录。 */
+export interface FsListing {
+  path: string
+  entries: FsEntry[]
+}
+
 // ---------------------------------------------------------------------------
 // 双 transport：模块级一次性选择
 // ---------------------------------------------------------------------------
@@ -238,6 +254,9 @@ interface Transport {
   readPage(vaultPath: string, relPath: string): Promise<string>
   ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport>
   onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn>
+  /** 服务器侧目录浏览（web 壳「浏览…」的数据源；桌面壳弹系统对话框，
+   *  本方法在 Tauri transport 下只做兜底抛错——组件在 Tauri 下不渲染）。 */
+  listFs(path?: string): Promise<FsListing>
 }
 
 /** Tauri IPC transport：命令名与参数键遵循 Tauri 的 camelCase 约定。 */
@@ -255,6 +274,9 @@ const tauriTransport: Transport = {
   ingestFile: (vaultPath, rawPath) => invoke<IngestReport>('ingest_file', { vaultPath, rawPath }),
   onIngestProgress: (handler) =>
     listen<IngestProgress>('ingest-progress', (e) => handler(e.payload)),
+  // 桌面壳选路径走 plugin-dialog 的系统对话框；本方法不应被调用（组件
+  // 在 Tauri 下不渲染），仅兜底给可辨认的中文错误。
+  listFs: () => Promise.reject('桌面壳请使用系统对话框选择路径'),
 }
 
 /** 浏览器订阅 Ingest 进度：EventSource（SSE）。EventSource 无法自定义
@@ -311,6 +333,9 @@ const webTransport: Transport = {
   ingestFile: (vaultPath, rawPath) =>
     httpPost<IngestReport>('/api/ingest', { vault_path: vaultPath, src_path: rawPath }),
   onIngestProgress: sseIngestProgress,
+  // path 缺省时 server 列用户主目录（首响应的 path 字段即 home canonical）
+  listFs: (path) =>
+    httpJson<FsListing>(path === undefined ? '/api/fs/list' : `/api/fs/list?path=${encodeURIComponent(path)}`),
 }
 
 /** 模块级单次选择：壳内走 IPC，浏览器走同源 HTTP。 */
@@ -377,4 +402,12 @@ export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestRe
  */
 export function onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
   return transport.onIngestProgress(handler)
+}
+
+/** 服务器侧只读目录浏览（web 壳专用）：path 缺省列用户主目录。
+ *
+ * 仅 web transport 有真实现；Tauri 下抛中文错误兜底（选路径组件在
+ * 桌面壳不渲染，改弹系统对话框）。 */
+export function listFs(path?: string): Promise<FsListing> {
+  return transport.listFs(path)
 }

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::extract::{Query, Request, State};
 use axum::http::{StatusCode, Uri};
@@ -52,6 +52,7 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
         .route("/vaults/recent", get(list_recent).delete(remove_recent))
         .route("/vaults/pages", get(pages))
         .route("/vaults/page", get(read_page))
+        .route("/fs/list", get(fs_list))
         .route("/config", get(get_config).put(put_config))
         .route("/config/test-connection", post(test_connection_handler))
         .route("/ingest", post(ingest))
@@ -313,6 +314,102 @@ async fn events(
 }
 
 // ---------------------------------------------------------------------------
+// 端点：web 壳新增（桌面壳由 plugin-dialog 弹系统对话框，浏览器弹不了）
+// ---------------------------------------------------------------------------
+
+/// 单个目录项：web 侧目录浏览的最小信息（只读浏览，无大小 / 权限等
+/// 元数据；`path` 为拼接好的绝对路径，前端直接用它继续下钻或选中）。
+#[derive(Debug, serde::Serialize)]
+struct FsEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+/// 一次目录列举的响应：当前目录（canonical）+ 其下条目。
+#[derive(Debug, serde::Serialize)]
+struct FsListing {
+    path: String,
+    entries: Vec<FsEntry>,
+}
+
+/// 过滤隐藏项（`.` 开头）并排序：目录在前、名称升序。**纯函数**——
+/// 过滤与排序规则在此单点，单测直接构造条目即可覆盖，不碰文件系统。
+fn visible_sorted(mut entries: Vec<FsEntry>) -> Vec<FsEntry> {
+    entries.retain(|entry| !entry.name.starts_with('.'));
+    // bool 的序是 false < true：以 b 为第一比较键（dir=true）即目录在前
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    entries
+}
+
+/// 读一个目录为 [`FsEntry`] 列表（过滤 + 排序委托 [`visible_sorted`]）。
+///
+/// symlink 的 is_dir 取 link 本身类型（`DirEntry::file_type` 不跟随）：
+/// 指向 home 外的链接目录不会被前端当成可进入项，与 server 端「越出
+/// home 即 403」的关口口径一致（进去了也只会得到 403，这里直接不诱出）。
+fn read_visible_entries(dir: &Path) -> std::io::Result<Vec<FsEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type()?.is_dir();
+        entries.push(FsEntry {
+            path: entry.path().to_string_lossy().into_owned(),
+            name,
+            is_dir,
+        });
+    }
+    Ok(visible_sorted(entries))
+}
+
+/// 列出文件系统目录（`GET /api/fs/list?path=<可选>`）：web 壳的「浏览…」
+/// 数据源。桌面壳选路径走 plugin-dialog 的系统对话框，浏览器弹不了，
+/// 改由本端点只读列目录——这也是全服务唯一的任意路径读取面，因此：
+///
+/// - **只允许 home 之内**：缺省列用户主目录（`dirs::home_dir`）；显式
+///   path 先 canonicalize（解析 `..` 与 symlink，失败即不存在 → 404），
+///   再断言落在 home canonical 之下，越界一律 403（`Path::starts_with`
+///   按组件比较，`/home/x` 与 `/home/xy` 不会混淆）；
+/// - **只读**：仅列目录项，不提供任何写操作；`.` 开头隐藏项跳过（浏览
+///   Vault / 文档用不到，也少暴露一层）；canonical home 本身失败属
+///   服务端环境问题 → 500。
+async fn fs_list(Query(q): Query<HashMap<String, String>>) -> Result<Json<FsListing>, ApiError> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        ApiError::internal("无法定位用户主目录（dirs::home_dir 返回 None），目录浏览不可用")
+    })?;
+    let home_canonical = home.canonicalize().map_err(|err| {
+        ApiError::internal(format!("解析用户主目录 {} 失败：{err}", home.display()))
+    })?;
+
+    let requested = match q.get("path").map(String::as_str).filter(|s| !s.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => home,
+    };
+    let canonical = requested.canonicalize().map_err(|err| {
+        ApiError::not_found(format!(
+            "路径不存在或无法访问：{}（{err}）",
+            requested.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(ApiError::not_found(format!(
+            "该路径不是目录：{}",
+            canonical.display()
+        )));
+    }
+    if !canonical.starts_with(&home_canonical) {
+        return Err(ApiError::forbidden("仅允许浏览用户主目录内的路径"));
+    }
+
+    let entries = read_visible_entries(&canonical)
+        .map_err(|err| ApiError::bad_request(format!("读取目录失败：{err}")))?;
+    Ok(Json(FsListing {
+        path: canonical.to_string_lossy().into_owned(),
+        entries,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // 测试（tower::ServiceExt::oneshot 方案）：单测直接把请求喂给 Router，
 // 不起真实端口、不绑网络——离线、确定性、无端口冲突；比「随机端口 +
 // reqwest」少一层进程/端口管理，且能直接持有 AppState（互斥锁测试
@@ -398,6 +495,7 @@ mod tests {
             get("/api/templates", None),
             get("/api/templates", Some("wrong-token")),
             get("/api/config", None),
+            get("/api/fs/list", None),
             post_json(
                 "/api/ingest",
                 None,
@@ -699,6 +797,99 @@ mod tests {
             !message.contains("已有另一个摄取"),
             "互斥释放后不得再报并发冲突：{message}"
         );
+    }
+
+    /// 验收：fs_list 走真实 home——缺省列用户主目录（响应 path 为 home
+    /// canonical，条目结构完整）；home 外（/etc）403 中文错误体；不存在
+    /// 路径 404。条目内容不绑机器布局，只断言结构与路径语义。
+    #[tokio::test]
+    async fn fs_list_lists_home_by_default_and_guards_boundaries() {
+        let env = test_env();
+
+        // 缺省 = home：path 字段即 home canonical（与 handler 同一取法）
+        let (status, body) = send(&env.app, authed_get("/api/fs/list")).await;
+        assert_eq!(status, StatusCode::OK);
+        let home_canonical = dirs::home_dir()
+            .expect("测试环境应有用户主目录")
+            .canonicalize()
+            .expect("home canonicalize 失败");
+        assert_eq!(
+            body["path"],
+            home_canonical.to_string_lossy().as_ref(),
+            "缺省应列用户主目录"
+        );
+        let entries = body["entries"].as_array().expect("entries 应为数组");
+        for entry in entries {
+            assert!(entry["name"].is_string());
+            assert!(entry["path"].is_string());
+            assert!(entry["is_dir"].is_boolean());
+            let entry_path = entry["path"].as_str().expect("path 为字符串");
+            assert!(
+                entry_path.starts_with(home_canonical.to_string_lossy().as_ref()),
+                "条目应全部落在 home 之下：{entry_path}"
+            );
+        }
+
+        // home 外（/etc 在 macOS 是 symlink，canonical 后 /private/etc，
+        // 无论哪种拼法都不在 home 之下）→ 403 + 中文
+        let (status, body) = send(&env.app, authed_get("/api/fs/list?path=/etc")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let message = body["message"].as_str().expect("403 应为 {message}");
+        assert!(
+            message.contains("仅允许浏览"),
+            "403 文案应说明边界：{message}"
+        );
+
+        // 不存在的路径 → 404 语义（canonicalize 失败）
+        let (status, body) = send(
+            &env.app,
+            authed_get("/api/fs/list?path=/no/such/dir-for-corpus-test"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["message"].as_str().unwrap().contains("不存在"),
+            "404 文案应说明路径不存在：{body}"
+        );
+    }
+
+    /// 验收：visible_sorted 纯函数——隐藏项（`.` 开头）被过滤，目录
+    /// 在前、各组内名称升序。不碰文件系统。
+    #[test]
+    fn visible_sorted_filters_hidden_and_orders_dirs_first() {
+        let entry = |name: &str, is_dir: bool| FsEntry {
+            path: format!("/home/u/{name}"),
+            name: name.to_string(),
+            is_dir,
+        };
+        let sorted = visible_sorted(vec![
+            entry("zebra.md", false),
+            entry(".hidden", false),
+            entry("docs", true),
+            entry(".corpus", true),
+            entry("alpha", true),
+            entry("apple.txt", false),
+        ]);
+        let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "docs", "apple.txt", "zebra.md"]);
+    }
+
+    /// 验收：read_visible_entries 对真实 tempdir——隐藏文件与隐藏目录
+    /// 都被跳过，目录排在文件前（tempdir 只做条目输入，与 home 无关）。
+    #[test]
+    fn read_visible_entries_skips_hidden_and_sorts() {
+        let dir = tempfile::tempdir().expect("tempdir 失败");
+        std::fs::write(dir.path().join("b.txt"), "x").expect("写文件失败");
+        std::fs::write(dir.path().join(".secret"), "x").expect("写隐藏文件失败");
+        std::fs::create_dir_all(dir.path().join("a-dir")).expect("建目录失败");
+        std::fs::create_dir_all(dir.path().join(".hdir")).expect("建隐藏目录失败");
+
+        let entries = read_visible_entries(dir.path()).expect("列目录失败");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a-dir", "b.txt"]);
+        assert!(entries[0].is_dir);
+        assert!(!entries[1].is_dir);
+        assert_eq!(entries[0].path, dir.path().join("a-dir").to_string_lossy());
     }
 
     /// 验收：静态资源无需 token；SPA 刷新（非根路径未命中）回

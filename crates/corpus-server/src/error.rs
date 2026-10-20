@@ -24,6 +24,30 @@ impl ApiError {
         }
     }
 
+    /// 路径不存在 / 不是目录等「找不到」语义。
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    /// 请求越界（如目录浏览越出用户主目录）。
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    /// 服务端环境问题（无法定位系统目录等），请求本身无错。
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
     /// 并发摄取冲突（全局互斥命中，见 POST /api/ingest 注释）。
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {

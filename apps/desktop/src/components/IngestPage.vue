@@ -3,12 +3,14 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   ingestFile,
+  isTauri,
   onIngestProgress,
   type IngestProgress,
   type IngestReport,
   type PageKind,
 } from '../api'
 import { errorMessage, PAGE_TYPE_LABELS } from '../display'
+import PathPicker from './PathPicker.vue'
 import { bumpPages, currentVault } from '../vault-state'
 
 /** 四阶段步骤条（引擎 IngestStage 的 UI 映射）。 */
@@ -39,6 +41,8 @@ const ingesting = ref(false)
 const phase = ref<Phase>('idle')
 const report = ref<IngestReport | null>(null)
 const ingestError = ref<string | null>(null)
+/** web 模式的服务器侧文件选择弹窗（Tauri 下弹系统对话框，不开本弹窗）。 */
+const pickerOpen = ref(false)
 
 /** 阶段时间线（按到达顺序；同阶段的 chars 更新不产生新标记）。 */
 const stageMarks = ref<StageMark[]>([])
@@ -181,15 +185,28 @@ const stallHint = computed(() => {
 })
 
 async function chooseDocFile(): Promise<void> {
-  // 任意位置的文档：导入 raw/ 由命令端自动完成（复制，源文件不动）
-  const picked = await open({
-    multiple: false,
-    filters: [{ name: '文档（Markdown / 纯文本）', extensions: ['md', 'markdown', 'txt'] }],
-  })
-  if (typeof picked === 'string') {
-    srcPath.value = picked
-    ingestError.value = null
+  // 桌面壳：系统对话框（原样不动）。浏览器：plugin-dialog 依赖 Tauri
+  // internals（invoke 直接抛错），改开服务器侧文件选择弹窗。
+  if (isTauri) {
+    // 任意位置的文档：导入 raw/ 由命令端自动完成（复制，源文件不动）
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: '文档（Markdown / 纯文本）', extensions: ['md', 'markdown', 'txt'] }],
+    })
+    if (typeof picked === 'string') {
+      srcPath.value = picked
+      ingestError.value = null
+    }
+    return
   }
+  pickerOpen.value = true
+}
+
+/** PathPicker 选中（.md / .markdown / .txt 文件）：即待摄取文档路径。 */
+function onPicked(path: string): void {
+  srcPath.value = path
+  ingestError.value = null
+  pickerOpen.value = false
 }
 
 async function runIngest(): Promise<void> {
@@ -255,6 +272,8 @@ function pageTypeLabel(kind: PageKind): string {
         {{ ingesting ? '摄取中…' : '开始摄取' }}
       </button>
     </div>
+
+    <PathPicker v-if="pickerOpen" mode="file" @picked="onPicked" @cancel="pickerOpen = false" />
 
     <section v-if="ingesting || phase === 'done' || phase === 'error'" class="card step">
       <h3>2 · 进度</h3>
