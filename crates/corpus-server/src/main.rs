@@ -17,10 +17,6 @@ use corpus_engine::ConfigStore;
 
 use crate::state::AppState;
 
-/// 与桌面壳 tauri.conf.json 的 identifier 一致：config.db 落在同一应用
-/// 数据目录，双壳共享配置与最近列表（同一台机器上是同一用户的数据）。
-const BUNDLE_IDENTIFIER: &str = "dev.corpus.desktop";
-
 const DEFAULT_PORT: u16 = 8619;
 
 struct Options {
@@ -37,7 +33,7 @@ fn print_usage() {
                      与编译期相对路径，见 README/源码注释）\n\
          -h, --help  显示本帮助\n\n\
          环境变量：CORPUS_HOME 设置后 config.db 存 $CORPUS_HOME/（e2e
-         隔离 / 沙盒实例；未设置与桌面壳共用系统数据目录）"
+         隔离 / 沙盒实例）；未设置默认 ~/.corpus（与桌面壳共用）"
     );
 }
 
@@ -103,12 +99,12 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 应用数据目录：`CORPUS_HOME` 环境变量优先（e2e / 沙盒隔离；设了即建），
-/// 未设置落回 `data_dir/dev.corpus.desktop`——与桌面壳
-/// （tauri app_data_dir）同一目录、同一 config.db。
+/// 全局数据目录：`CORPUS_HOME` 环境变量优先（e2e / 沙盒隔离；设了即建），
+/// 未设置落回 `~/.corpus`——与桌面壳同一目录、同一 config.db
+/// （三平台一致的开发者工具路径）。
 fn app_data_dir() -> Result<PathBuf, String> {
-    let base = dirs::data_dir().ok_or("无法定位系统数据目录（dirs::data_dir 返回 None）")?;
-    let dir = corpus_engine::corpus_home(base.join(BUNDLE_IDENTIFIER));
+    let home = dirs::home_dir().ok_or("无法定位用户主目录（dirs::home_dir 返回 None）")?;
+    let dir = corpus_engine::corpus_home(home.join(".corpus"));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建数据目录 {} 失败：{e}", dir.display()))?;
     Ok(dir)

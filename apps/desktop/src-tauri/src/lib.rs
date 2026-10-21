@@ -29,10 +29,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // 应用数据目录（data_dir/${bundle_identifier}），运行时解析、
-            // 不硬编码；CORPUS_HOME 环境变量优先（e2e / 沙盒隔离），
-            // 未设置走平台默认。目录不存在则创建，随后打开全局 config.db。
-            let dir = corpus_engine::corpus_home(app.path().app_data_dir()?);
+            // 全局数据目录：CORPUS_HOME 环境变量优先（e2e / 沙盒隔离），
+            // 未设置落回 ~/.corpus（与 server 壳一致，三平台同径、可直敲）。
+            // 目录不存在则创建，随后打开全局 config.db。
+            let home = app.path().home_dir()?;
+            let dir = corpus_engine::corpus_home(home.join(".corpus"));
             std::fs::create_dir_all(&dir)?;
             // CORPUS_HOME/.env（若存在）注入环境变量：API key 等放文件
             // 即可，覆盖 GUI 从 Dock 启动不继承 shell 环境的场景。
