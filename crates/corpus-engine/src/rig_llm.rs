@@ -183,7 +183,7 @@ pub fn build_model(tier: &ModelTier, api_key: &str) -> Result<DynModel<Completio
     }
 }
 
-/// 按档位构造端口：校验配置 → 从环境变量解析 key → 工厂建模型。
+/// 按档位构造端口：校验配置 → 解析 key（配置明文字段，ADR-0003）→ 工厂建模型。
 ///
 /// 不设输出上限（连通测试等最小调用用这个；上限对只回一个词的探针
 /// 无意义）。
@@ -211,7 +211,7 @@ pub fn build_llm_port_with_cap(tier: &ModelTier, max_tokens: Option<u64>) -> Res
 
 /// 真实「测试连通」：按 `tier` 构造端口并发起一次最小补全调用。
 ///
-/// 本地可判定的失败（模型名未配置、key 环境变量未设置、兼容端点缺
+/// 本地可判定的失败（模型名未配置、未配置 API key、兼容端点缺
 /// base_url）以 [`Error::InvalidConfig`] / [`Error::MissingApiKey`] 报告；
 /// 远端失败以 [`Error::Llm`] 报告。均不发任何回退网络请求。
 pub async fn test_connection(tier: &ModelTier) -> Result<ConnectionReport> {
@@ -228,7 +228,7 @@ mod tests {
             provider,
             model: model.to_string(),
             base_url: base_url.map(str::to_string),
-            api_key_env: None,
+            api_key: None,
         }
     }
 
@@ -343,14 +343,14 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfig(ref msg) if msg.contains("openai_compatible")));
     }
 
-    /// 本地可判定失败不依赖环境：缺 key 变量时 build_llm_port 直接报
-    /// MissingApiKey（变量名取 provider 惯例）。
+    /// 本地可判定失败不依赖环境：未配置 key（api_key 为 None）时
+    /// build_llm_port 直接报 MissingApiKey（文案指向设置页，ADR-0003）。
     #[test]
-    fn build_llm_port_requires_api_key_env() {
-        let mut t = tier(ProviderKind::OpenAI, "gpt-5.2", None);
-        t.api_key_env = Some("CORPUS_T2_RIG_DEFINITELY_UNSET".to_string());
+    fn build_llm_port_requires_api_key() {
+        let t = tier(ProviderKind::OpenAI, "gpt-5.2", None);
+        assert_eq!(t.api_key, None);
         match build_llm_port(&t) {
-            Err(Error::MissingApiKey { env }) => assert_eq!(env, "CORPUS_T2_RIG_DEFINITELY_UNSET"),
+            Err(Error::MissingApiKey) => {}
             Ok(_) => panic!("期望 MissingApiKey，实际成功构造"),
             Err(other) => panic!("期望 MissingApiKey，实际 {other}"),
         }

@@ -28,13 +28,14 @@ fn setup_vault(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, root)
 }
 
-/// Fake 档位：编排层只透传给端口注入缝，模型配置内容不参与管道行为。
+/// Fake 档位：编排层只透传给端口注入缝，模型配置内容不参与管道行为
+/// （api_key 留空——Fake 端口不解析 key，真实路径由 rig 工厂负责）。
 fn fake_tier() -> ModelTier {
     ModelTier {
         provider: ProviderKind::OpenAI,
         model: "fake-model".to_string(),
         base_url: None,
-        api_key_env: Some("CORPUS_INTEGRATION_TEST_UNSET_KEY".to_string()),
+        api_key: None,
     }
 }
 

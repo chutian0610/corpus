@@ -3,7 +3,8 @@
 //!
 //! - T1 范围：Template 体系（编译期常量）、`create_vault` 公共 API、
 //!   LLM Provider 测试接缝。
-//! - T2 范围：全局配置层（[`config`]，sqlite，API key 只存环境变量名）、
+//! - T2 范围：全局配置层（[`config`]，sqlite，API key 明文存 config.db，
+//!   ADR-0003）、
 //!   Vault 注册表（[`registry`]）、LLM 窄端口 [`LlmPort`] 与连通测试协议，
 //!   以及 `rig` feature 之后的 Rig 真实实现（[`rig_llm`]）。
 //! - T-UX 范围：[`vault::open_vault`]（打开已有 Vault 的只读校验）、
@@ -39,7 +40,7 @@ pub mod wiki;
 // 根 re-export 只保留外部消费者实际使用的名字（桌面壳与集成测试）；
 // 其余类型经各自模块路径访问（如 `corpus_engine::template::GENERIC`），
 // 仅引擎内部使用的类型不导出（如 ingest 的 LLM 解析结构）。
-pub use config::{corpus_home, load_dotenv, AppConfig, ApplyMode, ConfigStore, ModelTier};
+pub use config::{corpus_home, AppConfig, ApplyMode, ConfigStore, ModelTier};
 pub use engine::Engine;
 pub use error::{Error, Result};
 pub use fingerprint::sha256_hex;

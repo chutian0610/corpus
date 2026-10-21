@@ -134,9 +134,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // CORPUS_HOME/.env（若存在）注入环境变量：API key 等放文件即可，
-    // 不必每次 export；已有环境变量优先不覆盖。
-    corpus_engine::load_dotenv(&data_dir);
     let store = match ConfigStore::open(&data_dir) {
         Ok(store) => store,
         Err(err) => {

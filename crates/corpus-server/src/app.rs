@@ -226,6 +226,10 @@ async fn read_page(Query(q): Query<HashMap<String, String>>) -> Result<Json<Stri
 }
 
 /// 读取全局配置（对应 get_config 命令）。
+///
+/// 响应中 `api_key` 为**明文**：server 只绑 127.0.0.1（本机信任域）且
+/// 全部 /api 请求经一次性 token 门控，密钥不出本机进程边界；把配置原样
+/// 回传是设置页回显所需，明文本身是 ADR-0003 接受的取舍。
 async fn get_config(State(state): State<AppState>) -> Result<Json<AppConfig>, ApiError> {
     Ok(Json(state.store.get_config()?))
 }
@@ -528,8 +532,8 @@ mod tests {
         assert_eq!(body["apply_mode"], "manual", "默认配置 apply_mode=manual");
 
         let config = json!({
-            "fast": {"provider": "openai", "model": "gpt-test", "base_url": null, "api_key_env": null},
-            "strong": {"provider": "anthropic", "model": "claude-test", "base_url": null, "api_key_env": null},
+            "fast": {"provider": "openai", "model": "gpt-test", "base_url": null, "api_key": null},
+            "strong": {"provider": "anthropic", "model": "claude-test", "base_url": null, "api_key": null},
             "apply_mode": "auto",
             "query_pages": true
         });

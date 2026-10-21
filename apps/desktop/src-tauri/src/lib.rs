@@ -35,9 +35,6 @@ pub fn run() {
             let home = app.path().home_dir()?;
             let dir = corpus_engine::corpus_home(home.join(".corpus"));
             std::fs::create_dir_all(&dir)?;
-            // CORPUS_HOME/.env（若存在）注入环境变量：API key 等放文件
-            // 即可，覆盖 GUI 从 Dock 启动不继承 shell 环境的场景。
-            corpus_engine::load_dotenv(&dir);
             let store = ConfigStore::open(&dir)?;
             app.manage(store);
             Ok(())
@@ -94,7 +91,8 @@ async fn get_config(store: State<'_, ConfigStore>) -> Result<AppConfig, String> 
     store.get_config().map_err(|e| e.to_string())
 }
 
-/// 保存全局配置（整体覆盖写）。API key 只存环境变量名，值不经过本命令。
+/// 保存全局配置（整体覆盖写）。API key 为设置页输入的明文值，随配置
+/// 整体落本机 config.db（0600；ADR-0003 的主动取舍）。
 #[tauri::command]
 async fn set_config(store: State<'_, ConfigStore>, config: AppConfig) -> Result<AppConfig, String> {
     store.set_config(&config).map_err(|e| e.to_string())?;
@@ -103,7 +101,7 @@ async fn set_config(store: State<'_, ConfigStore>, config: AppConfig) -> Result<
 
 /// 测试连通：按传入档位对配置端点发起一次真实最小补全调用。
 ///
-/// 未配置模型名 / 缺 API key 环境变量 / 兼容端点缺 base_url 等本地可判定
+/// 未配置模型名 / 未配置 API key / 兼容端点缺 base_url 等本地可判定
 /// 的失败，引擎会返回中文错误信息（Error::InvalidConfig / MissingApiKey）。
 #[tauri::command]
 async fn test_connection(tier: ModelTier) -> Result<ConnectionReport, String> {

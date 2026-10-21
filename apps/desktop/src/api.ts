@@ -109,7 +109,8 @@ export interface ModelTier {
   provider: string
   model: string
   base_url: string | null
-  api_key_env: string | null
+  /** API key 明文值（ADR-0003：存本机 config.db；null = 未配置）。 */
+  api_key: string | null
 }
 
 export interface AppConfig {

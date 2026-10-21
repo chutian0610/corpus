@@ -18,7 +18,7 @@ interface TierForm {
   provider: string
   model: string
   base_url: string
-  api_key_env: string
+  api_key: string
 }
 
 const TIERS: ReadonlyArray<{ key: 'fast' | 'strong'; label: string; hint: string }> = [
@@ -31,11 +31,14 @@ const emit = defineEmits<{
 }>()
 
 const form = reactive({
-  fast: { provider: 'openai', model: '', base_url: '', api_key_env: '' } as TierForm,
-  strong: { provider: 'openai', model: '', base_url: '', api_key_env: '' } as TierForm,
+  fast: { provider: 'openai', model: '', base_url: '', api_key: '' } as TierForm,
+  strong: { provider: 'openai', model: '', base_url: '', api_key: '' } as TierForm,
   apply_mode: 'manual' as AppConfig['apply_mode'],
   query_pages: true,
 })
+
+/** API key 输入框的显隐状态（password ↔ text，每档位独立）。 */
+const showApiKey = reactive({ fast: false, strong: false })
 
 const loading = ref(true)
 const loadError = ref<string | null>(null)
@@ -71,7 +74,7 @@ function toTierForm(tier: ModelTier): TierForm {
     provider: tier.provider,
     model: tier.model,
     base_url: tier.base_url ?? '',
-    api_key_env: tier.api_key_env ?? '',
+    api_key: tier.api_key ?? '',
   }
 }
 
@@ -80,7 +83,7 @@ function toModelTier(tier: TierForm): ModelTier {
     provider: tier.provider,
     model: tier.model.trim(),
     base_url: tier.base_url.trim() || null,
-    api_key_env: tier.api_key_env.trim() || null,
+    api_key: tier.api_key.trim() || null,
   }
 }
 
@@ -167,17 +170,28 @@ async function runTestConnection(key: 'fast' | 'strong'): Promise<void> {
             />
           </label>
           <label class="field">
-            <span class="field-label">API key 环境变量名</span>
-            <input
-              v-model="form[t.key].api_key_env"
-              class="input"
-              type="text"
-              :placeholder="form[t.key].provider === 'openai_compatible' ? '必填：如 MY_GATEWAY_API_KEY' : '留空使用惯例名（如 OPENAI_API_KEY）'"
-            />
+            <span class="field-label">API key</span>
+            <span class="key-input">
+              <input
+                v-model="form[t.key].api_key"
+                class="input"
+                :type="showApiKey[t.key] ? 'text' : 'password'"
+                placeholder="留空该档无法调用"
+                autocomplete="new-password"
+              />
+              <button
+                type="button"
+                class="btn key-toggle"
+                :aria-label="showApiKey[t.key] ? '隐藏 API key' : '显示 API key'"
+                @click="showApiKey[t.key] = !showApiKey[t.key]"
+              >
+                {{ showApiKey[t.key] ? '隐藏' : '显示' }}
+              </button>
+            </span>
           </label>
         </div>
         <p class="hint">
-          API key 只从环境变量读取，密钥值不会写入任何文件。
+          API key 明文存本机 ~/.corpus/config.db（ADR-0003）；留空该档无法调用。
           兼容端点将自动启用 Chat Completions 线路与 system 消息兜底。
         </p>
         <div class="tier-actions">
@@ -291,6 +305,23 @@ async function runTestConnection(key: 'fast' | 'strong'): Promise<void> {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* API key 密码输入 + 显隐切换按钮的组合行 */
+.key-input {
+  display: flex;
+  gap: 8px;
+}
+
+.key-input .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.key-toggle {
+  flex-shrink: 0;
+  padding: 8px 12px;
+  font-size: 13px;
 }
 
 .field-label {
