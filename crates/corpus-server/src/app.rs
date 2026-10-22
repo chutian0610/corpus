@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Query, Request, State};
-use axum::http::{StatusCode, Uri};
+use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -28,9 +28,6 @@ use corpus_engine::{
 use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 
-/// token 自定义头（缺失 / 错误 → 401，中文 JSON 错误体）。
-pub const TOKEN_HEADER: &str = "X-Corpus-Token";
-
 /// SSE 进度事件名（前端 EventSource addEventListener 同名）。
 pub const INGEST_PROGRESS_SSE_EVENT: &str = "ingest-progress";
 
@@ -43,7 +40,7 @@ fn sse_event((name, payload): (String, serde_json::Value)) -> Option<Result<Even
         .map(|data| Ok(Event::default().event(name).data(data)))
 }
 
-/// 组装完整 Router：/api（token 中间件内校验）+ dist 静态资源。
+/// 组装完整 Router：/api（本机源校验中间件）+ dist 静态资源。
 pub fn build_router(state: AppState, dist: &Path) -> Router {
     let api = Router::new()
         .route("/templates", get(list_templates))
@@ -63,7 +60,7 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
     // index.html）。tower-http 的 ServeDir 不提供目录列出（目录请求按
     // index 规则或 404 处理），「禁用目录列出」由此满足；显式开启
     // append_index_html_on_directories 让 `/` 直接出壳页面。静态资源
-    // 不要求 token——它只是公开的应用壳，数据入口全部在 /api 后面。
+    // 只是公开的应用壳，数据入口全部在 /api 后面（本机源校验）。
     //
     // 符号链接（评审接受项）：不做 canonicalize。dist 由应用自身
     // `pnpm build` 产出，诱出符号链接需要本机写权限；URL 中的 `..`
@@ -78,62 +75,90 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
     Router::new()
         .nest("/api", api)
         .fallback_service(assets)
-        .layer(middleware::from_fn_with_state(state, token_auth))
+        .layer(middleware::from_fn(local_origin_auth))
 }
 
 // ---------------------------------------------------------------------------
-// token 中间件
+// 本机源校验中间件（替代早期的一次性 token 方案）
 // ---------------------------------------------------------------------------
+//
+// 服务只绑 127.0.0.1，威胁模型是**浏览器侧**的攻击者（本机其他进程
+// 属 ADR-0003 已接受的信任域——它们本就能读 0600 的 config.db）：
+//
+// - **drive-by CSRF**：恶意网页向 http://127.0.0.1:8619 发跨源 POST，
+//   响应虽不可读但副作用会执行（触发摄取烧 LLM token、改写 Vault）。
+//   浏览器跨源请求必带 Origin 头——非本机源一律 403；
+// - **DNS rebinding**：evil.com 解析到 127.0.0.1 使页面「同源」可读
+//   响应——此时 Host 头是 evil.com，非本机主机名一律 403。
+//
+// 规则（对 /api/* 生效；静态资源只是公开应用壳，不校验）：
+// - `Host` 头的主机部分必须是回环名（127.0.0.1 / localhost / ::1）；
+// - `Origin` 头（存在时）的源必须是本机 `http://127.0.0.1:{port}` 或
+//   `http://localhost:{port}`。**不存在则放行**——curl / 脚本等非浏览器
+//   客户端不带 Origin，这与「本机同用户进程可信」的姿态一致，也是
+//   CLI / e2e 直接调 API 的通道。
+//
+// 失败一律 403 + 中文 JSON 错误体。为什么不需要一次性 token：本机
+// 攻击面上 token 与源校验防的是同一批威胁，而 token 有不可避免的
+// 暴露面（启动日志 / 终端回显 / 截图外流，用户实测两次误贴），源
+// 校验零摩擦且防线等价。
 
-/// `/api/*` 的 token 校验（静态资源放行）：
-///
-/// - 首选 [`TOKEN_HEADER`] 自定义头；
-/// - 例外：仅 `/api/events` 额外接受 `?token=` 查询参数——EventSource
-///   无法自定义请求头。取舍：URL 带 token 会进浏览器历史与代理日志，
-///   但本服务仅绑 127.0.0.1、token 每次启动重新生成（一次性）且只在
-///   SSE 一个端点可用，风险可接受；其余 /api 端点坚持只认头，token
-///   不进任何 URL / Referer；
-/// - 失败一律 401 + 中文 JSON 错误体；
-/// - 安全基线（票据 #17）：本服务**不配置任何 CORS 放行**——同源服务
-///   下浏览器跨源请求自然失败；自定义头要求使「跨源简化请求」（不带
-///   预检）也会因缺头得到 401，恶意网页无法借道读取本机数据。
-async fn token_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// 回环主机名集合（Host / Origin 校验的放行名单）。
+const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost", "::1"];
+
+/// 取 Host 头的主机部分（剥掉端口；IPv6 的 `[::1]:8619` 形态剥出
+/// `::1`）。
+fn host_part(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(h, _)| h)
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    }
+}
+
+/// Origin 是否为本机源（`http://<回环名>:{port}`）。非 http、主机非
+/// 回环名或端口不匹配都算不通过。
+fn is_loopback_origin(origin: &str, port: u16) -> bool {
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let host_with_port = rest.split('/').next().unwrap_or_default();
+    LOOPBACK_HOSTS.contains(&host_part(host_with_port))
+        && host_with_port.ends_with(&format!(":{port}"))
+}
+
+/// `/api/*` 的本机源校验（静态资源放行）：
+/// - `Host` 主机部分必须为回环名（拦 DNS rebinding）；
+/// - `Origin` 存在时必须为本机源（拦 drive-by CSRF；不存在放行
+///   curl / 脚本）。
+async fn local_origin_auth(req: Request, next: Next) -> Response {
     let path = req.uri().path();
     if !path.starts_with("/api/") {
         return next.run(req).await;
     }
-    let provided = req
-        .headers()
-        .get(TOKEN_HEADER)
+    let headers = req.headers();
+    let host = headers
+        .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| {
-            if path == "/api/events" {
-                query_param(req.uri(), "token").map(str::to_owned)
-            } else {
-                None
-            }
-        });
-    // 常量时间比较对「仅绑本机、一次性、32 hex 随机」的 token 属过度
-    // 设计，普通比较即可（side channel 需要高频探测面，本机单用户场景
-    // 不存在）。
-    if provided.as_deref() == Some(state.token.as_str()) {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"message": "缺少或无效的访问令牌（X-Corpus-Token 头）。请从 corpus-server 启动输出的 URL 打开本页。"})),
+        .unwrap_or_default();
+    if !LOOPBACK_HOSTS.contains(&host_part(host)) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"message": "拒绝访问：Host 非本机地址（127.0.0.1 / localhost）。请从 http://127.0.0.1:8619/ 访问。"})),
         )
-            .into_response()
+            .into_response();
     }
-}
-
-/// 极简 query 参数提取（token 只含 hex 字符，无需 percent-decode）。
-fn query_param<'q>(uri: &'q Uri, key: &str) -> Option<&'q str> {
-    uri.query()?.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then_some(v)
-    })
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let port = host.rsplit_once(':').map_or("", |(_, p)| p);
+        if !is_loopback_origin(origin, port.parse().unwrap_or(0)) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"message": "拒绝跨源请求：Origin 非本机地址。本服务只接受从 http://127.0.0.1:8619/ 发起的调用。"})),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Query 提取结果的必填参数读取。
@@ -228,7 +253,7 @@ async fn read_page(Query(q): Query<HashMap<String, String>>) -> Result<Json<Stri
 /// 读取全局配置（对应 get_config 命令）。
 ///
 /// 响应中 `api_key` 为**明文**：server 只绑 127.0.0.1（本机信任域）且
-/// 全部 /api 请求经一次性 token 门控，密钥不出本机进程边界；把配置原样
+/// 全部 /api 请求经本机源校验门控，密钥不出本机进程边界；把配置原样
 /// 回传是设置页回显所需，明文本身是 ADR-0003 接受的取舍。
 async fn get_config(State(state): State<AppState>) -> Result<Json<AppConfig>, ApiError> {
     Ok(Json(state.store.get_config()?))
@@ -297,8 +322,8 @@ async fn ingest(
 }
 
 /// SSE 事件流：把广播通道的「事件名 + JSON payload」对经 [`sse_event`]
-/// 转成 `event: <名>` 逐条输出。token 经 `?token=` 查询参数（EventSource
-/// 无法自定义头，见 token_auth 注释）。订阅晚于事件发出时拿不到先前
+/// 转成 `event: <名>` 逐条输出。同源 EventSource 直连（本机源校验
+/// 中间件放行本机源）。订阅晚于事件发出时拿不到先前
 /// 事件（进度语义可容忍）；新增事件类型即发新的名字对，本写循环与
 /// 通道零改动（T9 查询流式的扩展点）。
 async fn events(
@@ -427,7 +452,8 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    /// 本机源常量（请求头构造用；与 server 绑定端口一致）。
+    const LOCAL_HOST: &str = "127.0.0.1:8619";
 
     struct TestEnv {
         app: Router,
@@ -435,12 +461,12 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    /// 临时数据目录下的标准测试环境（ConfigStore、一次性 token、
-    /// 不存在的 dist——静态测试单独建 dist）。
+    /// 临时数据目录下的标准测试环境（ConfigStore；不存在的 dist——静态
+    /// 测试单独建 dist）。
     fn test_env() -> TestEnv {
         let dir = tempfile::tempdir().expect("tempdir 失败");
         let store = corpus_engine::ConfigStore::open(dir.path()).expect("ConfigStore 失败");
-        let state = AppState::new(store, TEST_TOKEN.to_string());
+        let state = AppState::new(store);
         let app = build_router(state.clone(), Path::new("definitely-not-exist-dist"));
         TestEnv {
             app,
@@ -449,25 +475,62 @@ mod tests {
         }
     }
 
-    fn get(uri: &str, token: Option<&str>) -> Request<Body> {
-        let mut builder = Request::builder().uri(uri);
-        if let Some(t) = token {
-            builder = builder.header(TOKEN_HEADER, t);
+    /// 构造请求：默认带本机 Host（模拟真实浏览器/客户端），Origin 可选。
+    fn request(
+        method: axum::http::Method,
+        uri: &str,
+        host: Option<&str>,
+        origin: Option<&str>,
+        body: Option<String>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::HOST, host.unwrap_or(LOCAL_HOST));
+        if let Some(o) = origin {
+            builder = builder.header(axum::http::header::ORIGIN, o);
         }
-        builder.body(Body::empty()).expect("构造请求失败")
+        match body {
+            Some(b) => builder
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(b))
+                .expect("构造请求失败"),
+            None => builder.body(Body::empty()).expect("构造请求失败"),
+        }
     }
 
-    fn post_json(uri: &str, token: Option<&str>, body: &serde_json::Value) -> Request<Body> {
-        let mut builder = Request::builder()
-            .method(axum::http::Method::POST)
-            .uri(uri)
-            .header(axum::http::header::CONTENT_TYPE, "application/json");
-        if let Some(t) = token {
-            builder = builder.header(TOKEN_HEADER, t);
-        }
-        builder
-            .body(Body::from(body.to_string()))
-            .expect("构造请求失败")
+    fn get(uri: &str) -> Request<Body> {
+        request(axum::http::Method::GET, uri, None, None, None)
+    }
+
+    fn get_from(origin_host: &str, uri: &str) -> Request<Body> {
+        request(
+            axum::http::Method::GET,
+            uri,
+            Some(origin_host),
+            Some(format!("http://{origin_host}").as_str()),
+            None,
+        )
+    }
+
+    fn post_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
+        request(
+            axum::http::Method::POST,
+            uri,
+            None,
+            None,
+            Some(body.to_string()),
+        )
+    }
+
+    fn put_json(uri: &str, body: &serde_json::Value) -> Request<Body> {
+        request(
+            axum::http::Method::PUT,
+            uri,
+            None,
+            None,
+            Some(body.to_string()),
+        )
     }
 
     /// 发送请求并解码响应体（空体 → null；非 JSON → 字符串值）。
@@ -487,81 +550,100 @@ mod tests {
         (status, json)
     }
 
-    fn authed_get(uri: &str) -> Request<Body> {
-        get(uri, Some(TEST_TOKEN))
-    }
-
-    /// 验收：无 token / 错 token → 401 + 中文 JSON 错误体（含「令牌」）。
+    /// 验收：本机源 / 无 Origin 头（curl、脚本形态）一律放行——templates
+    /// 与 config 读写全链路真实落库。
     #[tokio::test]
-    async fn api_without_or_with_wrong_token_is_401_chinese_json() {
-        let env = test_env();
-        for req in [
-            get("/api/templates", None),
-            get("/api/templates", Some("wrong-token")),
-            get("/api/config", None),
-            get("/api/fs/list", None),
-            post_json(
-                "/api/ingest",
-                None,
-                &json!({"vault_path": "/x", "src_path": "/y"}),
-            ),
-        ] {
-            let (status, body) = send(&env.app, req).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED);
-            let message = body["message"].as_str().expect("错误体应为 {message}");
-            assert!(message.contains("令牌"), "错误文案应指明令牌：{message}");
-        }
-    }
-
-    /// 验收：带 token 的 templates / config 正常；config PUT 回读一致；
-    /// DELETE 最近列表经 query 参数工作。
-    #[tokio::test]
-    async fn token_header_grants_templates_config_roundtrip_and_recent() {
+    async fn local_and_originless_requests_pass_and_roundtrip_config() {
         let env = test_env();
 
-        let (status, body) = send(&env.app, authed_get("/api/templates")).await;
+        let (status, body) = send(&env.app, get("/api/templates")).await;
         assert_eq!(status, StatusCode::OK);
-        let templates = body.as_array().expect("模板应为数组");
-        assert!(!templates.is_empty());
-        assert!(templates[0]["id"].is_string());
+        assert!(!body.as_array().expect("模板应为数组").is_empty());
 
-        let (status, body) = send(&env.app, authed_get("/api/config")).await;
+        // 本机 Origin（真实浏览器形态）
+        let (status, body) = send(&env.app, get_from(LOCAL_HOST, "/api/config")).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["fast"]["provider"].is_string());
-        assert!(body["strong"]["model"].is_string());
         assert_eq!(body["apply_mode"], "manual", "默认配置 apply_mode=manual");
 
+        // 无 Origin（curl / e2e 脚本形态）：PUT 真实落库
         let config = json!({
             "fast": {"provider": "openai", "model": "gpt-test", "base_url": null, "api_key": null},
             "strong": {"provider": "anthropic", "model": "claude-test", "base_url": null, "api_key": null},
             "apply_mode": "auto",
             "query_pages": true
         });
-        let (status, body) = send(
-            &env.app,
-            Request::builder()
-                .method(axum::http::Method::PUT)
-                .uri("/api/config")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header(TOKEN_HEADER, TEST_TOKEN)
-                .body(Body::from(config.to_string()))
-                .expect("构造请求失败"),
-        )
-        .await;
+        let (status, body) = send(&env.app, put_json("/api/config", &config)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["fast"]["model"], "gpt-test");
-        let (_, body) = send(&env.app, authed_get("/api/config")).await;
+        let (_, body) = send(&env.app, get("/api/config")).await;
         assert_eq!(body["strong"]["model"], "claude-test", "PUT 应真实落库");
+    }
 
-        // DELETE 最近列表（query 传 path）：空列表移除也成功（幂等）
-        let req = Request::builder()
-            .method(axum::http::Method::DELETE)
-            .uri("/api/vaults/recent?path=/no/such")
-            .header(TOKEN_HEADER, TEST_TOKEN)
-            .body(Body::empty())
-            .expect("构造请求失败");
-        let (status, _) = send(&env.app, req).await;
-        assert_eq!(status, StatusCode::OK);
+    /// 验收：跨源 Origin（drive-by CSRF）一律 403 + 中文错误体，覆盖
+    /// GET / POST / SSE 三类端点。
+    #[tokio::test]
+    async fn cross_origin_requests_are_rejected_403() {
+        let env = test_env();
+        for req in [
+            get_from("evil.com", "/api/templates"),
+            post_json(
+                "/api/ingest",
+                &json!({"vault_path": "/x", "src_path": "/y"}),
+            ),
+            get("/api/events?token=irrelevant"),
+        ] {
+            let (req, _) = {
+                // 给无 Origin 的请求补一个 evil Origin（SSE 用例）
+                let mut req = req;
+                if req.headers().get(axum::http::header::ORIGIN).is_none() {
+                    req.headers_mut().insert(
+                        axum::http::header::ORIGIN,
+                        axum::http::HeaderValue::from_static("http://evil.com"),
+                    );
+                }
+                (req, ())
+            };
+            let (status, body) = send(&env.app, req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let message = body["message"].as_str().expect("403 应为 {message}");
+            assert!(
+                message.contains("跨源") || message.contains("本机"),
+                "{message}"
+            );
+        }
+    }
+
+    /// 验收：DNS rebinding——Host 为非回环名（攻击者域名解析到
+    /// 127.0.0.1，页面即「同源」）一律 403；localhost 变体放行。
+    #[tokio::test]
+    async fn rebinding_host_is_rejected_and_localhost_passes() {
+        let env = test_env();
+
+        let req = request(
+            axum::http::Method::GET,
+            "/api/templates",
+            Some("evil.com:8619"),
+            None,
+            None,
+        );
+        let (status, body) = send(&env.app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body["message"].as_str().unwrap().contains("Host"),
+            "403 文案应说明 Host 校验：{body}"
+        );
+
+        for host in ["localhost:8619", "[::1]:8619"] {
+            let req = request(
+                axum::http::Method::GET,
+                "/api/templates",
+                Some(host),
+                None,
+                None,
+            );
+            let (status, _) = send(&env.app, req).await;
+            assert_eq!(status, StatusCode::OK, "回环变体 {host} 应放行");
+        }
     }
 
     /// 验收：Vault 创建 / 打开 / 最近列表走真实引擎与真实 sqlite。
@@ -575,7 +657,6 @@ mod tests {
             &env.app,
             post_json(
                 "/api/vaults",
-                Some(TEST_TOKEN),
                 &json!({"path": vault_path.to_string_lossy(), "template_id": "generic"}),
             ),
         )
@@ -587,18 +668,15 @@ mod tests {
             "应真实落盘"
         );
 
-        // 创建即登记最近列表
-        let (_, body) = send(&env.app, authed_get("/api/vaults/recent")).await;
+        let (_, body) = send(&env.app, get("/api/vaults/recent")).await;
         let recent = body.as_array().expect("最近列表应为数组");
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0]["template_id"], "generic");
 
-        // 打开既有 Vault：校验通过 + 再次登记（仍一条，PRIMARY KEY 去重）
         let (status, body) = send(
             &env.app,
             post_json(
                 "/api/vaults/open",
-                Some(TEST_TOKEN),
                 &json!({"path": vault_path.to_string_lossy()}),
             ),
         )
@@ -606,12 +684,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["template_name"], "Generic");
 
-        // 非 Vault 路径明确报错（中文 message）
         let (status, body) = send(
             &env.app,
             post_json(
                 "/api/vaults/open",
-                Some(TEST_TOKEN),
                 &json!({"path": vault_dir.path().join("not-a-vault").to_string_lossy()}),
             ),
         )
@@ -637,10 +713,9 @@ mod tests {
 
         let vault_enc = vault_path.to_string_lossy();
 
-        // 正常读取：返回 JSON 字符串（与 invoke 的 String 等价）
         let (status, body) = send(
             &env.app,
-            authed_get(&format!(
+            get(&format!(
                 "/api/vaults/page?vault={vault_enc}&rel=sources/hello.md"
             )),
         )
@@ -648,11 +723,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::Value::String("# Hello\n正文内容".into()));
 
-        // `../` 逃逸：被引擎校验拒绝（HTTP 400 + 中文 message）
         for rel in ["../purpose.md", "../../outside.md", "..%2Fpurpose.md"] {
             let (status, body) = send(
                 &env.app,
-                authed_get(&format!("/api/vaults/page?vault={vault_enc}&rel={rel}")),
+                get(&format!("/api/vaults/page?vault={vault_enc}&rel={rel}")),
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "rel={rel}");
@@ -662,11 +736,10 @@ mod tests {
             );
         }
 
-        // 非 Vault 根同样拒绝（先过 open_vault 校验）
         let other = vault_dir.path().to_string_lossy();
         let (status, _) = send(
             &env.app,
-            authed_get(&format!(
+            get(&format!(
                 "/api/vaults/page?vault={other}&rel=sources/hello.md"
             )),
         )
@@ -674,20 +747,16 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    /// 验收：SSE 端点无 token 401；`?token=` 查询参数放行（EventSource
-    /// 无法自定义头的替代通道）；`?token=` 错值仍 401。
+    /// 验收：SSE 端点本机访问直接可用（无 token 时代——同源 EventSource
+    /// 或无 Origin 的脚本连接都放行）；跨源 Origin 403。
     #[tokio::test]
-    async fn events_sse_validates_token_via_query_param() {
+    async fn events_sse_allows_local_and_rejects_cross_origin() {
         let env = test_env();
 
-        let (status, _) = send(&env.app, get("/api/events", None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-        // ?token= 查询参数放行（正确的 token）
         let res = env
             .app
             .clone()
-            .oneshot(get(&format!("/api/events?token={TEST_TOKEN}"), None))
+            .oneshot(get("/api/events"))
             .await
             .expect("oneshot 失败");
         assert_eq!(res.status(), StatusCode::OK);
@@ -701,8 +770,16 @@ mod tests {
             "SSE 响应 content-type 应为 text/event-stream：{content_type}"
         );
 
-        let (status, _) = send(&env.app, get("/api/events?token=wrong", None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let req = request(
+            axum::http::Method::GET,
+            "/api/events",
+            Some(LOCAL_HOST),
+            Some("http://evil.com"),
+            None,
+        );
+        let (status, body) = send(&env.app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["message"].as_str().unwrap().contains("跨源"));
     }
 
     /// 验收：通道承载「事件名 + JSON payload」对，SSE 写循环按事件名
@@ -723,7 +800,7 @@ mod tests {
             let res = env
                 .app
                 .clone()
-                .oneshot(get(&format!("/api/events?token={TEST_TOKEN}"), None))
+                .oneshot(get("/api/events"))
                 .await
                 .expect("oneshot 失败");
             assert_eq!(res.status(), StatusCode::OK);
@@ -755,22 +832,20 @@ mod tests {
         }
     }
 
-    /// 验收：并发摄取返回 409。可行方案：**手动预锁全局互斥**再请求
-    /// ——server 层用 rig 真实端口（无 fake 注入点；端口注入测试缝在
-    /// 引擎层已由 ingest_file_with_ports 覆盖），而真实摄取耗时不可控；
-    /// 预锁确定性地命中 409 分支（互斥检查先于引擎调用与 Vault 校验，
-    /// 无需真实 Vault），是断言互斥语义的最小充分手段。
+    /// 验收：并发摄取返回 409。**手动预锁全局互斥**再请求——server 层
+    /// 用 rig 真实端口（无 fake 注入点；端口注入测试缝在引擎层已由
+    /// ingest_file_with_ports 覆盖），真实摄取耗时不可控；预锁确定性
+    /// 命中 409 分支（互斥检查先于引擎调用与 Vault 校验，无需真实
+    /// Vault），是断言互斥语义的最小充分手段。
     #[tokio::test]
     async fn concurrent_ingest_returns_409() {
         let env = test_env();
-        // 模拟「另一个摄取正在进行」：持有全局互斥
         let _guard = env.state.ingest_lock.lock().await;
 
         let (status, body) = send(
             &env.app,
             post_json(
                 "/api/ingest",
-                Some(TEST_TOKEN),
                 &json!({"vault_path": "/tmp/any", "src_path": "/tmp/any.md"}),
             ),
         )
@@ -782,15 +857,11 @@ mod tests {
             "409 文案应指明摄取冲突：{message}"
         );
 
-        // 释放互斥后同一请求不再 409：请求穿透互斥层进入引擎编排
-        // （默认配置在此报引擎错误——缺 key / 缺模型名等，随环境而定，
-        // 不绑具体文案，只断言互斥语义）
         drop(_guard);
         let (status, body) = send(
             &env.app,
             post_json(
                 "/api/ingest",
-                Some(TEST_TOKEN),
                 &json!({"vault_path": "/tmp/any", "src_path": "/tmp/any.md"}),
             ),
         )
@@ -810,51 +881,31 @@ mod tests {
     async fn fs_list_lists_home_by_default_and_guards_boundaries() {
         let env = test_env();
 
-        // 缺省 = home：path 字段即 home canonical（与 handler 同一取法）
-        let (status, body) = send(&env.app, authed_get("/api/fs/list")).await;
+        let (status, body) = send(&env.app, get("/api/fs/list")).await;
         assert_eq!(status, StatusCode::OK);
         let home_canonical = dirs::home_dir()
             .expect("测试环境应有用户主目录")
             .canonicalize()
             .expect("home canonicalize 失败");
-        assert_eq!(
-            body["path"],
-            home_canonical.to_string_lossy().as_ref(),
-            "缺省应列用户主目录"
-        );
+        assert_eq!(body["path"], home_canonical.to_string_lossy().as_ref());
         let entries = body["entries"].as_array().expect("entries 应为数组");
         for entry in entries {
             assert!(entry["name"].is_string());
             assert!(entry["path"].is_string());
             assert!(entry["is_dir"].is_boolean());
-            let entry_path = entry["path"].as_str().expect("path 为字符串");
-            assert!(
-                entry_path.starts_with(home_canonical.to_string_lossy().as_ref()),
-                "条目应全部落在 home 之下：{entry_path}"
-            );
         }
 
-        // home 外（/etc 在 macOS 是 symlink，canonical 后 /private/etc，
-        // 无论哪种拼法都不在 home 之下）→ 403 + 中文
-        let (status, body) = send(&env.app, authed_get("/api/fs/list?path=/etc")).await;
+        let (status, body) = send(&env.app, get("/api/fs/list?path=/etc")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        let message = body["message"].as_str().expect("403 应为 {message}");
-        assert!(
-            message.contains("仅允许浏览"),
-            "403 文案应说明边界：{message}"
-        );
+        assert!(body["message"].as_str().unwrap().contains("仅允许浏览"));
 
-        // 不存在的路径 → 404 语义（canonicalize 失败）
         let (status, body) = send(
             &env.app,
-            authed_get("/api/fs/list?path=/no/such/dir-for-corpus-test"),
+            get("/api/fs/list?path=/no/such/dir-for-corpus-test"),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(
-            body["message"].as_str().unwrap().contains("不存在"),
-            "404 文案应说明路径不存在：{body}"
-        );
+        assert!(body["message"].as_str().unwrap().contains("不存在"));
     }
 
     /// 验收：visible_sorted 纯函数——隐藏项（`.` 开头）被过滤，目录
@@ -896,23 +947,22 @@ mod tests {
         assert_eq!(entries[0].path, dir.path().join("a-dir").to_string_lossy());
     }
 
-    /// 验收：静态资源无需 token；SPA 刷新（非根路径未命中）回
+    /// 验收：静态资源无校验直接服务；SPA 刷新（非根路径未命中）回
     /// index.html；目录列出不可用（不存在路径 404）。
     #[tokio::test]
-    async fn static_assets_served_without_token_with_spa_fallback() {
+    async fn static_assets_served_with_spa_fallback() {
         let dir = tempfile::tempdir().expect("tempdir 失败");
         std::fs::write(dir.path().join("index.html"), "<html>corpus-shell</html>")
             .expect("写 index 失败");
         let store = corpus_engine::ConfigStore::open(dir.path()).expect("ConfigStore 失败");
-        let state = AppState::new(store, TEST_TOKEN.to_string());
+        let state = AppState::new(store);
         let app = build_router(state, dir.path());
 
-        let (status, body) = send(&app, get("/", None)).await;
+        let (status, body) = send(&app, get("/")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.as_str().unwrap().contains("corpus-shell"));
 
-        // SPA 刷新：任意前端路由未命中静态文件 → 回 index.html
-        let (status, body) = send(&app, get("/some/spa/route", None)).await;
+        let (status, body) = send(&app, get("/some/spa/route")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.as_str().unwrap().contains("corpus-shell"));
     }

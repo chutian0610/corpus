@@ -1280,7 +1280,6 @@ dependencies = [
  "corpus-engine",
  "dirs 6.0.0",
  "futures-util",
- "getrandom 0.3.4",
  "http-body-util",
  "serde",
  "serde_json",

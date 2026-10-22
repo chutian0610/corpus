@@ -5,8 +5,8 @@
  * 双 transport（票据 #17 v1 本地 web 形态）按运行环境自动选择：
  * - Tauri 壳内（window.__TAURI_INTERNALS__ 存在）：走 invoke（IPC）；
  * - 浏览器（corpus-server 静态服务或 vite dev 代理）：走同源
- *   fetch('/api/...') + X-Corpus-Token 头（token 在启动时经 ?token=
- *   引导进 sessionStorage，见 main.ts）。
+ *   fetch('/api/...')，安全由 server 的本机源校验（Host/Origin）保证，
+ *   前端无需携带任何凭据。
  * 组件层零改动：导出的函数签名与响应字段形状完全不变。
  *
  * 运行环境在页面生命周期内不会切换，`isTauri` 判定与 transport 选择都
@@ -24,42 +24,17 @@ export const isTauri = typeof (window as any).__TAURI_INTERNALS__ !== 'undefined
 /** SSE 进度事件名（与 corpus-server 的 INGEST_PROGRESS_SSE_EVENT 对应）。 */
 const INGEST_PROGRESS_SSE_EVENT = 'ingest-progress'
 
-/** token 在 sessionStorage 的键（main.ts 启动时从 ?token= 引导进来）。 */
-export const CORPUS_TOKEN_KEY = 'corpus-token'
-
-export function readToken(): string {
-  return sessionStorage.getItem(CORPUS_TOKEN_KEY) ?? ''
-}
-
-export function storeToken(token: string): void {
-  sessionStorage.setItem(CORPUS_TOKEN_KEY, token)
-}
-
 // ---------------------------------------------------------------------------
-// HTTP transport（浏览器壳）：同源 fetch + token 头
+// HTTP transport（浏览器壳）：同源 fetch，安全由 server 端本机源校验
 // ---------------------------------------------------------------------------
-
-function tokenHeaders(): Record<string, string> {
-  return { 'X-Corpus-Token': readToken() }
-}
 
 /**
- * 统一 HTTP 调用：401 时 console 明确指路（从 corpus-server 启动输出
- * 复制带 token 的 URL 重开）；非 2xx 把服务端 {message} 中文错误体转
- * 为 reject。**reject 的是字符串**——与 Tauri invoke 的错误形态一致，
- * display.ts 的 errorMessage() 双壳同一口径。
+ * 统一 HTTP 调用：非 2xx 把服务端 {message} 中文错误体转为 reject。
+ * **reject 的是字符串**——与 Tauri invoke 的错误形态一致，display.ts
+ * 的 errorMessage() 双壳同一口径。
  */
 async function httpJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { ...tokenHeaders(), ...(init?.headers ?? {}) },
-  })
-  if (res.status === 401) {
-    console.error(
-      'Corpus：请求被拒绝（401，令牌缺失或无效）。请从 corpus-server 启动输出复制完整 URL（含 ?token=）重新打开本页。',
-    )
-    throw '需要访问令牌：请从 corpus-server 启动输出的 URL 打开本页'
-  }
+  const res = await fetch(path, init)
   if (!res.ok) {
     let message = `HTTP ${res.status}`
     try {
@@ -281,10 +256,9 @@ const tauriTransport: Transport = {
 }
 
 /** 浏览器订阅 Ingest 进度：EventSource（SSE）。EventSource 无法自定义
- * 请求头，token 只能走 ?token= 查询参数（server 端仅对 /api/events 放行
- * 该方式，取舍见 server token_auth 注释）；unlisten = 关闭连接。 */
+ * 同源连接（server 端本机源校验放行）；unlisten = 关闭连接。 */
 function sseIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
-  const source = new EventSource(`/api/events?token=${encodeURIComponent(readToken())}`)
+  const source = new EventSource('/api/events')
   source.addEventListener(INGEST_PROGRESS_SSE_EVENT, (ev) => {
     try {
       handler(JSON.parse((ev as MessageEvent).data as string) as IngestProgress)

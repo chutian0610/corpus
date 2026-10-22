@@ -1,9 +1,10 @@
-//! Corpus 本机 web 服务壳（票据 #17 v1）：corpus-engine 公共 API 的一次
-//! 性 token HTTP 包装。领域逻辑零份——与桌面壳同级的最薄一层壳，浏览器
+//! Corpus 本机 web 服务壳（票据 #17 v1）：corpus-engine 公共 API 的 HTTP
+//! 包装。领域逻辑零份——与桌面壳同级的最薄一层壳，浏览器
 //! 由此成为与桌面并列的第二壳（真后端 + Chrome DevTools 调试闭环）。
 //!
-//! 安全基线：仅绑 127.0.0.1；启动生成一次性 token（32 hex），/api 一律
-//! 要求 X-Corpus-Token 头（SSE 例外走 ?token=，见 app.rs 注释）；无任何
+//! 安全基线：仅绑 127.0.0.1；/api 一律经本机源校验（Host 必须为回环
+//! 名、Origin 存在时必须为本机源，拦 drive-by CSRF 与 DNS rebinding，
+//! 见 app.rs 注释）；无任何
 //! CORS 放行。
 
 mod app;
@@ -92,13 +93,6 @@ fn resolve_dist(explicit: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 /// 一次性访问令牌：OS 熵源（CSPRNG）的 16 字节随机数 → 32 hex 字符
-/// （getrandom 直通系统熵源，无用户态 PRNG 中间层）。
-fn generate_token() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("OS 熵源不可用，无法生成访问令牌");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// 全局数据目录：`CORPUS_HOME` 环境变量优先（e2e / 沙盒隔离；设了即建），
 /// 未设置落回 `~/.corpus`——与桌面壳同一目录、同一 config.db
 /// （三平台一致的开发者工具路径）。
@@ -126,7 +120,6 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let token = generate_token();
     let data_dir = match app_data_dir() {
         Ok(dir) => dir,
         Err(err) => {
@@ -144,7 +137,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let state = AppState::new(store, token.clone());
+    let state = AppState::new(store);
     let router = app::build_router(state, &dist);
 
     // 先 bind 再打印 URL（打印出来的地址即可用）；只绑 loopback，
@@ -158,10 +151,7 @@ async fn main() {
         }
     };
 
-    println!(
-        "Corpus web 壳：http://127.0.0.1:{}/?token={token}",
-        opts.port
-    );
+    println!("Corpus web 壳：http://127.0.0.1:{}/", opts.port);
     println!(
         "静态目录：{}（刷新页面 404 时先 pnpm build 或检查 --dist）",
         dist.display()
@@ -175,7 +165,7 @@ async fn main() {
         "config.db 与桌面壳共用"
     };
     println!("数据目录：{}（{home_note}）", data_dir.display());
-    println!("令牌为一次性随机值，重启服务即更换；请勿把带 token 的 URL 发给他人。");
+    println!("安全：仅接受本机访问（Host/Origin 校验），跨源请求一律拒绝。");
 
     if let Err(err) = axum::serve(listener, router).await {
         eprintln!("corpus-server：服务异常退出：{err}");

@@ -23,18 +23,15 @@ pub struct AppState {
     /// `event: <名>`，新增事件类型（如 T9 查询流式）即发送新的名字对，
     /// 通道与写循环零改动（票据 #17 范围重定）。
     pub progress_tx: broadcast::Sender<(String, serde_json::Value)>,
-    /// 本次进程的一次性访问令牌（32 hex，启动时生成）。
-    pub token: Arc<String>,
 }
 
 impl AppState {
-    pub fn new(store: ConfigStore, token: String) -> Self {
+    pub fn new(store: ConfigStore) -> Self {
         let (progress_tx, _) = broadcast::channel(PROGRESS_CHANNEL_CAPACITY);
         Self {
             store: Arc::new(store),
             ingest_lock: Arc::new(Mutex::new(())),
             progress_tx,
-            token: Arc::new(token),
         }
     }
 }
