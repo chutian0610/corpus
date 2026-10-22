@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import IngestPage from './components/IngestPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import VaultCreatePage from './components/VaultCreatePage.vue'
 import { currentVault } from './vault-state'
 
-type PageId = 'create' | 'settings'
+type PageId = 'create' | 'ingest' | 'settings'
 
 const page = ref<PageId>('create')
 </script>
@@ -25,6 +26,14 @@ const page = ref<PageId>('create')
         <button
           type="button"
           class="tab"
+          :class="{ active: page === 'ingest' }"
+          @click="page = 'ingest'"
+        >
+          摄取
+        </button>
+        <button
+          type="button"
+          class="tab"
           :class="{ active: page === 'settings' }"
           @click="page = 'settings'"
         >
@@ -40,6 +49,7 @@ const page = ref<PageId>('create')
       </span>
     </nav>
     <VaultCreatePage v-if="page === 'create'" />
+    <IngestPage v-else-if="page === 'ingest'" />
     <SettingsPage v-else />
   </div>
 </template>

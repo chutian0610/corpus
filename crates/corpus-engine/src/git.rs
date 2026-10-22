@@ -36,6 +36,28 @@ fn run_git_with_fallback(repo: &Path, primary: &[&str], fallback: &[&str]) -> Re
     run_git(repo, primary).or_else(|_| run_git(repo, fallback))
 }
 
+/// 提交身份回退参数（`git -c` 前缀）：全局配置缺提交身份时用 Corpus
+/// 引擎身份，保证全新机器也能完成提交。两处调用（init / commit_files）
+/// 共用，勿各自内联。
+const CORPUS_IDENTITY_ARGS: [&str; 4] = [
+    "-c",
+    "user.name=Corpus",
+    "-c",
+    "user.email=corpus@localhost",
+];
+
+/// `git commit --message <message>`：优先沿用用户全局身份，失败回退
+/// Corpus 身份重试一次（见 [`run_git_with_fallback`]）。
+fn commit_with_identity_fallback(repo: &Path, message: &str) -> Result<()> {
+    let fallback: Vec<&str> = CORPUS_IDENTITY_ARGS
+        .iter()
+        .copied()
+        .chain(["commit", "--message", message])
+        .collect();
+    run_git_with_fallback(repo, &["commit", "--message", message], &fallback)?;
+    Ok(())
+}
+
 /// `git init` + 把当前全部内容作为初始提交。
 ///
 /// 提交身份优先沿用用户全局 git 配置；未配置时回退到 Corpus 引擎身份，
@@ -44,18 +66,28 @@ pub(super) fn init_with_initial_commit(repo: &Path, message: &str) -> Result<()>
     // git 2.28+ 支持指定初始分支名；旧版本回退到默认分支。
     run_git_with_fallback(repo, &["init", "--branch", "main"], &["init"])?;
     run_git(repo, &["add", "--all"])?;
-    run_git_with_fallback(
-        repo,
-        &["commit", "--message", message],
-        &[
-            "-c",
-            "user.name=Corpus",
-            "-c",
-            "user.email=corpus@localhost",
-            "commit",
-            "--message",
-            message,
-        ],
-    )?;
+    commit_with_identity_fallback(repo, message)
+}
+
+/// `git add <files>` + 单次提交，返回新提交的短 hash。
+///
+/// 只 add 显式给出的文件（而非 `--all`）：指纹缓存等 `.corpus/` 下的
+/// 可再生数据即使未被 .gitignore 覆盖也不会混入提交。每次 Apply 恰好
+/// 产生一个提交（Ingest 事务语义，见票据 T3）。
+pub(crate) fn commit_files(repo: &Path, files: &[String], message: &str) -> Result<String> {
+    let mut add_args = vec!["add".to_string()];
+    add_args.extend(files.iter().cloned());
+    let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
+    run_git(repo, &add_args)?;
+    commit_with_identity_fallback(repo, message)?;
+    run_git(repo, &["rev-parse", "--short", "HEAD"])
+}
+
+/// `git reset`（mixed）：清空暂存区、索引回到 HEAD，工作区不动。
+///
+/// Apply 事务的 commit 失败分支用——`git add` 可能已把文件写入索引，
+/// 恢复工作区快照后必须再清索引，工作区才算真正回到提交点。
+pub(crate) fn reset_index(repo: &Path) -> Result<()> {
+    run_git(repo, &["reset"])?;
     Ok(())
 }

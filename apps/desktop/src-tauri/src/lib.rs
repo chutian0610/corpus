@@ -3,12 +3,24 @@
 //! T2：setup 中解析 `app_data_dir()` 并注入 [`ConfigStore`]（引擎只认
 //! 目录参数，见 T2 调研笔记第 6 节），新增配置 / 连通测试 / 最近 Vault
 //! 命令。
+//! T3：`ingest_file` 命令——引擎进度回调桥接为 `ingest-progress` 事件
+//! （AppHandle: Emitter，见 T3 调研笔记第 4 节），并按全局配置
+//! `apply_mode` 分支：`auto` 显式 apply，`manual` 不落盘返回 Draft 检视
+//! 清单（完整人审流程属票据 T5）。
 
 use corpus_engine::{
-    AppConfig, ConfigStore, ConnectionReport, ModelTier, RecentVault, TemplateId, TemplateInfo,
-    VaultInfo,
+    AppConfig, ApplyMode, ConfigStore, ConnectionReport, IngestOutcome, IngestReport, IngestStage,
+    ModelTier, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
-use tauri::{Manager, State};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// 前端 listen 的 Ingest 进度事件名。
+pub const INGEST_PROGRESS_EVENT: &str = "ingest-progress";
+
+/// manual 模式（apply_mode=manual）结果的注明：Draft 未落盘，完整的
+/// 人审流程（检视 / 编辑 / 放行）属票据 T5。
+const MANUAL_REVIEW_NOTE: &str = "人审模式：Draft 未落盘，完整人审流程属 T5";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,6 +44,7 @@ pub fn run() {
             list_recent_vaults,
             add_recent_vault,
             remove_recent_vault,
+            ingest_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -115,4 +128,75 @@ async fn remove_recent_vault(store: State<'_, ConfigStore>, path: String) -> Res
         .remove_recent_vault(&path)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// ingest_file 命令响应：引擎 [`IngestReport`] 平铺 + Apply 模式语义。
+#[derive(Debug, Clone, Serialize)]
+struct IngestFileReport {
+    #[serde(flatten)]
+    report: IngestReport,
+    /// Draft 是否已落盘（指纹跳过与 manual 模式为 false）。
+    applied: bool,
+    /// manual 模式：Draft 人读检视清单（每页一行，降级页带标注）。
+    summary_lines: Vec<String>,
+    /// manual 模式注明（见 [`MANUAL_REVIEW_NOTE`]）。
+    note: Option<String>,
+}
+
+/// 摄取一个 raw 文件：指纹检查 → 两步 LLM → Draft，再按全局配置
+/// `apply_mode` 决定是否落盘（CONTEXT.md「Apply」）。
+///
+/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文）；
+/// 引擎的 `on_progress` 回调在这里桥接为全局 `ingest-progress` 事件
+/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。
+/// 模板取自 Vault 创建时绑定的 `.corpus/vault.json`。
+/// - `auto`：显式 apply（原子写 + 恰好一个 git 提交 + 指纹记录）；
+/// - `manual`：不落盘不提交，返回 Draft 的 summary_lines 并注明
+///   「人审模式：Draft 未落盘，完整人审流程属 T5」。
+#[tauri::command]
+async fn ingest_file(
+    app: AppHandle,
+    store: State<'_, ConfigStore>,
+    vault_path: String,
+    raw_path: String,
+) -> Result<IngestFileReport, String> {
+    let config: AppConfig = store.get_config().map_err(|e| e.to_string())?;
+    let fast = corpus_engine::build_llm_port(&config.fast).map_err(|e| e.to_string())?;
+    let strong = corpus_engine::build_llm_port(&config.strong).map_err(|e| e.to_string())?;
+
+    let emit_progress = |stage: IngestStage| {
+        // 事件推送失败只影响进度展示，不阻断摄取
+        let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
+    };
+
+    match corpus_engine::ingest(&vault_path, &raw_path, &fast, &strong, emit_progress)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        IngestOutcome::Skipped(report) => Ok(IngestFileReport {
+            report,
+            applied: false,
+            summary_lines: Vec::new(),
+            note: None,
+        }),
+        IngestOutcome::Draft(draft) => match config.apply_mode {
+            ApplyMode::Auto => {
+                let commit = corpus_engine::apply(&vault_path, &draft, emit_progress)
+                    .map_err(|e| e.to_string())?;
+                Ok(IngestFileReport {
+                    report: draft.report(Some(commit)),
+                    applied: true,
+                    summary_lines: Vec::new(),
+                    note: None,
+                })
+            }
+            // 人审模式：Draft 不落盘（零写入零提交），交还检视清单
+            ApplyMode::Manual => Ok(IngestFileReport {
+                report: draft.report(None),
+                applied: false,
+                summary_lines: draft.summary_lines(),
+                note: Some(MANUAL_REVIEW_NOTE.to_string()),
+            }),
+        },
+    }
 }
