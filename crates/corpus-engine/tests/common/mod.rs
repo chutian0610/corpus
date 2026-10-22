@@ -153,7 +153,12 @@ pub fn fresh_vault_path(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 /// 在 `repo` 内执行 git 并返回 stdout（测试断言用）。
 pub fn git(repo: &std::path::Path, args: &[&str]) -> String {
+    // -c core.quotePath=false：Linux 上 git 默认对非 ASCII 文件名做八进制
+    // 转义（"\350\207..."），会破坏 UTF-8 页面名断言——显式关闭，使断言
+    // 与本机/CI 的全局 git 配置解耦（CI 首跑实测踩中）。
     let output = Command::new("git")
+        .arg("-c")
+        .arg("core.quotePath=false")
         .args(args)
         .current_dir(repo)
         .output()
