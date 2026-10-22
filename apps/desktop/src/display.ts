@@ -19,7 +19,7 @@ export function templateDisplayName(id: string, name?: string): string {
  * （同 TEMPLATE_DISPLAY_NAMES 模式）：id 与顺序须与引擎侧保持一致；
  * 引擎新增 provider 时此处同步补展示名，展示逻辑不回灌引擎。 */
 export const PROVIDER_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'openai', label: 'OpenAI' },
+  { id: 'openai', label: 'OpenAI（官方）' },
   { id: 'anthropic', label: 'Anthropic' },
   { id: 'deepseek', label: 'DeepSeek' },
   { id: 'openai_compatible', label: 'OpenAI 兼容端点' },
