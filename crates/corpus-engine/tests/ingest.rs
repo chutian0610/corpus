@@ -658,6 +658,67 @@ async fn exact_name_dedup_updates_existing_page() {
     assert_eq!(git(&root, &["rev-list", "--count", "HEAD"]), "3");
 }
 
+/// 验收（跨摄取 slug 撞车）：两份不同 raw 的文章分析出**同名标题**
+/// 时，第二篇的 Source page 落到 `-2` 后缀路径——既有页面不被静默
+/// 覆写，双方溯源互不覆写。
+#[tokio::test]
+async fn same_title_from_different_raw_lands_on_suffixed_source_page() {
+    let (_dir, root) = setup_vault("vault");
+    let raw_a = write_raw(&root, "a.md", "甲写的同名文章");
+    let analysis_same_title =
+        r#"{"source_title":"同名指南","source_summary":"甲的摘要","entities":[],"concepts":[]}"#;
+    let bodies_same_title_a =
+        r#"{"pages":[{"path":"sources/同名指南","body":"第一篇溯源页正文"}]}"#;
+    let first = apply_ok(
+        &root,
+        &draft_of(
+            ingest(
+                &root,
+                &raw_a,
+                &ScriptedLlmPort::new(vec![analysis_same_title.to_string()]),
+                &ScriptedLlmPort::new(vec![bodies_same_title_a.to_string()]),
+                no_progress(),
+            )
+            .await
+            .expect("第一次摄取应成功"),
+        ),
+    );
+    assert_eq!(first.pages[0].action, PageAction::Create);
+    assert_eq!(first.pages[0].path, "sources/同名指南.md");
+
+    // 不同文件（raw/b.md），分析出相同标题（同名分析 + 对应成文）
+    let raw_b = write_raw(&root, "b.md", "乙写的同名文章（内容不同）");
+    let analysis_same_title =
+        r#"{"source_title":"同名指南","source_summary":"乙的摘要","entities":[],"concepts":[]}"#;
+    let bodies_same_title = r#"{"pages":[{"path":"sources/同名指南","body":"第二篇溯源页正文"}]}"#;
+    let second = apply_ok(
+        &root,
+        &draft_of(
+            ingest(
+                &root,
+                &raw_b,
+                &ScriptedLlmPort::new(vec![analysis_same_title.to_string()]),
+                &ScriptedLlmPort::new(vec![bodies_same_title.to_string()]),
+                no_progress(),
+            )
+            .await
+            .expect("同题第二次摄取应成功"),
+        ),
+    );
+    assert_eq!(second.pages.len(), 1, "同题分析只产出 Source 页");
+    assert_eq!(second.pages[0].action, PageAction::Create);
+    assert_eq!(second.pages[0].path, "sources/同名指南-2.md");
+
+    // 两页并存，各自溯源各自的 raw
+    assert_eq!(list_md(&root.join("wiki/sources")).len(), 2);
+    let (fm_a, _) =
+        parse_page(&fs::read_to_string(root.join("wiki/sources/同名指南.md")).unwrap()).unwrap();
+    assert_eq!(fm_a.raw_path.as_deref(), Some("raw/a.md"));
+    let (fm_b, _) =
+        parse_page(&fs::read_to_string(root.join("wiki/sources/同名指南-2.md")).unwrap()).unwrap();
+    assert_eq!(fm_b.raw_path.as_deref(), Some("raw/b.md"));
+}
+
 /// 同一 raw 内容变更后重摄取：更新同一个 Source page（raw 路径锚定）。
 #[tokio::test]
 async fn same_raw_reingest_after_change_updates_same_source_page() {

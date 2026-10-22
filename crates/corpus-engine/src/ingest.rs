@@ -1543,7 +1543,21 @@ fn build_plan(
     }
 
     // 路径分配：更新保留原路径；新建按 slug（同目录冲突追加序号）。
+    //
+    // 种子化：既有页面的路径先行登记（含 .md 后缀剥除后的键），使
+    // **跨摄取**的 slug 撞车也追加序号而非静默覆盖——两篇同题文章、
+    // 或不同名字 slugify 出同一路径（"TCP/IP" 与 "TCP IP"）时，第二篇
+    // 落到 `xxx-2.md`，双方溯源互不覆写。批内冲突沿用同一计数器语义
+    // （第二个新建页 = `-2`）。
     let mut used_paths: HashMap<String, usize> = HashMap::new();
+    for page in existing {
+        let key = page
+            .path
+            .strip_suffix(".md")
+            .unwrap_or(page.path.as_str())
+            .to_string();
+        *used_paths.entry(key).or_insert(0) += 1;
+    }
     for page in &mut planned {
         if let Some(existing_page) = &page.existing {
             page.path = existing_page.path.clone();
