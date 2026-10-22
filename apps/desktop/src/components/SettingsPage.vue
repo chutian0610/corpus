@@ -13,25 +13,6 @@ import {
 } from '../api'
 import { PROVIDER_OPTIONS, errorMessage } from '../display'
 
-/** base_url 字段对该 provider 是否有意义：openai / anthropic /
- * deepseek 是官方固定端点（openai 填了 base_url 会走 Responses API，
- * 第三方网关大多只支持 chat completions 而直接 404——想接第三方请选
- * openai_compatible）；minimax 可选（留空国内站，国际站覆盖）。 */
-const BASE_URL_PROVIDERS: ReadonlySet<string> = new Set([
-  'openai_compatible',
-  'minimax',
-])
-
-function usesBaseUrl(key: 'fast' | 'strong'): boolean {
-  return BASE_URL_PROVIDERS.has(form[key].provider)
-}
-
-function baseUrlLabel(key: 'fast' | 'strong'): string {
-  return form[key].provider === 'minimax'
-    ? 'Base URL（可选；留空用国内站，国际站填 https://api.minimax.io/v1）'
-    : 'Base URL（必填）'
-}
-
 /** 表单内的档位：可空字段用空串编辑，提交时转回 null */
 interface TierForm {
   provider: string
@@ -179,8 +160,8 @@ async function runTestConnection(key: 'fast' | 'strong'): Promise<void> {
               placeholder="如 gpt-5.2 / claude-sonnet-4-6 / deepseek-v4-flash"
             />
           </label>
-          <label v-if="usesBaseUrl(t.key)" class="field">
-            <span class="field-label">{{ baseUrlLabel(t.key) }}</span>
+          <label class="field">
+            <span class="field-label">Base URL（可选；OpenAI 兼容端点必填，官方端点亦可填中转/镜像地址）</span>
             <input
               v-model="form[t.key].base_url"
               class="input"
