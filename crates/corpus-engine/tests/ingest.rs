@@ -442,14 +442,15 @@ async fn compose_failure_leaves_no_partial_writes() {
     assert_failure_clean(&root, &state);
 }
 
-/// 首次输出坏、重试后好：管道恢复并成功落盘（容错重试的价值路径）。
+/// 首次输出截断但可修复、重试后好：管道恢复并成功落盘（容错重试的
+/// 价值路径）。
 #[tokio::test]
 async fn retry_recovers_from_one_bad_output() {
     let (_dir, root) = setup_vault("vault");
     let raw = write_raw(&root, "a.md", "内容");
     let fast = ScriptedLlmPort::new(vec![
-        // 截断的 JSON：能提取到片段但无法解析 → 触发一次重试
-        "{\"source_title\": \"T\"".to_string(),
+        // 完全损坏（无任何可修复候选）→ 解析失败 → 触发一次重试
+        "{\"source_title\": ".to_string(),
         analysis_json(),
     ]);
     let strong = ScriptedLlmPort::new(vec![bodies_json()]);
@@ -459,8 +460,51 @@ async fn retry_recovers_from_one_bad_output() {
             .expect("重试一次后应成功"),
     );
     assert_eq!(fast.call_count(), 2);
+    assert_eq!(draft.llm_calls[0].salvaged, None, "损坏输出无修复产物");
     apply(&root, &draft, no_progress()).expect("apply 失败");
     assert!(root.join("wiki/sources").is_dir());
+}
+
+/// 截断但可修复的输出（entities 写到一半断掉）：salvage 恢复部分条目
+/// 直接采用，不消耗重试（一次调用成功），统计与日志标 salvaged=true。
+#[tokio::test]
+async fn truncated_analysis_salvages_partial_entries_in_one_call() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let truncated = r#"{"source_title":"Attention Is All You Need","source_summary":"s",
+  "entities":[{"title":"Transformer","summary":"架构"},{"ti"#;
+    let fast = ScriptedLlmPort::new(vec![truncated.to_string()]);
+    // 成文计划按修复后的部分条目：Source + Transformer（BERT 丢失）
+    let bodies = r##"{"pages": [
+      {"path": "sources/attention-is-all-you-need", "body": "摘要。"},
+      {"path": "entities/transformer", "body": "正文。"}
+    ]}"##;
+    let strong = ScriptedLlmPort::new(vec![bodies.to_string()]);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("截断输出应修复成功（不重试）"),
+    );
+    assert_eq!(fast.call_count(), 1, "salvage 成功不得消耗重试");
+    assert_eq!(draft.llm_calls[0].salvaged, Some(true), "统计应标 salvaged");
+
+    // 修复产物：部分条目（Transformer 在、半截条目随截断丢失）
+    assert_eq!(
+        draft.pages.len(),
+        2,
+        "Source + 唯一恢复的实体：{:?}",
+        draft.summary_lines()
+    );
+    let report = apply_ok(&root, &draft);
+    assert_eq!(report.pages.len(), 2);
+
+    // llm-calls.log 该行带 "salvaged":true
+    let log = llm_calls_log(&root);
+    assert!(
+        log[0].contains("\"salvaged\":true"),
+        "统计日志应标注 salvaged：{}",
+        log[0]
+    );
 }
 
 /// 失败路径的基线快照：wiki/ 文件树 + 提交数 + git 状态（摄取前 raw 尚
@@ -1189,13 +1233,11 @@ async fn llm_calls_log_records_all_steps_without_raw_content() {
 // ---------------------------------------------------------------------------
 
 /// 推理模型内联思考 + 中途截断的分析输出（模拟思考 token 挤占
-/// max_tokens：`<think>` 混流在前，JSON 在列表中间戛然而止）。
+/// max_tokens：`<think>` 混流在前，JSON 在首个值字符串中间戛然而止——
+/// 无任何完整元素，salvage 不可行，维持解析失败路径）。
 fn think_wrapped_truncated_analysis() -> String {
-    let mut json = String::from("{\"source_title\":\"T\",\"source_summary\":\"");
+    let mut json = String::from("{\"source_title\":\"");
     json.push_str(&"长".repeat(300));
-    json.push_str(
-        "\",\"entities\":[{\"title\":\"X\",\"summary\":\"Y\"}],\"concepts\":[{\"title\":\"Z\",\"summ",
-    );
     format!("<think>\n用户给了一篇论文，让我先想想结构……\n好，开始输出。\n</think>\n{json}")
 }
 
@@ -1275,7 +1317,7 @@ async fn parse_failure_log_records_output_diagnostics() {
         assert_eq!(tail.chars().count(), 300, "tail 应为后 300 字符：{tail}");
         assert!(head.starts_with("<think>"), "head 应保留思考块起点：{head}");
         assert!(
-            tail.ends_with("\"summ"),
+            tail.ends_with("长"),
             "tail 应停在 JSON 截断点（一眼可见断在哪）：{tail}"
         );
         // 错误摘要末尾附开头/结尾摘录（前端悬停 title 直接可见）
@@ -1285,4 +1327,150 @@ async fn parse_failure_log_records_output_diagnostics() {
             "错误摘要应附输出摘录：{error}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 最低有效性闸门（#23）：全空分析不得静默成功
+// ---------------------------------------------------------------------------
+
+/// 验收（#23）：形状不对但含 `{}` 的 JSON（成文响应错位的典型形状
+/// `{"pages":[...]}`）会「成功」解析为全空分析——必须视为违约走重试
+/// 且重试 user 附强约束；两次仍空报错零写入，而非产出垃圾 Source 页。
+#[tokio::test]
+async fn empty_shell_analysis_violates_and_retries_then_fails_clean() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "内容");
+    let state = failure_baseline(&root);
+
+    let fast = ScriptedLlmPort::new(vec![
+        r#"{"pages":[]}"#.to_string(),
+        r#"{"pages":[]}"#.to_string(),
+    ]);
+    let strong = ScriptedLlmPort::new(vec![]);
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
+        .await
+        .expect_err("两次全空分析必须报错");
+    assert!(matches!(err, Error::BadLlmOutput(_)), "got: {err:?}");
+    assert_eq!(fast.call_count(), 2, "全空违约应走既有重试（共两次）");
+    assert_eq!(strong.call_count(), 0, "分析违约不得进入第二步");
+    assert_failure_clean(&root, &state);
+
+    // 重试 user 消息追加了点名必填字段的强约束
+    let calls = fast.recorded_calls();
+    assert!(
+        calls[1].1.contains("source_title") && calls[1].1.contains("实质内容"),
+        "重试 user 应附全空违约强约束：{}",
+        calls[1].1
+    );
+
+    // 统计：两次都是 parse_failed（违约按失败处理）
+    // 日志：违约输出原文进了 debug 日志（失败自动记录，见下节测试）
+}
+
+/// 验收（#23）：首次全空违约 → 强约束重试 → 正常分析恢复，整单成功。
+#[tokio::test]
+async fn empty_shell_retry_recovers_with_good_analysis() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "内容");
+    let fast = ScriptedLlmPort::new(vec![
+        r#"{"pages": [{"path": "x", "body": "错位的成文响应"}]"#.to_string(),
+        analysis_json(),
+    ]);
+    let strong = ScriptedLlmPort::new(vec![bodies_json()]);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("重试后应恢复"),
+    );
+    assert_eq!(fast.call_count(), 2);
+    assert!(
+        fast.recorded_calls()[1].1.contains("实质内容"),
+        "重试 user 应附强约束：{}",
+        fast.recorded_calls()[1].1
+    );
+    // 正常分析：1 Source + 1 Entity + 1 Concept
+    assert_eq!(draft.pages.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// LLM debug 日志（.corpus/llm-debug.log：完整输入/输出原文）
+// ---------------------------------------------------------------------------
+
+/// 读 Vault 的 llm-debug.log 全部行（文件须存在）。
+fn llm_debug_log(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(".corpus/llm-debug.log"))
+        .expect("llm-debug.log 应存在")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 验收：失败调用（解析失败）自动写 debug 日志——system/user/输出原文
+/// 齐全；成功调用在未设 CORPUS_DEBUG 时不写；CORPUS_DEBUG=1 时成功
+/// 调用也全量记录（env 为进程全局态，经 ENV_LOCK 串行化）。
+// 持锁跨 .await 是刻意的：CORPUS_DEBUG 必须覆盖整个摄取过程
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn debug_log_records_failures_and_env_gated_successes() {
+    let _guard = common::ENV_LOCK.lock().unwrap();
+    std::env::remove_var("CORPUS_DEBUG");
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "DEBUG_MARKER_INPUT 正文内容");
+
+    // 失败调用：自动记录（两次解析失败各一条）
+    let fast = ScriptedLlmPort::new(vec!["坏输出".to_string(), "还是坏".to_string()]);
+    let strong = ScriptedLlmPort::new(vec![]);
+    assert!(ingest(&root, &raw, &fast, &strong, no_progress())
+        .await
+        .is_err());
+    let lines = llm_debug_log(&root);
+    assert_eq!(lines.len(), 2, "两次失败各留一条：{lines:?}");
+    let entry: serde_json::Value = serde_json::from_str(&lines[0]).expect("每行是 JSON");
+    assert_eq!(entry["purpose"], "analyze");
+    assert_eq!(entry["outcome"], "parse_failed");
+    assert!(
+        entry["system"]
+            .as_str()
+            .unwrap()
+            .contains("Output contract"),
+        "system 全文应记录：{}",
+        entry["system"]
+    );
+    assert!(
+        entry["user"]
+            .as_str()
+            .unwrap()
+            .contains("DEBUG_MARKER_INPUT"),
+        "user 全文应记录：{}",
+        entry["user"]
+    );
+    assert_eq!(entry["output"], "坏输出", "输出原文应记录");
+
+    // 成功调用（CORPUS_DEBUG 未设）：不写 debug 日志
+    let report = ingest_ok(&root, &raw).await;
+    assert_eq!(report.llm_calls.len(), 2);
+    assert_eq!(llm_debug_log(&root).len(), 2, "成功调用不写 debug 日志");
+
+    // CORPUS_DEBUG=1：成功调用也全量记录（analyze + compose 各一条）
+    std::env::set_var("CORPUS_DEBUG", "1");
+    let raw_b = write_raw(&root, "b.md", "DEBUG_MARKER_B 内容");
+    let _report_b = ingest_ok(&root, &raw_b).await;
+    std::env::remove_var("CORPUS_DEBUG");
+    let lines = llm_debug_log(&root);
+    assert_eq!(lines.len(), 4, "成功调用也应全量记录：{lines:?}");
+    let analyze: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+    let compose: serde_json::Value = serde_json::from_str(&lines[3]).unwrap();
+    assert_eq!(analyze["outcome"], "ok");
+    assert_eq!(compose["outcome"], "ok");
+    assert_eq!(compose["purpose"], "compose");
+    assert!(
+        compose["output"].as_str().unwrap().contains("\"pages\""),
+        "输出原文应完整记录：{}",
+        compose["output"]
+    );
+    assert!(
+        analyze["user"].as_str().unwrap().contains("DEBUG_MARKER_B"),
+        "成功调用的输入也应记录"
+    );
 }

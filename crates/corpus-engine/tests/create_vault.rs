@@ -62,11 +62,11 @@ fn create_vault_creates_complete_skeleton_for_every_template() {
             template.id
         );
 
-        // .corpus/.gitignore 忽略指纹缓存 state.db 与 LLM 调用日志
-        // llm-calls.log（可再生 / 本地诊断数据，不入库）
+        // .corpus/.gitignore 忽略指纹缓存 state.db、LLM 调用统计
+        // llm-calls.log 与 LLM debug 日志（可再生 / 本地诊断数据，不入库）
         assert_eq!(
             fs::read_to_string(root.join(".corpus/.gitignore")).unwrap(),
-            "state.db\nllm-calls.log\n"
+            "state.db\nllm-calls.log\nllm-debug.log\nllm-debug.log.1\n"
         );
 
         // vault.json 记录模板绑定，且可经公共 API 读回

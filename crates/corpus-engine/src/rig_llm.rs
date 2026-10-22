@@ -30,7 +30,8 @@ use crate::llm::{test_connection_with, ConnectionReport, LlmPort};
 /// 用途配置（取舍见 [`build_llm_port_with_cap`]）。`max_tokens` 是服务端
 /// 硬顶（第一道闸），引擎侧的字符熔断是第二道闸（见 [`crate::ingest`]）；
 /// `additional_params` 原样并入请求体顶层（provider passthrough），
-/// 用于 MiniMax 等推理模型的 `thinking` 开关。
+/// 用于 MiniMax M3.1 等推理模型的 `reasoning_effort` / `reasoning_split`
+/// 等透传参数（见 [`crate::ingest::analysis_passthrough_params`]）。
 pub struct RigLlmPort {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
@@ -214,9 +215,11 @@ pub fn build_llm_port_with_cap(tier: &ModelTier, max_tokens: Option<u64>) -> Res
 /// [`build_llm_port_with_cap`] 的完整形态：额外携带透传参数
 /// （`AgentBuilder::additional_params`，原样并入请求体顶层）。
 ///
-/// 典型用途：MiniMax M3 系列等推理模型经 OpenAI 兼容端点默认开思考
-/// （thinking token 挤占 max_tokens 预算且照常计费），分析调用传
-/// `{"thinking": {"type": "disabled"}}` 关闭。
+/// 典型用途：MiniMax M3.1 系等推理模型强制思考且思考 token 计入
+/// `max_tokens` 预算，分析调用传 `reasoning_effort` / `reasoning_split`
+/// 压低思考量并分离思考与正文（参数事实与取舍见
+/// [`crate::ingest::analysis_passthrough_params`]；`thinking` 开关不可用
+/// ——M3.1 上 `thinking.type=disabled` 返回 400，只有旧 M3 可关）。
 pub fn build_llm_port_with(
     tier: &ModelTier,
     max_tokens: Option<u64>,
@@ -398,7 +401,7 @@ mod tests {
             model: model.clone(),
             max_tokens: Some(crate::llm::ANALYSIS_MAX_TOKENS),
         };
-        assert_eq!(capped.max_tokens, Some(20_000));
+        assert_eq!(capped.max_tokens, Some(50_000));
         let uncapped = RigLlmPort {
             additional_params: None,
             model,
@@ -409,6 +412,10 @@ mod tests {
 
     /// 透传参数在端口构造期预设（complete 协议无法按调用携带）：
     /// build_llm_port_with 持有该值、build_llm_port_with_cap 保持 None。
+    /// 参数内容即分析端口实际透传的
+    /// [`crate::ingest::analysis_passthrough_params`]（reasoning_effort
+    /// low + reasoning_split true——MiniMax M3.1 强制思考，thinking
+    /// disabled 会 400），此处一并断言防漂移。
     #[test]
     fn additional_params_round_trip_through_constructor() {
         let t = ModelTier {
@@ -419,7 +426,12 @@ mod tests {
                 Some("http://x/v1"),
             )
         };
-        let params = serde_json::json!({ "thinking": { "type": "disabled" } });
+        let params = crate::ingest::analysis_passthrough_params();
+        assert_eq!(
+            params,
+            serde_json::json!({ "reasoning_effort": "low", "reasoning_split": true }),
+            "分析端口的透传参数必须是 reasoning_effort low + reasoning_split true"
+        );
 
         let with = build_llm_port_with(&t, Some(ANALYSIS_MAX_TOKENS), Some(params.clone()))
             .expect("带 key 构造应成功");

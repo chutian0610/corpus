@@ -25,9 +25,22 @@
 //! first-`{` 到 last-`}` 的 JSON 提取窗口（见 [`strip_think_blocks`]）。
 //! 剥离只影响解析；`chars` 计数保持原样（如实反映模型输出量）。
 //!
+//! JSON 输出的三级容错（解析层）：
+//! 1. 剥离思考块 + 围栏/杂文字容忍（见 [`extract_json_object`]）；
+//! 2. 截断修复（salvage）：serde 报截断特征错误（EOF/trailing/expected）
+//!    时按括号平衡闭合恢复可解析前缀，部分条目可用即采用（统计标
+//!    `salvaged=true`，见 [`salvage_truncated_json`]）；
+//! 3. 最低有效性闸门（#23）：解析/修复成功后 source_title、entities、
+//!    concepts 全空视为违约——任何形状不对但含 `{}` 的 JSON（如成文
+//!    响应错位）都不得静默变成「全空分析」（空标题落回文件名、空计划
+//!    产出垃圾页），违约走既有重试并附强约束，二次仍空报错零写入。
+//!
 //! 全程每次 LLM 调用都记 [`LlmCallStats`]（档位/用途/字数/耗时/结果，
 //! 无原文；失败时附输出首尾片段诊断），随 [`IngestReport`] 返回并即时
 //! 追加到 Vault 的 `.corpus/llm-calls.log`（JSON 行，被 .gitignore 忽略）。
+//! 另有 `.corpus/llm-debug.log`（输入/输出原文，仅失败自动记录；设
+//! `CORPUS_DEBUG=1` 时成功调用也全量记录，超 5MB 轮转保留一代）——
+//! 该文件在用户本机 Vault 内、git 忽略，仅本地诊断用。
 //!
 //! 引擎不依赖 tauri：进度经 `on_progress: impl FnMut(IngestStage)` 回调
 //! 上报（见 T3 调研笔记第 4 节架构提示），壳层负责转成事件。
@@ -523,21 +536,41 @@ pub async fn ingest_file<F>(
 where
     F: FnMut(IngestStage) + Send,
 {
-    // fast 档端口：MiniMax M3 系列等推理模型经 OpenAI 兼容端点默认开
-    // 思考，thinking token 挤占 max_tokens 预算且照常计费（实测单次
-    // 分析输出 2 万字被拦腰截断）——分析步透传参数关闭思考。strong 档
-    // 保留思考（成文质量受益），仅设输出上限。
+    // fast 档端口：MiniMax M3.1 系等推理模型强制思考（官方文档：
+    // thinking.type=disabled 在 M3.1 上返回 400，只有旧 M3 可关；思考
+    // token 计入 max_tokens 预算——max_tokens 太小会以 finish_reason=
+    // length 结束且 content 为空），分析步改传 reasoning_effort=low
+    // 大幅压低思考量（M3.1-Flash 专属参数，low–max，默认 max——
+    // 默认 max 的超长思考正是分析输出被拦腰截断的元凶），
+    // reasoning_split=true 确保思考分离进 reasoning_content、不混入
+    // 正文流。strong 档保留思考（成文质量受益），仅设输出上限。
     let fast = if config.fast.provider == ProviderKind::OpenAICompatible {
         crate::rig_llm::build_llm_port_with(
             &config.fast,
             Some(ANALYSIS_MAX_TOKENS),
-            Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+            Some(analysis_passthrough_params()),
         )?
     } else {
         crate::rig_llm::build_llm_port_with_cap(&config.fast, Some(ANALYSIS_MAX_TOKENS))?
     };
     let strong = crate::rig_llm::build_llm_port_with_cap(&config.strong, Some(COMPOSE_MAX_TOKENS))?;
     ingest_file_with_ports(vault_root, src_path, config, &fast, &strong, on_progress).await
+}
+
+/// 分析端口（OpenAICompatible）的透传参数——`ingest_file` 原样并入
+/// 请求体顶层（`AgentBuilder::additional_params`，provider passthrough）。
+///
+/// MiniMax 官方文档事实（2026-10 核对）：
+/// - M3.1-Flash 强制思考：`thinking.type=disabled` 返回 400，只有旧 M3
+///   可关——因此不传 `thinking`，改用思考量控制参数；
+/// - `reasoning_effort`（M3.1-Flash 专属，low–max，默认 max）控制思考
+///   token 量：传 `low` 大幅压低思考开销（思考 token 计入 `max_tokens`，
+///   默认 max 的超长思考正是分析输出截断的元凶）；
+/// - `reasoning_split: true` 把思考分离到 `reasoning_content`（思考与
+///   正文分离；M3.1-Flash 不支持 false，缺省即分离——显式传 true 是
+///   对其他 OpenAI 兼容后端的兼容声明，防止思考文本内联进 content）。
+pub(crate) fn analysis_passthrough_params() -> serde_json::Value {
+    serde_json::json!({ "reasoning_effort": "low", "reasoning_split": true })
 }
 
 /// 归一化 raw 路径：相对 Vault 解析为绝对，并校验位于 `raw/` 内。
@@ -625,6 +658,16 @@ pub const COMPOSE_MAX_OUTPUT_CHARS: usize = 60_000;
 /// 统计与日志文件的相对路径（Vault 内；被 `.corpus/.gitignore` 忽略）。
 pub const LLM_CALLS_LOG_REL: &str = ".corpus/llm-calls.log";
 
+/// LLM debug 日志的相对路径：记录每次调用的完整输入（system/user）与
+/// 输出原文。**隐私说明**：该文件位于用户本机 Vault 的 `.corpus/` 内、
+/// 被 `.corpus/.gitignore` 忽略（不入库），仅本地诊断用——排查「模型
+/// 到底收到了什么、吐了什么」时全量可查，绝不随 git 历史/同步外流。
+pub const LLM_DEBUG_LOG_REL: &str = ".corpus/llm-debug.log";
+
+/// debug 日志轮转阈值（字节）：追加前超过即轮转为 `llm-debug.log.1`
+///（保留一代，旧 `.1` 被覆盖）——原文全量记录的文件会长得很快。
+pub const LLM_DEBUG_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
 /// 错误摘要写入统计时的最大保留长度（字符）。
 const STATS_ERROR_MAX_CHARS: usize = 200;
 
@@ -642,6 +685,12 @@ const RETRY_CONSTRAINT_OVERSIZED: &str =
 /// 上次输出无法解析时，重试 user 消息末尾追加的强约束。
 const RETRY_CONSTRAINT_UNPARSEABLE: &str =
     "上次输出无法解析。只输出符合要求的紧凑内容，禁止复述原文、禁止重复。";
+
+/// 上次输出解析成功但全空（最低有效性闸门违约，#23）时，重试 user
+/// 消息末尾追加的强约束——明确点名必填字段，比「无法解析」更有针对性。
+const RETRY_CONSTRAINT_EMPTY: &str = "上次输出缺少实质内容：source_title、entities、concepts \
+不得全空。请严格按约定形状输出一个 JSON 对象，包含非空的 source_title、\
+source_summary，以及 entities/concepts 列表（每个条目带非空 title）。";
 
 /// 一次调用的画像：档位 + 用途 + 步骤名 + 字符熔断上限（分析/成文各自
 /// 一份，[`with_retry_stream`] 据此填统计与判断超限）。
@@ -682,6 +731,81 @@ impl LlmCallRecorder {
     fn finish(self) -> Vec<LlmCallStats> {
         self.calls
     }
+
+    /// 追加一条 LLM debug 日志（完整输入/输出原文，见
+    /// [`LLM_DEBUG_LOG_REL`]）：**失败调用自动记录**（端口错误 / 超限 /
+    /// 解析或校验违约）；成功调用仅在 `CORPUS_DEBUG=1` 时全量记录。
+    /// Best-effort：写日志失败只打 stderr，绝不影响摄取主流程。
+    #[allow(clippy::too_many_arguments)]
+    fn record_debug(
+        &self,
+        tier: LlmTier,
+        purpose: LlmCallPurpose,
+        outcome: LlmCallOutcome,
+        system: Option<&str>,
+        user: &str,
+        output: &str,
+        error: Option<&str>,
+    ) {
+        if outcome == LlmCallOutcome::Ok && !debug_always_enabled() {
+            return;
+        }
+        let mut entry = serde_json::json!({
+            "ts": chrono::Local::now().to_rfc3339(),
+            "tier": tier,
+            "purpose": purpose,
+            "outcome": outcome,
+            "system": system.unwrap_or(""),
+            "user": user,
+            "output": output,
+        });
+        if let Some(error) = error {
+            entry["error"] = serde_json::Value::String(error.to_string());
+        }
+        if let Err(err) = append_llm_debug_line(&self.vault_root, &entry) {
+            eprintln!("追加 LLM debug 日志失败（不影响摄取结果）：{err}");
+        }
+    }
+}
+
+/// `CORPUS_DEBUG=1`（精确值）：成功调用的输入/输出也全量写 debug 日志。
+/// 失败调用无论该开关如何都会记录（诊断截断 / 违约问题的最小事实）。
+fn debug_always_enabled() -> bool {
+    std::env::var("CORPUS_DEBUG").is_ok_and(|v| v.trim() == "1")
+}
+
+/// 追加一行 JSON 到 Vault 的 llm-debug.log；追加前超
+/// [`LLM_DEBUG_LOG_MAX_BYTES`] 则轮转为 `llm-debug.log.1`（保留一代）。
+fn append_llm_debug_line(vault_root: &Path, entry: &serde_json::Value) -> Result<()> {
+    let path = vault_root.join(LLM_DEBUG_LOG_REL);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    rotate_if_oversized(&path, LLM_DEBUG_LOG_MAX_BYTES)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{}", serde_json::to_string(entry)?)?;
+    Ok(())
+}
+
+/// 日志轮转：`path` 超过 `max_bytes` 即重命名为 `<path>.1`（覆盖旧一代）。
+/// 文件不存在时是空操作；轮转失败仅清掉旧 `.1` 后尽力 rename（诊断数据
+/// 不反噬主流程，调用方已按 best-effort 处理错误）。
+fn rotate_if_oversized(path: &Path, max_bytes: u64) -> Result<()> {
+    let oversized = fs::metadata(path)
+        .map(|meta| meta.len() > max_bytes)
+        .unwrap_or(false);
+    if !oversized {
+        return Ok(());
+    }
+    let mut rotated = path.as_os_str().to_os_string();
+    rotated.push(".1");
+    let rotated = PathBuf::from(rotated);
+    let _ = fs::remove_file(&rotated);
+    fs::rename(path, &rotated)?;
+    Ok(())
 }
 
 /// 追加一行 JSON 到 Vault 的 llm-calls.log（不存在则创建）。
@@ -694,35 +818,46 @@ fn append_llm_call_line(vault_root: &Path, stats: &LlmCallStats) -> Result<()> {
     Ok(())
 }
 
-/// LLM 流式调用 + 输出熔断 + 解析的重试助手（两步共用）：
+/// LLM 流式调用 + 输出熔断 + 解析/校验的重试助手（两步共用）：
 ///
 /// - **熔断**：聚合输出超过 `profile.max_output_chars` 即视为该次失败
 ///   （不进入 parse——超限内容即使是合法 JSON 也不采信），原因写明
 ///   「输出 N 字超过上限 M，疑似模型复述原文或陷入重复」；
-/// - **重试**：解析失败 / 超限均重试一次，重试的 user 消息末尾按上次
-///   失败原因追加强约束句（[`RETRY_CONSTRAINT_OVERSIZED`] /
-///   [`RETRY_CONSTRAINT_UNPARSEABLE`]）；两次失败报 [`Error::BadLlmOutput`]
-///   （`what` 为步骤名，错误含两次输出字数）；端口调用错误（网络 /
-///   鉴权 / 远端）记录统计后原样透传，不重试（与既有语义一致——
-///   重试只针对输出质量问题）；
+/// - **解析与截断修复**：`parse` 返回 `(值, salvaged)`——解析层内部已
+///   尝试截断修复（见 [`parse_json_lenient`]），salvaged=true 表示输出
+///   是括号平衡闭合的修复产物（部分条目），统计标 `salvaged` 字段；
+/// - **校验（最低有效性闸门，#23）**：`validate` 返回 `Some(强约束句)`
+///   即语义违约（如全空分析），该次按失败处理走重试——违约句同时是
+///   重试 user 末尾追加的强约束；
+/// - **重试**：解析失败 / 违约 / 超限均重试一次，重试的 user 消息末尾
+///   按上次失败原因追加强约束句（[`RETRY_CONSTRAINT_OVERSIZED`] /
+///   [`RETRY_CONSTRAINT_UNPARSEABLE`] / 校验返回的约束句）；两次失败报
+///   [`Error::BadLlmOutput`]（`what` 为步骤名，错误含两次输出字数）；
+///   端口调用错误（网络 / 鉴权 / 远端）记录统计后原样透传，不重试
+///   （与既有语义一致——重试只针对输出质量问题）；
 /// - **统计**：每次尝试记一条 [`LlmCallStats`]（`recorder` 落日志 +
 ///   进报告）。解析失败 / 超限的记录额外附失败诊断（输出首尾片段 +
 ///   思考标签检测，见 [`fill_failure_diagnostics`]），错误摘要末尾附
 ///   开头/结尾摘录（[`error_with_excerpt`]）——截断点与思考混流一眼
-///   可见；端口调用错误（无输出）不记片段。
+///   可见；端口调用错误（无输出）不记片段；
+/// - **debug 日志**：失败调用（含端口错误）自动把完整输入/输出原文落
+///   [`LLM_DEBUG_LOG_REL`]；成功调用仅 `CORPUS_DEBUG=1` 时记录
+///   （见 [`LlmCallRecorder::record_debug`]）。
 ///
 /// 文本增量经 [`LlmPort::complete_stream`] 即时到达，`on_chars` 是节流后
 /// 的 chars 上报（模型已输出字符数）：距上次上报 ≥[`REPORT_MIN_INTERVAL`]
 /// 或累计新增 ≥[`REPORT_MIN_NEW_CHARS`] 才放行——连续小增量合并成一报，
 /// 避免高频回调淹没进度通道。流结束后补一次终值（尾部增量可能未达阈值）。
 /// 每次尝试独立计数（重试的输出与上次无关）。
+#[allow(clippy::too_many_arguments)]
 async fn with_retry_stream<T>(
     recorder: &mut LlmCallRecorder,
     port: &dyn LlmPort,
     system: Option<&str>,
     user: &str,
     profile: CallProfile,
-    parse: impl Fn(&str) -> Result<T>,
+    parse: impl Fn(&str) -> Result<(T, bool)>,
+    validate: &(dyn Fn(&T) -> Option<&'static str> + Send + Sync),
     on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<T> {
     let CallProfile {
@@ -776,7 +911,18 @@ async fn with_retry_stream<T>(
                     output_head: None,
                     output_tail: None,
                     has_think_tag: None,
+                    salvaged: None,
                 });
+                // debug 日志：失败自动记录（无输出，错误原样）
+                recorder.record_debug(
+                    tier,
+                    purpose,
+                    LlmCallOutcome::Error,
+                    system,
+                    &attempt_user,
+                    "",
+                    Some(&err.to_string()),
+                );
                 return Err(err);
             }
         };
@@ -799,6 +945,7 @@ async fn with_retry_stream<T>(
             output_head: None,
             output_tail: None,
             has_think_tag: None,
+            salvaged: None,
         };
 
         // 熔断：超限即失败，不进入 parse（即使内容恰好是合法 JSON）。
@@ -812,16 +959,76 @@ async fn with_retry_stream<T>(
             );
             fill_failure_diagnostics(&mut record, &output);
             recorder.record(record);
+            recorder.record_debug(
+                tier,
+                purpose,
+                LlmCallOutcome::Oversized,
+                system,
+                &attempt_user,
+                &output,
+                Some(&reason),
+            );
             last_error = reason;
             retry_note = RETRY_CONSTRAINT_OVERSIZED.to_string();
             continue;
         }
         match parse(&output) {
-            Ok(parsed) => {
-                recorder.record(stats(LlmCallOutcome::Ok, None));
+            Ok((parsed, salvaged)) => {
+                // 最低有效性闸门（#23）：解析/修复成功但内容违约（如全空
+                // 分析）不得静默采信——按失败处理走重试，违约句兼作强约束。
+                if let Some(note) = validate(&parsed) {
+                    let reason = note.to_string();
+                    let mut record = stats(
+                        LlmCallOutcome::ParseFailed,
+                        Some(error_with_excerpt(&format!("违约：{reason}"), &output)),
+                    );
+                    fill_failure_diagnostics(&mut record, &output);
+                    recorder.record(record);
+                    recorder.record_debug(
+                        tier,
+                        purpose,
+                        LlmCallOutcome::ParseFailed,
+                        system,
+                        &attempt_user,
+                        &output,
+                        Some(&reason),
+                    );
+                    last_error = reason;
+                    retry_note = note.to_string();
+                    continue;
+                }
+                let mut record = stats(LlmCallOutcome::Ok, None);
+                if salvaged {
+                    // 截断修复产物被采用：统计与日志显式标注
+                    record.salvaged = Some(true);
+                }
+                recorder.record(record);
+                recorder.record_debug(
+                    tier,
+                    purpose,
+                    LlmCallOutcome::Ok,
+                    system,
+                    &attempt_user,
+                    &output,
+                    None,
+                );
+                if salvaged {
+                    eprintln!(
+                        "输出 JSON 中途截断，已按括号平衡修复并采用部分条目（salvaged=true）"
+                    );
+                }
                 return Ok(parsed);
             }
             Err(err) => {
+                recorder.record_debug(
+                    tier,
+                    purpose,
+                    LlmCallOutcome::ParseFailed,
+                    system,
+                    &attempt_user,
+                    &output,
+                    Some(&err.to_string()),
+                );
                 last_error = err.to_string();
                 let mut record = stats(
                     LlmCallOutcome::ParseFailed,
@@ -917,8 +1124,8 @@ fn strip_think_blocks(output: &str) -> Cow<'_, str> {
 }
 
 /// 第一步调用：schema_prompt 注入 system，raw 全文作为 user；
-/// 解析失败 / 超限重试一次，再失败报 [`Error::BadLlmOutput`]（零写入）。
-/// `on_chars` 收到节流后的流式 chars 上报。
+/// 解析失败 / 超限 / 全空违约重试一次，再失败报 [`Error::BadLlmOutput`]
+///（零写入）。`on_chars` 收到节流后的流式 chars 上报。
 async fn analyze(
     fast: &dyn LlmPort,
     template: &WikiTemplate,
@@ -940,16 +1147,31 @@ async fn analyze(
             max_output_chars: ANALYSIS_MAX_OUTPUT_CHARS,
         },
         parse_analysis,
+        &is_valid_analysis,
         on_chars,
     )
     .await
 }
 
-/// 容错解析分析输出：先剥离思考块，再截取首个 `{` 到最后一个 `}` 走 serde_json。
-fn parse_analysis(output: &str) -> Result<AnalysisOutcome> {
+/// 最低有效性闸门（#23）：`AnalysisOutcome` 全空（source_title 为空 AND
+/// entities 空 AND concepts 空）即违约——`#[serde(default)]` 使任何形状
+/// 不对但含 `{}` 的 JSON（如成文响应错位、模型跑题输出）都会「成功」
+/// 解析为全空分析：空标题落回 raw 文件名、空计划产出降级正文垃圾页，
+/// 用户看到「摄取成功但内容是垃圾」。返回 `Some(强约束句)` 交
+/// [`with_retry_stream`] 走既有重试，二次仍空报错零写入。
+fn is_valid_analysis(analysis: &AnalysisOutcome) -> Option<&'static str> {
+    let empty_shell = analysis.source_title.trim().is_empty()
+        && analysis.entities.is_empty()
+        && analysis.concepts.is_empty();
+    empty_shell.then_some(RETRY_CONSTRAINT_EMPTY)
+}
+
+/// 容错解析分析输出：先剥离思考块，再提取 JSON（截断时尝试修复）。
+/// 返回（结果, salvaged）——salvaged=true 表示输出是括号平衡闭合的
+/// 截断修复产物（部分条目），由 [`with_retry_stream`] 标注统计。
+fn parse_analysis(output: &str) -> Result<(AnalysisOutcome, bool)> {
     let stripped = strip_think_blocks(output);
-    let json = extract_json_object(&stripped);
-    serde_json::from_str(json).map_err(|err| Error::BadLlmOutput(format!("JSON 解析失败：{err}")))
+    parse_json_lenient(&stripped)
 }
 
 /// 提取输出中的 JSON 对象字面量（容忍 ```json 围栏与前后杂文字）。
@@ -958,6 +1180,125 @@ fn extract_json_object(output: &str) -> &str {
         (Some(start), Some(end)) if end > start => &output[start..=end],
         _ => "",
     }
+}
+
+/// 宽容 JSON 解析：先按既有提取窗口（[`extract_json_object`]）走 serde；
+/// 失败且错误带截断特征（EOF / trailing / expected——思考 token 挤占
+/// max_tokens 截断输出的典型报错）时，尝试括号平衡修复
+///（[`salvage_truncated_json`]）再解析一次，成功即采用（salvaged=true）。
+/// 修复不可行或修复产物仍不可解析 → 回传原始错误（走既有重试）。
+fn parse_json_lenient<T: serde::de::DeserializeOwned>(stripped: &str) -> Result<(T, bool)> {
+    let json = extract_json_object(stripped);
+    match serde_json::from_str(json) {
+        Ok(value) => Ok((value, false)),
+        Err(err) => {
+            let message = err.to_string();
+            let parse_error = || Error::BadLlmOutput(format!("JSON 解析失败：{message}"));
+            let truncated = message.contains("EOF")
+                || message.contains("trailing")
+                || message.contains("expected");
+            if !truncated {
+                return Err(parse_error());
+            }
+            let Some(repaired) = salvage_truncated_json(stripped) else {
+                return Err(parse_error());
+            };
+            match serde_json::from_str::<T>(&repaired) {
+                Ok(value) => Ok((value, true)),
+                // 截断得比任何完整元素更早 / 修复产物类型违约：回原始错误
+                Err(_) => Err(parse_error()),
+            }
+        }
+    }
+}
+
+/// 截断 JSON 的括号平衡修复（salvage）：从首个 `{` 扫描到文本末尾
+///（截断输出天然缺尾），跟踪字符串 / 转义状态与 `{} []` 栈，收集全部
+/// 「完整元素」边界候选——每个 `,` 之前（当前容器的元素刚结束）、每个
+/// `}` / `]` 闭合之后、每个**值**字符串闭合之后（key 字符串不算：其后
+/// 必有 `:`，在 key 处截断补闭合必然不可解析）；字符串开着到达文本末尾
+/// 说明正悬在字符串中间，不产生「全文闭合」候选。
+///
+/// 候选按数据量从多到少尝试（末尾完整前缀 > 边界倒序），返回第一个能
+/// 独立解析为 JSON 值的「前缀 + 补齐闭合括号」；最外层对象闭合即完整
+/// JSON（trailing characters 场景），直接自检后返回。全部候选不可解析
+/// 或无任何候选（开头即断 / 括号错乱）→ `None`，交由调用方走既有重试。
+fn salvage_truncated_json(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let body = &text[start..];
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    // 「期待值」位：true 时遇到的字符串是值（key 位置为 false）。
+    let mut expect_value = false;
+    // 边界候选（截断字节位相对 body，该点的括号栈快照），按出现序。
+    let mut cuts: Vec<(usize, Vec<char>)> = Vec::new();
+
+    for (idx, ch) in body.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+                if expect_value {
+                    cuts.push((idx + ch.len_utf8(), stack.clone()));
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => {
+                stack.push(ch);
+                expect_value = ch == '[';
+            }
+            '}' | ']' => {
+                let expected = if ch == '}' { '{' } else { '[' };
+                if stack.pop() != Some(expected) {
+                    return None; // 括号错乱（如杂文字混入）：不猜，放弃
+                }
+                expect_value = false;
+                if stack.is_empty() {
+                    // 最外层已闭合：完整 JSON，其后即使还有文本也不属于它
+                    let complete = &body[..idx + ch.len_utf8()];
+                    return serde_json::from_str::<serde_json::Value>(complete)
+                        .is_ok()
+                        .then(|| complete.to_string());
+                }
+                cuts.push((idx + ch.len_utf8(), stack.clone()));
+            }
+            ',' => {
+                cuts.push((idx, stack.clone()));
+                expect_value = stack.last() == Some(&'[');
+            }
+            _ => {}
+        }
+    }
+
+    // 组装并按数据量从多到少尝试：末尾完整前缀（覆盖截断恰落在数字 /
+    // 闭合符之后等场景）→ 各边界倒序（数据多的优先）。
+    let mut attempts: Vec<String> = Vec::new();
+    if !in_string {
+        attempts.push(closed_at(body, body.len(), &stack));
+    }
+    for (cut, open) in cuts.iter().rev() {
+        attempts.push(closed_at(body, *cut, open));
+    }
+    attempts
+        .into_iter()
+        .find(|candidate| serde_json::from_str::<serde_json::Value>(candidate).is_ok())
+}
+
+/// `body[..cut]` + 按栈快照补齐的闭合括号序列。
+fn closed_at(body: &str, cut: usize, open: &[char]) -> String {
+    let mut repaired = String::with_capacity(cut + open.len());
+    repaired.push_str(&body[..cut]);
+    for bracket in open.iter().rev() {
+        repaired.push(if *bracket == '{' { '}' } else { ']' });
+    }
+    repaired
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,6 +1658,8 @@ async fn compose(
             max_output_chars: COMPOSE_MAX_OUTPUT_CHARS,
         },
         parse_written,
+        // 成文无额外语义校验（漏页走摘要兜底降级，不属违约）
+        &|_: &WrittenPages| None,
         on_chars,
     )
     .await?;
@@ -1332,10 +1675,11 @@ async fn compose(
     Ok(bodies)
 }
 
-fn parse_written(output: &str) -> Result<WrittenPages> {
+/// 成文输出解析：与 [`parse_analysis`] 同一容错路径（剥离思考块 →
+/// 提取 / 截断修复），返回（结果, salvaged）。
+fn parse_written(output: &str) -> Result<(WrittenPages, bool)> {
     let stripped = strip_think_blocks(output);
-    let json = extract_json_object(&stripped);
-    serde_json::from_str(json).map_err(|err| Error::BadLlmOutput(format!("JSON 解析失败：{err}")))
+    parse_json_lenient(&stripped)
 }
 
 /// 按字符数截断（Unicode 安全；喂给 LLM 的既有正文限长用）。
@@ -1711,15 +2055,165 @@ mod tests {
 
     #[test]
     fn parse_analysis_accepts_valid_and_rejects_garbage() {
-        let ok = parse_analysis(r#"{"source_title":"T","entities":[{"title":"E","aliases":["e"],"summary":"s"}],"concepts":[]}"#)
-            .expect("合法输出应通过");
+        let (ok, salvaged) = parse_analysis(
+            r#"{"source_title":"T","entities":[{"title":"E","aliases":["e"],"summary":"s"}],"concepts":[]}"#,
+        )
+        .expect("合法输出应通过");
+        assert!(!salvaged);
         assert_eq!(ok.source_title, "T");
         assert_eq!(ok.entities.len(), 1);
         assert_eq!(ok.entities[0].title, "E");
-        // 缺字段走 serde default：不报错
-        let partial = parse_analysis("{}").expect("空对象合法（全默认值）");
+        // 缺字段走 serde default：不报错（有效性与否由 is_valid_analysis 裁决）
+        let (partial, salvaged) = parse_analysis("{}").expect("空对象合法（全默认值）");
+        assert!(!salvaged);
         assert!(partial.entities.is_empty());
         assert!(parse_analysis("垃圾输出").is_err());
+    }
+
+    #[test]
+    fn is_valid_analysis_rejects_only_the_empty_shell() {
+        // 全空（title 空白 + 两列表空）→ 违约
+        let shell = AnalysisOutcome {
+            source_title: "   ".to_string(),
+            ..AnalysisOutcome::default()
+        };
+        assert_eq!(is_valid_analysis(&shell), Some(RETRY_CONSTRAINT_EMPTY));
+        assert_eq!(
+            is_valid_analysis(&AnalysisOutcome::default()),
+            Some(RETRY_CONSTRAINT_EMPTY)
+        );
+        // 任一实质内容存在即有效
+        let with_title = AnalysisOutcome {
+            source_title: "T".to_string(),
+            ..AnalysisOutcome::default()
+        };
+        assert_eq!(is_valid_analysis(&with_title), None);
+        let with_entity = AnalysisOutcome {
+            entities: vec![AnalyzedPage {
+                title: "E".to_string(),
+                ..AnalyzedPage::default()
+            }],
+            ..AnalysisOutcome::default()
+        };
+        assert_eq!(is_valid_analysis(&with_entity), None);
+    }
+
+    /// 截断修复（salvage）：括号平衡闭合的纯函数行为。
+    #[test]
+    fn salvage_truncated_json_closes_brackets_at_last_complete_element() {
+        // 实体数组写到一半断掉：完整条目全部保留，悬在半空的字符串整体丢弃
+        let truncated =
+            r#"{"source_title":"T","entities":[{"title":"X","summary":"Y"},{"title":"Q","summ"#;
+        let repaired = salvage_truncated_json(truncated).expect("应可修复");
+        assert_eq!(
+            repaired,
+            r#"{"source_title":"T","entities":[{"title":"X","summary":"Y"},{"title":"Q"}]}"#
+        );
+        // 末尾完整（截在数字 / 闭合符之后）：全文闭合，一个不丢
+        assert_eq!(
+            salvage_truncated_json(r#"{"a":[1,2"#).as_deref(),
+            Some(r#"{"a":[1,2]}"#)
+        );
+        assert_eq!(
+            salvage_truncated_json(r#"{"a":[{"x":1"#).as_deref(),
+            Some(r#"{"a":[{"x":1}]}"#)
+        );
+        // 字符串中途截断（值字符串悬空）：回退到最后一个完整元素
+        assert_eq!(
+            salvage_truncated_json(r#"{"source_title":"T","source_summary":"断"#).as_deref(),
+            Some(r#"{"source_title":"T"}"#)
+        );
+        // key 字符串不是边界（其后必有冒号，在 key 处闭合不可解析）
+        assert_eq!(
+            salvage_truncated_json(r#"{"a":"v","b"#).as_deref(),
+            Some(r#"{"a":"v"}"#)
+        );
+        // 完全没有完整元素：无法修复
+        assert_eq!(salvage_truncated_json(r#"{"source_title"#), None);
+        assert_eq!(salvage_truncated_json(""), None);
+        // 字符串内的括号 / 引号转义不干扰扫描
+        assert_eq!(
+            salvage_truncated_json(r#"{"a":"他说\"{[","b":[1,2"#).as_deref(),
+            Some(r#"{"a":"他说\"{[","b":[1,2]}"#)
+        );
+        // 已闭合的最外层对象（trailing characters 场景）：其后杂文字不算
+        assert_eq!(
+            salvage_truncated_json(r#"{"a":1} 以上是结果，{ 随便"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        // 修复产物必须真的可解析并产出部分条目
+        let (parsed, salvaged) = parse_analysis(truncated).expect("截断输出应修复成功");
+        assert!(salvaged, "截断修复应标 salvaged=true");
+        assert_eq!(parsed.source_title, "T");
+        assert_eq!(parsed.entities.len(), 2, "完整条目全部保留");
+        assert_eq!(parsed.entities[0].title, "X");
+        assert_eq!(parsed.entities[1].title, "Q");
+    }
+
+    /// 截断 JSON 端到端：entities 写到一半断掉 → salvage 恢复部分条目
+    /// 而非走重试；成文输出同理。
+    #[test]
+    fn truncated_json_salvages_partial_entries_without_retry() {
+        let truncated = r#"{"source_title":"Attention","source_summary":"s",
+  "entities":[{"title":"Transformer","summary":"架构"},{"title":"BERT","summa"#;
+        let (outcome, salvaged) = parse_analysis(truncated).expect("截断输出应修复成功");
+        assert!(salvaged);
+        assert_eq!(outcome.source_title, "Attention");
+        assert_eq!(outcome.entities.len(), 2);
+        assert_eq!(outcome.entities[0].title, "Transformer");
+        assert_eq!(outcome.entities[1].title, "BERT");
+        // 成文同样受益
+        let (written, salvaged) =
+            parse_written(r#"{"pages":[{"path":"sources/a","body":"b"},{"path":"entities/x""#)
+                .expect("截断成文输出应修复成功");
+        assert!(salvaged);
+        assert_eq!(written.pages.len(), 2);
+        assert_eq!(written.pages[0].path, "sources/a");
+        assert_eq!(written.pages[1].path, "entities/x");
+    }
+
+    /// 完全损坏的输出（无任何完整元素 / 类型违约）：salvage 不可行 →
+    /// 维持解析失败（由 with_retry_stream 走重试，集成测试覆盖调用次数）。
+    #[test]
+    fn fully_broken_json_still_fails_parse_for_retry() {
+        assert!(parse_analysis(r#"{这不是 JSON，连括号都不齐"#).is_err());
+        assert!(parse_analysis("垃圾输出").is_err());
+        // 类型违约（形状合法但字段类型错）不走截断修复
+        assert!(parse_analysis(r#"{"entities":"not-an-array"}"#).is_err());
+    }
+
+    /// debug 日志轮转：未超阈值不动；超阈值轮转为 `.1`（保留一代，
+    /// 再次轮转覆盖旧一代）；轮转阈值为 5MB。
+    #[test]
+    fn debug_log_rotation_keeps_one_generation() {
+        assert_eq!(LLM_DEBUG_LOG_MAX_BYTES, 5 * 1024 * 1024, "轮转上限应为 5MB");
+        let dir = tempfile::tempdir().expect("tempdir 失败");
+        let path = dir.path().join("llm-debug.log");
+        let rotated = dir.path().join("llm-debug.log.1");
+
+        // 未超阈值：不轮转
+        fs::write(&path, "当前一代内容").expect("写日志失败");
+        rotate_if_oversized(&path, 1000).expect("轮转检查失败");
+        assert!(path.exists());
+        assert!(!rotated.exists());
+
+        // 超阈值：轮转，旧文件成为 .1
+        rotate_if_oversized(&path, 2).expect("轮转失败");
+        assert!(!path.exists(), "原文件应已改名");
+        assert_eq!(
+            fs::read_to_string(&rotated).unwrap(),
+            "当前一代内容",
+            "旧一代保留在 .1"
+        );
+
+        // 再次轮转：覆盖旧一代（只保留一代）
+        fs::write(&path, "新一代").expect("写日志失败");
+        rotate_if_oversized(&path, 2).expect("二次轮转失败");
+        assert_eq!(fs::read_to_string(&rotated).unwrap(), "新一代");
+
+        // 文件不存在：空操作（二次轮转后原路径已随改名消失）
+        assert!(!path.exists());
+        rotate_if_oversized(&path, 2).expect("缺文件应空操作");
     }
 
     #[test]

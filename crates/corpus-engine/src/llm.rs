@@ -146,14 +146,24 @@ pub struct LlmCallStats {
     /// [`LlmCallStats::output_head`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_think_tag: Option<bool>,
+    /// 输出是否经截断修复（salvage）后被采用：JSON 中途截断时按括号
+    /// 平衡闭合恢复可解析前缀（部分条目）。`Some(true)` 表示该条统计
+    /// 对应的输出为修复产物；正常解析为 `None`（不序列化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salvaged: Option<bool>,
 }
 
 /// 分析步（fast 档）的服务端输出上限（token）。
 ///
-/// 换算依据：分析输出熔断是 30,000 字符（见 [`crate::ingest`]），中文约
-/// 1.5 字/token，30,000 ÷ 1.5 = 20,000。这是 rig 端口 `AgentBuilder::
-/// max_tokens` 的第一道闸（服务端硬顶）；引擎侧字符熔断是第二道闸。
-pub const ANALYSIS_MAX_TOKENS: u64 = 20_000;
+/// 原换算依据：分析输出熔断是 30,000 字符（见 [`crate::ingest`]），中文约
+/// 1.5 字/token。现放宽到 50,000：MiniMax M3.1 系等推理模型强制思考
+/// （`thinking.type=disabled` 返回 400），思考 token 计入 `max_tokens`
+/// 预算（官方文档：max_tokens 太小会以 finish_reason=length 结束且
+/// content 为空），而 `reasoning_effort` 之外的 adaptive 思考量不可控——
+/// 服务端硬顶放宽为第一道闸的兜底；真正的收紧在引擎侧 30,000 字符熔断
+///（第二道闸，见 [`crate::ingest`]）与分析步 `reasoning_effort=low`
+/// 透传（见 [`crate::ingest::ingest_file`]）。
+pub const ANALYSIS_MAX_TOKENS: u64 = 50_000;
 
 /// 成文步（strong 档）的服务端输出上限（token）。
 ///

@@ -137,6 +137,11 @@ impl LlmPort for StreamingLlmPort {
     }
 }
 
+/// env 是进程全局态：涉及读写进程环境变量的测试（如 CORPUS_DEBUG）
+/// 用本互斥锁串行化，避免并发测试互相污染。std Mutex：异步测试持锁跨
+/// .await 是刻意的（摄取期间 env 必须保持设置），调用点显式 allow。
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 在临时目录下造一个尚不存在的 vault 根路径。
 ///
 /// TempDir 与 root 一同返回：目录随句柄存活，测试期间不会被清理。
