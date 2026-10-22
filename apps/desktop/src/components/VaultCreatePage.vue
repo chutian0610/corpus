@@ -5,8 +5,9 @@
  *  原样内联展示。 */
 import { computed, onMounted, ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
-import { createVault, listTemplates, type TemplateInfo, type VaultInfo } from '../api'
+import { createVault, isTauri, listTemplates, type TemplateInfo, type VaultInfo } from '../api'
 import { errorMessage, templateDisplayName } from '../display'
+import PathPicker from './PathPicker.vue'
 
 const emit = defineEmits<{
   (e: 'created', root: string): void
@@ -19,6 +20,8 @@ const vaultPath = ref<string | null>(null)
 const creating = ref(false)
 const createdVault = ref<VaultInfo | null>(null)
 const createError = ref<string | null>(null)
+/** web 模式的服务器侧目录浏览弹窗（Tauri 下弹系统对话框，不开本弹窗）。 */
+const pickerOpen = ref(false)
 
 onMounted(loadTemplates)
 
@@ -50,11 +53,24 @@ function selectTemplate(id: string): void {
 }
 
 async function chooseDirectory(): Promise<void> {
-  const dir = await open({ directory: true, multiple: false })
-  if (typeof dir === 'string') {
-    vaultPath.value = dir
-    createError.value = null
+  // 桌面壳：系统对话框（原样不动）。浏览器：plugin-dialog 依赖 Tauri
+  // internals（invoke 直接抛错），改开服务器侧目录浏览弹窗。
+  if (isTauri) {
+    const dir = await open({ directory: true, multiple: false })
+    if (typeof dir === 'string') {
+      vaultPath.value = dir
+      createError.value = null
+    }
+    return
   }
+  pickerOpen.value = true
+}
+
+/** PathPicker 选中（当前目录 / 当前目录+新目录名）：即 Vault 目标路径。 */
+function onPicked(path: string): void {
+  vaultPath.value = path
+  createError.value = null
+  pickerOpen.value = false
 }
 
 async function handleCreate(): Promise<void> {
@@ -160,6 +176,8 @@ function buildTreeLines(paths: string[], rootLabel: string): string[] {
         {{ creating ? '创建中…' : '创建 Vault' }}
       </button>
     </div>
+
+    <PathPicker v-if="pickerOpen" mode="dir" @picked="onPicked" @cancel="pickerOpen = false" />
 
     <section v-if="createError" class="card result error">
       <h3>创建失败</h3>

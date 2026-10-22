@@ -3,13 +3,14 @@
 //! 设计约束（见 T2 调研笔记第 5、8 节）：
 //! - rusqlite（bundled）同步 API + `Mutex<Connection>` 包裹——SQLite 单文件
 //!   低并发的本质与同步模型匹配，壳层（Tauri command）已在线程池执行；
-//! - **API key 只存环境变量名**（[`ModelTier::api_key_env`]），值永不落盘；
+//! - **API key 以明文值存本机 config.db**（[`ModelTier::api_key`]，ADR-0003
+//!   的主动取舍）：设置页输入是唯一来源，环境变量 / `.env` 路径已整体移除；
 //! - 引擎只接受目录参数（[`ConfigStore::open`]），`tempfile::tempdir()` 即可测试。
 //!
 //! Vault 注册表（最近打开）与配置同库，见 [`crate::registry`]。
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
@@ -20,14 +21,29 @@ use crate::error::{Error, Result};
 /// config.db 文件名（位于传入目录下）。
 pub const CONFIG_DB_FILENAME: &str = "config.db";
 
+/// config.db 权限收紧为 `0600`（unix，ADR-0003 补偿措施 2）：新建文件
+/// 的 umask 默认权限不可靠，显式 set_permissions 挡住多用户机器上其他
+/// 账户读取。非 unix（Windows 走 ACL，无此语义）为空操作，直接跳过。
+#[cfg(unix)]
+fn restrict_db_permissions(db_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(db_path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// 非 unix 平台无 chmod 语义（Windows 文件权限走 ACL），不做任何事。
+#[cfg(not(unix))]
+fn restrict_db_permissions(_db_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// 配置在 `config` 表中的 key（值为整个 [`AppConfig`] 的 JSON）。
 const CONFIG_KEY: &str = "app_config";
 
 /// LLM 供应方类型：决定 provider 工厂如何构造客户端（T2 调研笔记第 2 节）。
 ///
-/// 序列化字符串、惯例 API key 环境变量名与全集顺序**只**定义在下方的
-/// [`PROVIDER_SPECS`] 单一数据源中（serde 为手写实现，从表派生）；
-/// 更换供应商只改配置，引擎代码零改动。
+/// 序列化字符串与全集顺序**只**定义在下方的 [`PROVIDER_SPECS`] 单一数据源中
+/// （serde 为手写实现，从表派生）；更换供应商只改配置，引擎代码零改动。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     /// OpenAI 官方端点。
@@ -39,40 +55,42 @@ pub enum ProviderKind {
     /// 任意 OpenAI 兼容端点：必须配置 base_url，工厂启用
     /// `Route::Chat` + system-instructions-as-messages 兜底。
     OpenAICompatible,
+    /// MiniMax 官方端点（rig 原生方言，OpenAI 格式线）：默认国内站
+    /// `api.minimaxi.com`，国际站经 base_url 覆盖为
+    /// `https://api.minimax.io/v1`。M3 系列为推理模型，工厂按档位附加
+    /// reasoning 参数（见 ingest 的 fast 档端口构造）。
+    Minimax,
 }
 
 /// Provider 静态描述：[`ProviderKind`] 的单一数据源，新增供应方时
-/// 只改这张表与 enum 本体，serde / `as_str` / `default_api_key_env`
-/// / [`ProviderKind::all`] 全部自动跟随。
+/// 只改这张表与 enum 本体，serde / `as_str` / [`ProviderKind::all`]
+/// 全部自动跟随。
 struct ProviderSpec {
     kind: ProviderKind,
     /// serde / 展示 / 日志用 id 字符串（如 `openai_compatible`）。
     id: &'static str,
-    /// 该供应方惯例的 API key 环境变量名；`openai_compatible` 无惯例
-    /// （自定义端点配自定义变量名），为 `None`。
-    default_api_key_env: Option<&'static str>,
 }
 
 const PROVIDER_SPECS: &[ProviderSpec] = &[
     ProviderSpec {
         kind: ProviderKind::OpenAI,
         id: "openai",
-        default_api_key_env: Some("OPENAI_API_KEY"),
     },
     ProviderSpec {
         kind: ProviderKind::Anthropic,
         id: "anthropic",
-        default_api_key_env: Some("ANTHROPIC_API_KEY"),
     },
     ProviderSpec {
         kind: ProviderKind::DeepSeek,
         id: "deepseek",
-        default_api_key_env: Some("DEEPSEEK_API_KEY"),
     },
     ProviderSpec {
         kind: ProviderKind::OpenAICompatible,
         id: "openai_compatible",
-        default_api_key_env: None,
+    },
+    ProviderSpec {
+        kind: ProviderKind::Minimax,
+        id: "minimax",
     },
 ];
 
@@ -96,12 +114,6 @@ impl ProviderKind {
             .iter()
             .find(|spec| spec.id == id)
             .map(|spec| spec.kind)
-    }
-
-    /// 该供应方惯例的 API key 环境变量名；`openai_compatible` 无惯例
-    /// （自定义端点配自定义变量名），返回 `None`。
-    pub fn default_api_key_env(self) -> Option<&'static str> {
-        self.spec().default_api_key_env
     }
 
     /// id 字符串（与 serde 表示一致，展示与日志用）。
@@ -134,8 +146,8 @@ impl<'de> Deserialize<'de> for ProviderKind {
 
 /// 一个模型档位：provider、模型名与接入参数。
 ///
-/// `api_key_env` 是**环境变量名**而非 key 值；`None` 时按
-/// [`ProviderKind::default_api_key_env`] 的惯例名解析。
+/// `api_key` 是 key **明文值**而非环境变量名（ADR-0003 的主动取舍）：
+/// 设置页输入是唯一来源，落盘本机 config.db（0600），无环境变量回退。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelTier {
     /// 供应方类型。
@@ -144,31 +156,21 @@ pub struct ModelTier {
     pub model: String,
     /// 自定义 base_url（OpenAI / Anthropic / OpenAI 兼容端点可选或必填）。
     pub base_url: Option<String>,
-    /// API key 所在的环境变量名；`None` 落回供应方惯例名。
-    pub api_key_env: Option<String>,
+    /// API key 明文值（ADR-0003：存本机 config.db，0600 权限补偿）；
+    /// `None` / 空表示尚未配置，该档位无法调用。
+    pub api_key: Option<String>,
 }
 
 impl ModelTier {
-    /// 解析实际使用的 API key 环境变量名（显式配置优先，落回惯例名）。
-    pub fn api_key_env_name(&self) -> Option<&str> {
-        self.api_key_env
-            .as_deref()
-            .or_else(|| self.provider.default_api_key_env())
-    }
-
-    /// 从环境变量读取 API key 值。变量未设置时报 [`Error::MissingApiKey`]。
+    /// 解析实际使用的 API key 值：直接取配置中的明文字段克隆。
     ///
-    /// key 值只在本方法调用瞬间进入内存，任何持久化路径都不经过它。
+    /// 未配置（`None` 或 trim 后为空）报 [`Error::MissingApiKey`]——
+    /// 不存在环境变量查找，缺 key 的唯一出路是去设置页填写。
     pub fn resolve_api_key(&self) -> Result<String> {
-        let env = self.api_key_env_name().ok_or_else(|| {
-            Error::InvalidConfig(format!(
-                "未配置 API key 环境变量名（provider：{}，请显式指定 api_key_env）",
-                self.provider.as_str()
-            ))
-        })?;
-        std::env::var(env).map_err(|_| Error::MissingApiKey {
-            env: env.to_string(),
-        })
+        match self.api_key {
+            Some(ref key) if !key.trim().is_empty() => Ok(key.clone()),
+            _ => Err(Error::MissingApiKey),
+        }
     }
 }
 
@@ -246,14 +248,41 @@ impl AppConfig {
 
 impl ModelTier {
     /// 指定 provider 的初始档位：模型名留空（视为尚未配置，连通测试会
-    /// 给出明确错误），api_key_env 落回惯例名（`None`）。
+    /// 给出明确错误），api_key 未配置（`None`）。
     fn default_for(provider: ProviderKind) -> Self {
         Self {
             provider,
             model: String::new(),
             base_url: None,
-            api_key_env: None,
+            api_key: None,
         }
+    }
+}
+
+/// 全局数据目录解析：`CORPUS_HOME` 环境变量优先，未设置（或为空）时
+/// 落回壳层给定的平台默认（桌面 = Tauri `app_data_dir`；server =
+/// 系统数据目录下的 `dev.corpus.desktop`）。
+///
+/// 设了 `CORPUS_HOME` 就创建该目录——e2e / 沙盒常用全新临时目录，
+/// 调用方不必再判断存在性。config.db（配置 + Vault 注册表）跟随本目录；
+/// Vault 内的 `.corpus/`（指纹缓存、llm-calls.log）不在此列，本就
+/// 随 Vault 自包含。
+///
+/// 背景：shell 层的 e2e 曾因与桌面壳共用真实 config.db 而覆写用户
+/// 配置——本环境变量是数据面隔离的正式机制，任何起 server / 写
+/// 数据面的 e2e 都必须设 `CORPUS_HOME` 指向临时目录。
+pub fn corpus_home(fallback: impl AsRef<Path>) -> PathBuf {
+    match std::env::var("CORPUS_HOME") {
+        Ok(home) if !home.trim().is_empty() => {
+            let dir = PathBuf::from(home.trim());
+            if let Err(err) = fs::create_dir_all(&dir) {
+                // 建目录失败不在此处中断：ConfigStore::open 会以更明确的
+                // 错误失败，这里只保留路径语义。
+                eprintln!("CORPUS_HOME 目录创建失败（{}）：{err}", dir.display());
+            }
+            dir
+        }
+        _ => fallback.as_ref().to_path_buf(),
     }
 }
 
@@ -275,10 +304,17 @@ impl ConfigStore {
     /// 打开 `{dir}/config.db`（不存在则创建）并执行迁移。
     ///
     /// `dir` 不存在时会先创建；壳层传入 `app_data_dir()`，测试传 tempdir。
+    ///
+    /// 文件权限（unix，ADR-0003 补偿措施 2 / 票据 #18 验收项）：无论新建
+    /// 还是打开既有库，一律把 config.db 收紧为 `0600`——sqlite 新建文件
+    /// 按 umask 落盘（常见 0644，组 / 其他可读），显式 chmod 挡住多用户
+    /// 机器上其他账户；旧版本遗留的宽松权限在再次打开时一并纠正。
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        let conn = Connection::open(dir.join(CONFIG_DB_FILENAME))?;
+        let db_path = dir.join(CONFIG_DB_FILENAME);
+        let conn = Connection::open(&db_path)?;
+        restrict_db_permissions(&db_path)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -364,13 +400,13 @@ mod tests {
                 provider: ProviderKind::OpenAI,
                 model: "gpt-5.2".into(),
                 base_url: None,
-                api_key_env: None,
+                api_key: None,
             },
             strong: ModelTier {
                 provider: ProviderKind::Anthropic,
                 model: "claude-sonnet-4-6".into(),
                 base_url: None,
-                api_key_env: None,
+                api_key: None,
             },
             apply_mode: ApplyMode::Manual,
             query_pages: true,
@@ -386,7 +422,7 @@ mod tests {
         assert!(config.query_pages);
         assert_eq!(config.fast.provider, ProviderKind::OpenAI);
         assert_eq!(config.fast.model, "");
-        assert_eq!(config.fast.api_key_env_name(), Some("OPENAI_API_KEY"));
+        assert_eq!(config.fast.api_key, None);
     }
 
     #[test]
@@ -397,13 +433,13 @@ mod tests {
                 provider: ProviderKind::OpenAICompatible,
                 model: "qwen3-max".into(),
                 base_url: Some("https://gw.example.com/v1".into()),
-                api_key_env: Some("GW_API_KEY".into()),
+                api_key: Some("gw-plaintext-key".into()),
             },
             strong: ModelTier {
                 provider: ProviderKind::Anthropic,
                 model: "claude-sonnet-4-6".into(),
                 base_url: None,
-                api_key_env: None,
+                api_key: None,
             },
             apply_mode: ApplyMode::Auto,
             query_pages: false,
@@ -422,7 +458,7 @@ mod tests {
                 provider: ProviderKind::DeepSeek,
                 model: "deepseek-v4-flash".into(),
                 base_url: None,
-                api_key_env: None,
+                api_key: Some("ds-plaintext-key".into()),
             },
             ..valid_config()
         };
@@ -440,6 +476,8 @@ mod tests {
         // 直接断言 sqlite 行内的 JSON 真实内容，而非只走公共 API
         assert_eq!(raw["fast"]["model"], "deepseek-v4-flash");
         assert_eq!(raw["fast"]["provider"], "deepseek");
+        // 明文姿态（ADR-0003）：api_key 字段原样进 JSON
+        assert_eq!(raw["fast"]["api_key"], "ds-plaintext-key");
         assert_eq!(raw["apply_mode"], "manual");
         assert_eq!(raw["query_pages"], true);
     }
@@ -468,7 +506,7 @@ mod tests {
             provider: ProviderKind::OpenAICompatible,
             model: "qwen3-max".into(),
             base_url: None,
-            api_key_env: Some("GW_API_KEY".into()),
+            api_key: Some("gw-plaintext-key".into()),
         };
         let err = store.set_config(&config).expect_err("缺 base_url 应被拒绝");
         assert!(
@@ -486,7 +524,7 @@ mod tests {
                 provider,
                 model: "m".into(),
                 base_url: None,
-                api_key_env: None,
+                api_key: None,
             };
             config
                 .validate()
@@ -494,23 +532,30 @@ mod tests {
         }
     }
 
-    /// API key 值永不落盘：配置只含变量名，把一个伪造 key 值注入环境
-    /// 并走完解析路径后，db 文件字节中不得出现该值。
+    /// 明文姿态（ADR-0003）：api_key Some → resolve 原样返回该值；
+    /// 配置落盘后 db 文件字节里真实包含该明文（与旧「永不落盘」语义相反，
+    /// 有意断言正向事实，防止实现悄悄绕开 config.db）。
     #[test]
-    fn api_key_value_never_persists_to_db_file() {
-        let secret_value = "corpus-fake-key-do-not-persist-9f8e7d";
-        std::env::set_var("CORPUS_T2_FAKE_API_KEY", secret_value);
+    fn api_key_resolves_from_config_and_persists_plaintext_to_db_file() {
+        let secret_value = "corpus-plaintext-key-roundtrip-9f8e7d";
         let (dir, store) = ConfigStore::test_open();
         let mut config = valid_config();
-        config.fast.api_key_env = Some("CORPUS_T2_FAKE_API_KEY".into());
+        config.fast.api_key = Some(secret_value.into());
         store.set_config(&config).expect("保存配置失败");
 
-        // 值确实能从环境变量解析出来（协议路径通），……
+        // resolve 直接来自配置字段（无 env 查找路径）
         assert_eq!(
-            config.fast.resolve_api_key().expect("读取 env key 失败"),
+            config.fast.resolve_api_key().expect("解析 api_key 失败"),
             secret_value
         );
-        // ……但 db 文件字节里绝无 key 值（连变量名带值都不含值本身）
+        // 重开后仍解析出同一值（真实从 db 读回）
+        let reopened = ConfigStore::open(dir.path()).expect("重开失败");
+        let loaded = reopened.get_config().expect("读取配置失败");
+        assert_eq!(
+            loaded.fast.resolve_api_key().expect("重开解析失败"),
+            secret_value
+        );
+        // db 文件字节里就是明文
         let mut bytes = Vec::new();
         fs::File::open(dir.path().join(CONFIG_DB_FILENAME))
             .expect("打开 db 文件失败")
@@ -518,10 +563,9 @@ mod tests {
             .expect("读取 db 文件失败");
         let text = String::from_utf8_lossy(&bytes);
         assert!(
-            !text.contains(secret_value),
-            "API key 值不得出现在 config.db 中"
+            text.contains(secret_value),
+            "api_key 明文应出现在 config.db 中（ADR-0003 姿态）"
         );
-        std::env::remove_var("CORPUS_T2_FAKE_API_KEY");
     }
 
     #[test]
@@ -538,34 +582,85 @@ mod tests {
         assert_eq!(reopened.get_config().expect("读取失败"), config);
     }
 
+    /// ADR-0003 补偿措施 2（票据 #18 验收项提前落地）：open 新建
+    /// config.db 后权限必须是 0600（挡住多用户机器上其他账户读取）。
+    #[cfg(unix)]
     #[test]
-    fn resolve_api_key_reports_missing_env_with_name() {
+    fn open_restricts_new_config_db_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _store) = ConfigStore::test_open();
+        let mode = fs::metadata(dir.path().join(CONFIG_DB_FILENAME))
+            .expect("config.db 应存在")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "config.db 应为 0600，实际 {:o}",
+            mode & 0o777
+        );
+    }
+
+    /// 旧库遗留的宽松权限（如 0644）在再次 open 时一并纠正为 0600。
+    #[cfg(unix)]
+    #[test]
+    fn open_corrects_preexisting_loose_config_db_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = ConfigStore::test_open();
+        let db = dir.path().join(CONFIG_DB_FILENAME);
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).expect("放宽权限失败");
+        drop(store);
+
+        ConfigStore::open(dir.path()).expect("重开失败");
+        let mode = fs::metadata(&db)
+            .expect("config.db 应存在")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "旧库宽松权限应在打开时纠正，实际 {:o}",
+            mode & 0o777
+        );
+    }
+
+    /// 未配置 key（None）报 MissingApiKey，文案指向设置页与 ADR-0003
+    /// （不再有 env 变量名，也不再有回退查找）。
+    #[test]
+    fn resolve_api_key_reports_missing_key_with_setup_guidance() {
         let tier = ModelTier {
             provider: ProviderKind::OpenAI,
             model: "gpt-5.2".into(),
             base_url: None,
-            api_key_env: Some("CORPUS_T2_DEFINITELY_UNSET_KEY".to_string()),
+            api_key: None,
         };
         match tier.resolve_api_key() {
-            Err(Error::MissingApiKey { env }) => {
-                assert_eq!(env, "CORPUS_T2_DEFINITELY_UNSET_KEY");
+            Err(err @ Error::MissingApiKey) => {
+                let msg = err.to_string();
+                assert!(msg.contains("设置页"), "文案应指路设置页：{msg}");
+                assert!(msg.contains("config.db"), "文案应指明存储位置：{msg}");
+                assert!(msg.contains("ADR-0003"), "文案应引用 ADR：{msg}");
             }
             other => panic!("期望 MissingApiKey，实际 {other:?}"),
         }
     }
 
+    /// 空串与纯空白等同未配置：同样报 MissingApiKey（前端提交已 trim
+    /// 空转 null，此处防御手改 db / 旧库残留）。
     #[test]
-    fn openai_compatible_without_env_name_is_invalid() {
-        let tier = ModelTier {
-            provider: ProviderKind::OpenAICompatible,
-            model: "m".into(),
-            base_url: Some("https://gw".into()),
-            api_key_env: None,
-        };
-        assert!(matches!(
-            tier.resolve_api_key(),
-            Err(Error::InvalidConfig(_))
-        ));
+    fn resolve_api_key_treats_blank_as_missing() {
+        for blank in [Some("".to_string()), Some("   ".to_string())] {
+            let tier = ModelTier {
+                provider: ProviderKind::OpenAICompatible,
+                model: "m".into(),
+                base_url: Some("https://gw".into()),
+                api_key: blank,
+            };
+            assert!(
+                matches!(tier.resolve_api_key(), Err(Error::MissingApiKey)),
+                "空白 api_key 应报 MissingApiKey"
+            );
+        }
     }
 
     /// 注册表读写同库：配置保存后 recent_vaults 表仍可用（跨模块联动冒烟）。
@@ -585,17 +680,13 @@ mod tests {
         assert_eq!(store.list_recent_vaults().expect("列注册表失败").len(), 1);
     }
 
-    /// 单一数据源派生的一致性：as_str / default_api_key_env / serde
-    /// 字符串三者互通，全集与顺序来自 PROVIDER_SPECS。
+    /// 单一数据源派生的一致性：as_str / serde 字符串两者互通，全集与
+    /// 顺序来自 PROVIDER_SPECS。
     #[test]
     fn provider_kind_table_is_single_source_of_truth() {
-        assert_eq!(ProviderKind::all().count(), 4);
+        assert_eq!(ProviderKind::all().count(), 5);
         assert_eq!(ProviderKind::DeepSeek.as_str(), "deepseek");
-        assert_eq!(
-            ProviderKind::OpenAI.default_api_key_env(),
-            Some("OPENAI_API_KEY")
-        );
-        assert_eq!(ProviderKind::OpenAICompatible.default_api_key_env(), None);
+        assert_eq!(ProviderKind::Minimax.as_str(), "minimax");
 
         // serde 手写实现与 as_str 一致：全部 id 可 JSON 往返
         for kind in ProviderKind::all() {
@@ -610,5 +701,47 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("nope"));
         assert!(msg.contains("openai_compatible"));
+    }
+}
+
+#[cfg(test)]
+mod corpus_home_tests {
+    use super::*;
+
+    /// env 是进程全局态：并发测试下用互斥锁串行化对本变量的读写。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_set_creates_and_wins_over_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CORPUS_HOME", home.path());
+        let fallback = home.path().join("fallback-should-not-be-used");
+
+        let resolved = corpus_home(&fallback);
+
+        assert_eq!(resolved, home.path());
+        assert!(home.path().is_dir(), "设了 CORPUS_HOME 应自动建目录");
+        assert!(!fallback.exists(), "fallback 不应被触碰");
+        std::env::remove_var("CORPUS_HOME");
+    }
+
+    #[test]
+    fn env_unset_or_blank_falls_back_without_creation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CORPUS_HOME");
+        let fallback = tempfile::tempdir().unwrap().path().join("not-created");
+
+        assert_eq!(corpus_home(&fallback), fallback);
+        assert!(
+            !fallback.exists(),
+            "未设 env 不应创建 fallback（创建是壳层职责）"
+        );
+
+        // 空串与纯空白等同未设置
+        std::env::set_var("CORPUS_HOME", "   ");
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(corpus_home(dir.path()), dir.path());
+        std::env::remove_var("CORPUS_HOME");
     }
 }

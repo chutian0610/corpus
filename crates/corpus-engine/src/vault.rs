@@ -45,10 +45,11 @@ pub struct VaultMeta {
     pub template_id: TemplateId,
 }
 
-/// `.corpus/.gitignore` 内容：指纹缓存 `state.db` 与 LLM 调用日志
-/// `llm-calls.log` 均属可再生 / 本地诊断数据，不入库（git 历史只承载
-/// Wiki 与骨架）。
-const CORPUS_GITIGNORE: &str = "state.db\nllm-calls.log\n";
+/// `.corpus/.gitignore` 内容：指纹缓存 `state.db`、LLM 调用统计
+/// `llm-calls.log` 与 LLM debug 日志 `llm-debug.log`（含输入/输出原文，
+/// 仅本地诊断用）均属可再生 / 隐私敏感的本机数据，不入库（git 历史
+/// 只承载 Wiki 与骨架）。
+const CORPUS_GITIGNORE: &str = "state.db\nllm-calls.log\nllm-debug.log\nllm-debug.log.1\n";
 
 /// `wiki/index.md` 初始内容（内容目录，由引擎维护）。
 const INDEX_MD: &str = "\

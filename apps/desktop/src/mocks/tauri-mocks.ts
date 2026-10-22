@@ -97,8 +97,8 @@ const TEMPLATES: TemplateInfo[] = [
 ]
 
 const DEFAULT_CONFIG = {
-  fast: { provider: 'openai', model: '', base_url: null, api_key_env: null },
-  strong: { provider: 'openai', model: '', base_url: null, api_key_env: null },
+  fast: { provider: 'openai', model: '', base_url: null, api_key: null },
+  strong: { provider: 'openai', model: '', base_url: null, api_key: null },
   apply_mode: 'manual',
   query_pages: true,
 }

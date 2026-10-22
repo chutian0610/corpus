@@ -13,3 +13,5 @@ apps/desktop/src-tauri/gen/schemas
 *.swp
 .idea/
 .vscode/
+
+.env

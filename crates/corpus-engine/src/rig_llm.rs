@@ -21,22 +21,26 @@ use crate::error::{Error, Result};
 use crate::llm::{test_connection_with, ConnectionReport, LlmPort};
 
 /// LlmPort 的 Rig 实现：持有构造好的 `DynModel<Completion>` 与可选的
-/// 服务端输出上限（token）。
+/// 服务端输出上限（token）、透传参数。
 ///
-/// `max_tokens` 是 `AgentBuilder` 的**构建期**参数（rig 0.44），而
-/// `complete` / `complete_stream` 协议无法按调用携带用途——因此上限在
-/// 端口构造时预设：Ingest 两条路径与档位一一对应（fast 只用于分析、
-/// strong 只用于成文），按档位构造端口即等价于按用途设限（取舍见
-/// [`build_llm_port_with_cap`]）。这是服务端硬顶（第一道闸），引擎侧
-/// 的字符熔断是第二道闸（见 [`crate::ingest`]）。
+/// `max_tokens` 与 `additional_params` 都是 `AgentBuilder` 的**构建期**
+/// 参数（rig 0.44），而 `complete` / `complete_stream` 协议无法按调用
+/// 携带用途——因此在端口构造时预设：Ingest 两条路径与档位一一对应
+/// （fast 只用于分析、strong 只用于成文），按档位构造端口即等价于按
+/// 用途配置（取舍见 [`build_llm_port_with_cap`]）。`max_tokens` 是服务端
+/// 硬顶（第一道闸），引擎侧的字符熔断是第二道闸（见 [`crate::ingest`]）；
+/// `additional_params` 原样并入请求体顶层（provider passthrough），
+/// 用于 MiniMax M3.1 等推理模型的 `reasoning_effort` / `reasoning_split`
+/// 等透传参数（见 [`crate::ingest::analysis_passthrough_params`]）。
 pub struct RigLlmPort {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
+    additional_params: Option<serde_json::Value>,
 }
 
 impl RigLlmPort {
     /// 按本次调用的 system（可选）构造 AgentBuilder，应用端口预设的
-    /// preamble 与 max_tokens（两处构建共用）。
+    /// preamble、max_tokens 与透传参数（两处构建共用）。
     fn agent_builder(&self, system: Option<&str>) -> AgentBuilder {
         let mut builder = AgentBuilder::new(self.model.clone());
         if let Some(system) = system {
@@ -44,6 +48,9 @@ impl RigLlmPort {
         }
         if let Some(max_tokens) = self.max_tokens {
             builder = builder.max_tokens(max_tokens);
+        }
+        if let Some(params) = &self.additional_params {
+            builder = builder.additional_params(params.clone());
         }
         builder
     }
@@ -165,6 +172,17 @@ pub fn build_model(tier: &ModelTier, api_key: &str) -> Result<DynModel<Completio
             .client()
             .completion(tier.model.clone())
             .into()),
+        // MiniMax 原生方言（OpenAI 格式线）：默认国内站 api.minimaxi.com，
+        // 国际站经 base_url 覆盖为 https://api.minimax.io/v1。模型常量表
+        // 尚无 M3.x（rig 未跟上），模型名直接用配置字符串。
+        ProviderKind::Minimax => {
+            let mut config =
+                OpenAIConfig::with_key(&rig::providers::openai::wire::MINIMAX_CHINA, api_key);
+            if let Some(base_url) = &tier.base_url {
+                config = config.with_base_url(base_url.clone());
+            }
+            Ok(config.client().chat(tier.model.clone()).into())
+        }
         ProviderKind::Anthropic => Ok(anthropic_config(tier, api_key)?
             .client()
             .completion(tier.model.clone())
@@ -183,7 +201,7 @@ pub fn build_model(tier: &ModelTier, api_key: &str) -> Result<DynModel<Completio
     }
 }
 
-/// 按档位构造端口：校验配置 → 从环境变量解析 key → 工厂建模型。
+/// 按档位构造端口：校验配置 → 解析 key（配置明文字段，ADR-0003）→ 工厂建模型。
 ///
 /// 不设输出上限（连通测试等最小调用用这个；上限对只回一个词的探针
 /// 无意义）。
@@ -202,16 +220,33 @@ pub fn build_llm_port(tier: &ModelTier) -> Result<RigLlmPort> {
 /// （第一道闸）；引擎侧还有按字符数的熔断（第二道闸，见 [`crate::ingest`]），
 /// 两道闸独立生效。
 pub fn build_llm_port_with_cap(tier: &ModelTier, max_tokens: Option<u64>) -> Result<RigLlmPort> {
+    build_llm_port_with(tier, max_tokens, None)
+}
+
+/// [`build_llm_port_with_cap`] 的完整形态：额外携带透传参数
+/// （`AgentBuilder::additional_params`，原样并入请求体顶层）。
+///
+/// 典型用途：MiniMax M3.1 系等推理模型强制思考且思考 token 计入
+/// `max_tokens` 预算，分析调用传 `reasoning_effort` / `reasoning_split`
+/// 压低思考量并分离思考与正文（参数事实与取舍见
+/// [`crate::ingest::analysis_passthrough_params`]；`thinking` 开关不可用
+/// ——M3.1 上 `thinking.type=disabled` 返回 400，只有旧 M3 可关）。
+pub fn build_llm_port_with(
+    tier: &ModelTier,
+    max_tokens: Option<u64>,
+    additional_params: Option<serde_json::Value>,
+) -> Result<RigLlmPort> {
     let api_key = tier.resolve_api_key()?;
     Ok(RigLlmPort {
         model: build_model(tier, &api_key)?,
         max_tokens,
+        additional_params,
     })
 }
 
 /// 真实「测试连通」：按 `tier` 构造端口并发起一次最小补全调用。
 ///
-/// 本地可判定的失败（模型名未配置、key 环境变量未设置、兼容端点缺
+/// 本地可判定的失败（模型名未配置、未配置 API key、兼容端点缺
 /// base_url）以 [`Error::InvalidConfig`] / [`Error::MissingApiKey`] 报告；
 /// 远端失败以 [`Error::Llm`] 报告。均不发任何回退网络请求。
 pub async fn test_connection(tier: &ModelTier) -> Result<ConnectionReport> {
@@ -221,6 +256,7 @@ pub async fn test_connection(tier: &ModelTier) -> Result<ConnectionReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::ANALYSIS_MAX_TOKENS;
     use rig::providers::openai::responses_api::SystemInstructionsPlacement;
 
     fn tier(provider: ProviderKind, model: &str, base_url: Option<&str>) -> ModelTier {
@@ -228,7 +264,7 @@ mod tests {
             provider,
             model: model.to_string(),
             base_url: base_url.map(str::to_string),
-            api_key_env: None,
+            api_key: None,
         }
     }
 
@@ -343,14 +379,14 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfig(ref msg) if msg.contains("openai_compatible")));
     }
 
-    /// 本地可判定失败不依赖环境：缺 key 变量时 build_llm_port 直接报
-    /// MissingApiKey（变量名取 provider 惯例）。
+    /// 本地可判定失败不依赖环境：未配置 key（api_key 为 None）时
+    /// build_llm_port 直接报 MissingApiKey（文案指向设置页，ADR-0003）。
     #[test]
-    fn build_llm_port_requires_api_key_env() {
-        let mut t = tier(ProviderKind::OpenAI, "gpt-5.2", None);
-        t.api_key_env = Some("CORPUS_T2_RIG_DEFINITELY_UNSET".to_string());
+    fn build_llm_port_requires_api_key() {
+        let t = tier(ProviderKind::OpenAI, "gpt-5.2", None);
+        assert_eq!(t.api_key, None);
         match build_llm_port(&t) {
-            Err(Error::MissingApiKey { env }) => assert_eq!(env, "CORPUS_T2_RIG_DEFINITELY_UNSET"),
+            Err(Error::MissingApiKey) => {}
             Ok(_) => panic!("期望 MissingApiKey，实际成功构造"),
             Err(other) => panic!("期望 MissingApiKey，实际 {other}"),
         }
@@ -372,14 +408,48 @@ mod tests {
         )
         .expect("构造 DynModel 失败");
         let capped = RigLlmPort {
+            additional_params: None,
             model: model.clone(),
             max_tokens: Some(crate::llm::ANALYSIS_MAX_TOKENS),
         };
-        assert_eq!(capped.max_tokens, Some(20_000));
+        assert_eq!(capped.max_tokens, Some(50_000));
         let uncapped = RigLlmPort {
+            additional_params: None,
             model,
             max_tokens: None,
         };
         assert_eq!(uncapped.max_tokens, None);
+    }
+
+    /// 透传参数在端口构造期预设（complete 协议无法按调用携带）：
+    /// build_llm_port_with 持有该值、build_llm_port_with_cap 保持 None。
+    /// 参数内容即分析端口实际透传的
+    /// [`crate::ingest::analysis_passthrough_params`]（reasoning_effort
+    /// low + reasoning_split true——MiniMax M3.1 强制思考，thinking
+    /// disabled 会 400），此处一并断言防漂移。
+    #[test]
+    fn additional_params_round_trip_through_constructor() {
+        let t = ModelTier {
+            api_key: Some("test-key".to_string()),
+            ..tier(
+                ProviderKind::OpenAICompatible,
+                "MiniMax-M3.1-Flash",
+                Some("http://x/v1"),
+            )
+        };
+        let params = crate::ingest::analysis_passthrough_params();
+        assert_eq!(
+            params,
+            serde_json::json!({ "reasoning_effort": "low", "reasoning_split": true }),
+            "分析端口的透传参数必须是 reasoning_effort low + reasoning_split true"
+        );
+
+        let with = build_llm_port_with(&t, Some(ANALYSIS_MAX_TOKENS), Some(params.clone()))
+            .expect("带 key 构造应成功");
+        assert_eq!(with.additional_params.as_ref(), Some(&params));
+        assert_eq!(with.max_tokens, Some(ANALYSIS_MAX_TOKENS));
+
+        let without = build_llm_port_with_cap(&t, None).expect("构造应成功");
+        assert_eq!(without.additional_params, None);
     }
 }

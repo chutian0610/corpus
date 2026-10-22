@@ -51,6 +51,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// read_page 的页面文件读取失败（路径校验已通过，读取时 IO 失败，
+    /// 如权限不足 / 读取瞬间被删——不存在与 symlink 逃逸已被前置校验挡下）。
+    #[error("页面无法读取：{}（{reason}）", path.display())]
+    PageUnreadable {
+        /// 读取失败页面的绝对路径。
+        path: PathBuf,
+        /// 底层错误描述。
+        reason: String,
+    },
+
     /// Ingest 的 raw 文件不在 Vault 的 raw/ 目录内。
     #[error("raw 文件必须在 Vault 的 raw/ 目录内：{}（Vault：{}）", raw.display(), vault.display())]
     RawNotInVault {
@@ -113,15 +123,12 @@ pub enum Error {
     #[error("配置无效：{0}")]
     InvalidConfig(String),
 
-    /// API key 对应的环境变量未设置。
+    /// 尚未配置 API key（设置页输入是唯一来源）。
     ///
-    /// API key 的值只从环境变量读取，永不落盘；此错误意味着调用方
-    /// 需要先在运行环境中设置该变量。
-    #[error("环境变量 {env} 未设置：API key 只从环境变量读取，值不会写入任何文件")]
-    MissingApiKey {
-        /// 期望读取的环境变量名。
-        env: String,
-    },
+    /// ADR-0003 明文姿态：key 存本机 config.db（0600），环境变量 / `.env`
+    /// 路径已整体移除；此错误意味着调用方需要去设置页填写。
+    #[error("尚未配置 API key：请在设置页输入（明文存本机 ~/.corpus/config.db，依据 ADR-0003）")]
+    MissingApiKey,
 
     /// LLM 调用失败（网络、鉴权、模型返回错误等）。
     #[error("LLM 调用失败：{0}")]

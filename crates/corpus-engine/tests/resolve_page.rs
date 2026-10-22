@@ -1,7 +1,7 @@
-//! resolve_page_path 集成测试（票据 T-UX 应用壳）：read_page 等只读入口
-//! 的路径安全单一关口。前置拒绝（绝对路径 / `..` / 非 `.md`）与解析后
-//! 断言（canonicalize 包含在 Vault 内，堵 symlink 逃逸）都断言在真实
-//! 文件系统（tempdir）上。
+//! resolve_page_path 与 read_page 集成测试（票据 T-UX 应用壳）：read_page
+//! 等只读入口的路径安全单一关口与页面读取唯一入口。前置拒绝（绝对路径 /
+//! `..` / 非 `.md`）与解析后断言（canonicalize 包含在 Vault 内，堵 symlink
+//! 逃逸）都断言在真实文件系统（tempdir）上。
 
 mod common;
 
@@ -9,7 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use common::fresh_vault_path;
-use corpus_engine::{create_vault, resolve_page_path, Error, TemplateId};
+
+use corpus_engine::{create_vault, read_page, resolve_page_path, Error, TemplateId};
 
 /// 建一个带页面文件的 Vault：`page_rel` 相对 `wiki/`（自动建父目录）。
 fn vault_with_page(tag: &str, page_rel: &str) -> (tempfile::TempDir, PathBuf) {
@@ -116,4 +117,27 @@ fn resolve_page_path_rejects_symlink_escaping_vault() {
         resolve_page_path(&root, "entities/broken.md").unwrap_err(),
         Error::InvalidPagePath { .. }
     ));
+}
+
+/// read_page（桌面壳与 corpus-server 共用的页面读取唯一入口）：三段全在
+/// 引擎——非 Vault 先拒（open_vault 级校验前置）、`..` 逃逸被路径安全
+/// 关口拒绝、正常页面读出原文。
+#[test]
+fn read_page_reads_content_and_rejects_non_vault_and_escape() {
+    let (dir, root) = vault_with_page("vault", "sources/hello.md");
+
+    // 正常读取：返回页面原文（helper 写入的内容）
+    assert_eq!(
+        read_page(&root, "sources/hello.md").expect("正常读取失败"),
+        "# 页面\n"
+    );
+
+    // `..` 逃逸：路径安全关口拒绝（同一错误类型，HTTP / IPC 上同一文案）
+    let err = read_page(&root, "../purpose.md").expect_err("逃逸应被拒绝");
+    assert!(matches!(err, Error::InvalidPagePath { .. }), "got: {err:?}");
+    assert!(err.to_string().contains("非法页面路径"), "got: {err}");
+
+    // 非 Vault 根：open_vault 级校验先于路径校验拒绝（NotAVault）
+    let err = read_page(dir.path(), "sources/hello.md").expect_err("非 Vault 应被拒绝");
+    assert!(matches!(err, Error::NotAVault { .. }), "got: {err:?}");
 }

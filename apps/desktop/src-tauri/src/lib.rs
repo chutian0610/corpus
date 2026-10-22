@@ -4,41 +4,36 @@
 //! 目录参数，见 T2 调研笔记第 6 节），新增配置 / 连通测试 / 最近 Vault
 //! 命令。
 //! T3：`ingest_file` 命令——引擎进度回调桥接为 `ingest-progress` 事件
-//! （AppHandle: Emitter，见 T3 调研笔记第 4 节），并按全局配置
-//! `apply_mode` 分支：`auto` 显式 apply，`manual` 不落盘返回 Draft 检视
-//! 清单（完整人审流程属票据 T5）。
-//! T-UX（Ingest 流程修正）：`ingest_file` 改为两段——先经引擎
-//! `import_raw` 把任意位置的源文件导入（复制）进 raw/，再走既有管道
-//! （管道只接受 raw/ 内路径的契约不变）；用户不再被要求先手动把
-//! 文件拷进 raw/。
-//! T-UX：应用壳两级结构（启动页 + 工作区）的支撑命令——`open_vault`
+//! （AppHandle: Emitter，见 T3 调研笔记第 4 节）。
+//! T-UX（Ingest 流程修正）：`ingest_file` 两段化（import → 管道）；
+//! T-UX 应用壳两级结构（启动页 + 工作区）的支撑命令——`open_vault`
 //! （引擎校验 + 最近列表登记）、`list_pages`（页面树）、`read_page`
-//! （预览用只读文本，路径安全由引擎 `resolve_page_path` 校验）；
-//! `add_recent_vault` 退役（「打开」统一走 `open_vault` 的校验口径，
-//! 不再允许无校验登记）。
+//! （预览用只读文本，校验与读取都在引擎唯一入口）；
+//! `add_recent_vault` 退役（「打开」统一走 `open_vault` 的校验口径）。
+//! T-W（票据 #17 v1）：`ingest_file` 编排（import → 端口带上限 →
+//! ingest → 按 apply_mode apply）整体下沉为引擎公共 API
+//! `corpus_engine::ingest_file`，本命令退化为薄委托——读全局配置 +
+//! 桥接进度事件，与 corpus-server 双壳共用同一编排（行为一致）。
 
 use corpus_engine::{
-    AppConfig, ApplyMode, ConfigStore, ConnectionReport, IngestOutcome, IngestReport, IngestStage,
-    ModelTier, OpenedVault, PageTree, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    AppConfig, ConfigStore, ConnectionReport, IngestFileReport, IngestStage, ModelTier,
+    OpenedVault, PageTree, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
-use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 前端 listen 的 Ingest 进度事件名。
 pub const INGEST_PROGRESS_EVENT: &str = "ingest-progress";
-
-/// manual 模式（apply_mode=manual）结果的注明：Draft 未落盘，完整的
-/// 人审流程（检视 / 编辑 / 放行）属票据 T5。
-const MANUAL_REVIEW_NOTE: &str = "人审模式：Draft 未落盘，完整人审流程属 T5";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // 应用数据目录（data_dir/${bundle_identifier}），运行时解析、
-            // 不硬编码；目录不存在则创建，随后打开全局 config.db。
-            let dir = app.path().app_data_dir()?;
+            // 全局数据目录：CORPUS_HOME 环境变量优先（e2e / 沙盒隔离），
+            // 未设置落回 ~/.corpus（与 server 壳一致，三平台同径、可直敲）。
+            // 目录不存在则创建，随后打开全局 config.db。
+            let home = app.path().home_dir()?;
+            let dir = corpus_engine::corpus_home(home.join(".corpus"));
             std::fs::create_dir_all(&dir)?;
             let store = ConfigStore::open(&dir)?;
             app.manage(store);
@@ -96,7 +91,8 @@ async fn get_config(store: State<'_, ConfigStore>) -> Result<AppConfig, String> 
     store.get_config().map_err(|e| e.to_string())
 }
 
-/// 保存全局配置（整体覆盖写）。API key 只存环境变量名，值不经过本命令。
+/// 保存全局配置（整体覆盖写）。API key 为设置页输入的明文值，随配置
+/// 整体落本机 config.db（0600；ADR-0003 的主动取舍）。
 #[tauri::command]
 async fn set_config(store: State<'_, ConfigStore>, config: AppConfig) -> Result<AppConfig, String> {
     store.set_config(&config).map_err(|e| e.to_string())?;
@@ -105,7 +101,7 @@ async fn set_config(store: State<'_, ConfigStore>, config: AppConfig) -> Result<
 
 /// 测试连通：按传入档位对配置端点发起一次真实最小补全调用。
 ///
-/// 未配置模型名 / 缺 API key 环境变量 / 兼容端点缺 base_url 等本地可判定
+/// 未配置模型名 / 未配置 API key / 兼容端点缺 base_url 等本地可判定
 /// 的失败，引擎会返回中文错误信息（Error::InvalidConfig / MissingApiKey）。
 #[tauri::command]
 async fn test_connection(tier: ModelTier) -> Result<ConnectionReport, String> {
@@ -155,54 +151,26 @@ async fn list_pages(vault_path: String) -> Result<PageTree, String> {
 
 /// 只读读取 `wiki/` 下某页面的原始文本（预览面板；正式渲染属 T4）。
 ///
-/// 路径安全全部由引擎 [`corpus_engine::resolve_page_path`] 单一关口承担
-/// （拒绝绝对路径 / `..` / 非 `.md`，canonicalize 断言不逃出 Vault）；
-/// 读取前先对 `vault_path` 跑 `open_vault` 级校验（`.corpus/vault.json`
-/// 存在且模板可解析），与「打开」同一口径。
+/// 全部校验与读取都在引擎 [`corpus_engine::read_page`] 单一入口（open_vault
+/// 级 Vault 校验 + resolve_page_path 路径安全关口 + 读原文三段：拒绝绝对
+/// 路径 / `..` / 非 `.md` / symlink 逃逸）——本命令只做委托与错误字符串化，
+/// 与 corpus-server 双壳同一口径，不重复胶水。
 #[tauri::command]
 async fn read_page(vault_path: String, rel_path: String) -> Result<String, String> {
-    corpus_engine::open_vault(&vault_path).map_err(|e| e.to_string())?;
-    let full =
-        corpus_engine::resolve_page_path(&vault_path, &rel_path).map_err(|e| e.to_string())?;
-    std::fs::read_to_string(&full).map_err(|e| format!("读取 {} 失败：{e}", full.display()))
+    corpus_engine::read_page(&vault_path, &rel_path).map_err(|e| e.to_string())
 }
 
-/// ingest_file 命令响应：引擎 [`IngestReport`] 平铺 + 导入信息 + Apply 模式语义。
-#[derive(Debug, Clone, Serialize)]
-struct IngestFileReport {
-    #[serde(flatten)]
-    report: IngestReport,
-    /// 导入后的 raw 文件相对 Vault 路径（如 `raw/foo.md`，引擎
-    /// `import_raw` 的结果；管道实际摄取的就是它）。
-    imported_raw_path: String,
-    /// 本次是否新导入进 raw/（false = 已在库 / 同内容去重）。
-    newly_imported: bool,
-    /// Draft 是否已落盘（指纹跳过与 manual 模式为 false）。
-    applied: bool,
-    /// manual 模式：Draft 人读检视清单（每页一行，降级页带标注）。
-    summary_lines: Vec<String>,
-    /// manual 模式注明（见 [`MANUAL_REVIEW_NOTE`]）。
-    note: Option<String>,
-}
-
-/// 摄取一个文档（两段）：先 `import_raw` 把任意位置的源文件导入
-/// （复制）进 Vault 的 raw/（源文件不动；同名去重 / 后缀递增），再走
-/// 既有 Ingest 管道：指纹检查 → 两步 LLM → Draft，按全局配置
-/// `apply_mode` 决定是否落盘（CONTEXT.md「Apply」）。管道契约不变——
-/// 只接受 raw/ 内路径，入口由本命令的导入段保证。
+/// 摄取一个文档（薄委托）：编排（`import_raw` 导入 → 双档位端口带上限
+/// → `ingest` 管道 → 按 `apply_mode` 分支 apply）已整体下沉为引擎公共
+/// API [`corpus_engine::ingest_file`]（票据 #17 v1，桌面壳与
+/// corpus-server 共用同一编排，行为一致）。本命令只负责壳层职责：
+/// 读全局配置（apply_mode / 双模型档位）与把引擎进度回调桥接为全局
+/// `ingest-progress` 事件（payload 即引擎 `IngestStage`；分析/生成两步
+/// 的 LLM 流式增量 chars 原样 emit）。
 ///
-/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文），
-/// 并按档位预设服务端输出上限（max_tokens：分析 20k / 成文 40k token，
-/// 见 [`corpus_engine::ANALYSIS_MAX_TOKENS`]）；引擎侧另有字符熔断与
-/// 调用统计（[`IngestReport::llm_calls`]，随报告透传到前端）。
-/// 引擎的 `on_progress` 回调在这里桥接为全局 `ingest-progress` 事件
-/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。分析/
-/// 生成两步的 LLM 输出走引擎流式增量：同阶段重复事件携带递增 `chars`
-/// （模型已输出字符数，引擎侧已节流），本命令原样 emit 不再加工。
-/// 模板取自 Vault 创建时绑定的 `.corpus/vault.json`。
-/// - `auto`：显式 apply（原子写 + 恰好一个 git 提交 + 指纹记录）；
-/// - `manual`：不落盘不提交，返回 Draft 的 summary_lines 并注明
-///   「人审模式：Draft 未落盘，完整人审流程属 T5」。
+/// 响应为引擎 [`IngestFileReport`]（serde flatten 平铺 + applied/note/
+/// imported_raw_path/newly_imported/summary_lines），字段形状与前端
+/// `IngestReport` 接口一致。
 #[tauri::command]
 async fn ingest_file(
     app: AppHandle,
@@ -210,71 +178,12 @@ async fn ingest_file(
     vault_path: String,
     raw_path: String,
 ) -> Result<IngestFileReport, String> {
-    // 第一段：导入（任意位置 → raw/；已在库则原样通过）。
-    let imported = corpus_engine::import_raw(&vault_path, &raw_path).map_err(|e| e.to_string())?;
-
-    let config: AppConfig = store.get_config().map_err(|e| e.to_string())?;
-    // 服务端输出硬顶（第一道闸）：fast 档只用于分析、strong 档只用于
-    // 成文，按档位构造即等价于按用途设限（complete 协议无法按调用携带
-    // 用途，取舍见引擎 build_llm_port_with_cap 文档）。引擎侧另有字符
-    // 熔断第二道闸。
-    let fast = corpus_engine::build_llm_port_with_cap(
-        &config.fast,
-        Some(corpus_engine::ANALYSIS_MAX_TOKENS),
-    )
-    .map_err(|e| e.to_string())?;
-    let strong = corpus_engine::build_llm_port_with_cap(
-        &config.strong,
-        Some(corpus_engine::COMPOSE_MAX_TOKENS),
-    )
-    .map_err(|e| e.to_string())?;
-
-    let emit_progress = |stage: IngestStage| {
+    let config = store.get_config().map_err(|e| e.to_string())?;
+    let emit_progress = move |stage: IngestStage| {
         // 事件推送失败只影响进度展示，不阻断摄取
         let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
     };
-
-    // 第二段：既有 Ingest 管道（只接受 raw/ 内路径）。
-    match corpus_engine::ingest(
-        &vault_path,
-        &imported.raw_abs,
-        &fast,
-        &strong,
-        emit_progress,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    {
-        IngestOutcome::Skipped(report) => Ok(IngestFileReport {
-            report,
-            imported_raw_path: imported.raw_rel,
-            newly_imported: imported.imported,
-            applied: false,
-            summary_lines: Vec::new(),
-            note: None,
-        }),
-        IngestOutcome::Draft(draft) => match config.apply_mode {
-            ApplyMode::Auto => {
-                let commit = corpus_engine::apply(&vault_path, &draft, emit_progress)
-                    .map_err(|e| e.to_string())?;
-                Ok(IngestFileReport {
-                    report: draft.report(Some(commit)),
-                    imported_raw_path: imported.raw_rel,
-                    newly_imported: imported.imported,
-                    applied: true,
-                    summary_lines: Vec::new(),
-                    note: None,
-                })
-            }
-            // 人审模式：Draft 不落盘（零写入零提交），交还检视清单
-            ApplyMode::Manual => Ok(IngestFileReport {
-                report: draft.report(None),
-                imported_raw_path: imported.raw_rel,
-                newly_imported: imported.imported,
-                applied: false,
-                summary_lines: draft.summary_lines(),
-                note: Some(MANUAL_REVIEW_NOTE.to_string()),
-            }),
-        },
-    }
+    corpus_engine::ingest_file(&vault_path, &raw_path, &config, emit_progress)
+        .await
+        .map_err(|e| e.to_string())
 }
