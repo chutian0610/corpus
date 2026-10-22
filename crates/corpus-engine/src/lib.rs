@@ -58,7 +58,8 @@ pub use provider::Provider;
 pub use registry::RecentVault;
 #[cfg(feature = "rig")]
 pub use rig_llm::{
-    build_llm_port, build_llm_port_with_cap, build_model, test_connection, RigLlmPort,
+    build_llm_port, build_llm_port_with, build_llm_port_with_cap, build_model, test_connection,
+    RigLlmPort,
 };
 // 完整编排（真实端口变体）属 rig 真实实现；端口注入变体
 // `ingest_file_with_ports` 永远可用（见 ingest 模块文档）。

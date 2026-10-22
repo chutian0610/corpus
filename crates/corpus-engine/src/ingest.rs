@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::atomic_write;
-use crate::config::{AppConfig, ApplyMode};
+use crate::config::{AppConfig, ApplyMode, ProviderKind};
 use crate::error::{Error, Result};
 use crate::fingerprint::{sha256_hex, StateStore};
 use crate::git;
@@ -523,7 +523,19 @@ pub async fn ingest_file<F>(
 where
     F: FnMut(IngestStage) + Send,
 {
-    let fast = crate::rig_llm::build_llm_port_with_cap(&config.fast, Some(ANALYSIS_MAX_TOKENS))?;
+    // fast 档端口：MiniMax M3 系列等推理模型经 OpenAI 兼容端点默认开
+    // 思考，thinking token 挤占 max_tokens 预算且照常计费（实测单次
+    // 分析输出 2 万字被拦腰截断）——分析步透传参数关闭思考。strong 档
+    // 保留思考（成文质量受益），仅设输出上限。
+    let fast = if config.fast.provider == ProviderKind::OpenAICompatible {
+        crate::rig_llm::build_llm_port_with(
+            &config.fast,
+            Some(ANALYSIS_MAX_TOKENS),
+            Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+        )?
+    } else {
+        crate::rig_llm::build_llm_port_with_cap(&config.fast, Some(ANALYSIS_MAX_TOKENS))?
+    };
     let strong = crate::rig_llm::build_llm_port_with_cap(&config.strong, Some(COMPOSE_MAX_TOKENS))?;
     ingest_file_with_ports(vault_root, src_path, config, &fast, &strong, on_progress).await
 }

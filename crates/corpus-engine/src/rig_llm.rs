@@ -21,22 +21,25 @@ use crate::error::{Error, Result};
 use crate::llm::{test_connection_with, ConnectionReport, LlmPort};
 
 /// LlmPort 的 Rig 实现：持有构造好的 `DynModel<Completion>` 与可选的
-/// 服务端输出上限（token）。
+/// 服务端输出上限（token）、透传参数。
 ///
-/// `max_tokens` 是 `AgentBuilder` 的**构建期**参数（rig 0.44），而
-/// `complete` / `complete_stream` 协议无法按调用携带用途——因此上限在
-/// 端口构造时预设：Ingest 两条路径与档位一一对应（fast 只用于分析、
-/// strong 只用于成文），按档位构造端口即等价于按用途设限（取舍见
-/// [`build_llm_port_with_cap`]）。这是服务端硬顶（第一道闸），引擎侧
-/// 的字符熔断是第二道闸（见 [`crate::ingest`]）。
+/// `max_tokens` 与 `additional_params` 都是 `AgentBuilder` 的**构建期**
+/// 参数（rig 0.44），而 `complete` / `complete_stream` 协议无法按调用
+/// 携带用途——因此在端口构造时预设：Ingest 两条路径与档位一一对应
+/// （fast 只用于分析、strong 只用于成文），按档位构造端口即等价于按
+/// 用途配置（取舍见 [`build_llm_port_with_cap`]）。`max_tokens` 是服务端
+/// 硬顶（第一道闸），引擎侧的字符熔断是第二道闸（见 [`crate::ingest`]）；
+/// `additional_params` 原样并入请求体顶层（provider passthrough），
+/// 用于 MiniMax 等推理模型的 `thinking` 开关。
 pub struct RigLlmPort {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
+    additional_params: Option<serde_json::Value>,
 }
 
 impl RigLlmPort {
     /// 按本次调用的 system（可选）构造 AgentBuilder，应用端口预设的
-    /// preamble 与 max_tokens（两处构建共用）。
+    /// preamble、max_tokens 与透传参数（两处构建共用）。
     fn agent_builder(&self, system: Option<&str>) -> AgentBuilder {
         let mut builder = AgentBuilder::new(self.model.clone());
         if let Some(system) = system {
@@ -44,6 +47,9 @@ impl RigLlmPort {
         }
         if let Some(max_tokens) = self.max_tokens {
             builder = builder.max_tokens(max_tokens);
+        }
+        if let Some(params) = &self.additional_params {
+            builder = builder.additional_params(params.clone());
         }
         builder
     }
@@ -202,10 +208,25 @@ pub fn build_llm_port(tier: &ModelTier) -> Result<RigLlmPort> {
 /// （第一道闸）；引擎侧还有按字符数的熔断（第二道闸，见 [`crate::ingest`]），
 /// 两道闸独立生效。
 pub fn build_llm_port_with_cap(tier: &ModelTier, max_tokens: Option<u64>) -> Result<RigLlmPort> {
+    build_llm_port_with(tier, max_tokens, None)
+}
+
+/// [`build_llm_port_with_cap`] 的完整形态：额外携带透传参数
+/// （`AgentBuilder::additional_params`，原样并入请求体顶层）。
+///
+/// 典型用途：MiniMax M3 系列等推理模型经 OpenAI 兼容端点默认开思考
+/// （thinking token 挤占 max_tokens 预算且照常计费），分析调用传
+/// `{"thinking": {"type": "disabled"}}` 关闭。
+pub fn build_llm_port_with(
+    tier: &ModelTier,
+    max_tokens: Option<u64>,
+    additional_params: Option<serde_json::Value>,
+) -> Result<RigLlmPort> {
     let api_key = tier.resolve_api_key()?;
     Ok(RigLlmPort {
         model: build_model(tier, &api_key)?,
         max_tokens,
+        additional_params,
     })
 }
 
@@ -221,6 +242,7 @@ pub async fn test_connection(tier: &ModelTier) -> Result<ConnectionReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::ANALYSIS_MAX_TOKENS;
     use rig::providers::openai::responses_api::SystemInstructionsPlacement;
 
     fn tier(provider: ProviderKind, model: &str, base_url: Option<&str>) -> ModelTier {
@@ -372,14 +394,39 @@ mod tests {
         )
         .expect("构造 DynModel 失败");
         let capped = RigLlmPort {
+            additional_params: None,
             model: model.clone(),
             max_tokens: Some(crate::llm::ANALYSIS_MAX_TOKENS),
         };
         assert_eq!(capped.max_tokens, Some(20_000));
         let uncapped = RigLlmPort {
+            additional_params: None,
             model,
             max_tokens: None,
         };
         assert_eq!(uncapped.max_tokens, None);
+    }
+
+    /// 透传参数在端口构造期预设（complete 协议无法按调用携带）：
+    /// build_llm_port_with 持有该值、build_llm_port_with_cap 保持 None。
+    #[test]
+    fn additional_params_round_trip_through_constructor() {
+        let t = ModelTier {
+            api_key: Some("test-key".to_string()),
+            ..tier(
+                ProviderKind::OpenAICompatible,
+                "MiniMax-M3.1-Flash",
+                Some("http://x/v1"),
+            )
+        };
+        let params = serde_json::json!({ "thinking": { "type": "disabled" } });
+
+        let with = build_llm_port_with(&t, Some(ANALYSIS_MAX_TOKENS), Some(params.clone()))
+            .expect("带 key 构造应成功");
+        assert_eq!(with.additional_params.as_ref(), Some(&params));
+        assert_eq!(with.max_tokens, Some(ANALYSIS_MAX_TOKENS));
+
+        let without = build_llm_port_with_cap(&t, None).expect("构造应成功");
+        assert_eq!(without.additional_params, None);
     }
 }
