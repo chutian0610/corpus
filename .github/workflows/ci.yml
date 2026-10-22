@@ -8,7 +8,7 @@ on:
 
 jobs:
   rust:
-    name: Rust（fmt / clippy / 测试）
+    name: rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +30,7 @@ jobs:
         run: cargo test -p corpus-engine --no-default-features
 
   frontend:
-    name: 前端（vue-tsc / vite）
+    name: frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
