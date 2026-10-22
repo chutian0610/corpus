@@ -172,6 +172,17 @@ pub fn build_model(tier: &ModelTier, api_key: &str) -> Result<DynModel<Completio
             .client()
             .completion(tier.model.clone())
             .into()),
+        // MiniMax 原生方言（OpenAI 格式线）：默认国内站 api.minimaxi.com，
+        // 国际站经 base_url 覆盖为 https://api.minimax.io/v1。模型常量表
+        // 尚无 M3.x（rig 未跟上），模型名直接用配置字符串。
+        ProviderKind::Minimax => {
+            let mut config =
+                OpenAIConfig::with_key(&rig::providers::openai::wire::MINIMAX_CHINA, api_key);
+            if let Some(base_url) = &tier.base_url {
+                config = config.with_base_url(base_url.clone());
+            }
+            Ok(config.client().chat(tier.model.clone()).into())
+        }
         ProviderKind::Anthropic => Ok(anthropic_config(tier, api_key)?
             .client()
             .completion(tier.model.clone())

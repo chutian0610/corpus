@@ -55,6 +55,11 @@ pub enum ProviderKind {
     /// 任意 OpenAI 兼容端点：必须配置 base_url，工厂启用
     /// `Route::Chat` + system-instructions-as-messages 兜底。
     OpenAICompatible,
+    /// MiniMax 官方端点（rig 原生方言，OpenAI 格式线）：默认国内站
+    /// `api.minimaxi.com`，国际站经 base_url 覆盖为
+    /// `https://api.minimax.io/v1`。M3 系列为推理模型，工厂按档位附加
+    /// reasoning 参数（见 ingest 的 fast 档端口构造）。
+    Minimax,
 }
 
 /// Provider 静态描述：[`ProviderKind`] 的单一数据源，新增供应方时
@@ -82,6 +87,10 @@ const PROVIDER_SPECS: &[ProviderSpec] = &[
     ProviderSpec {
         kind: ProviderKind::OpenAICompatible,
         id: "openai_compatible",
+    },
+    ProviderSpec {
+        kind: ProviderKind::Minimax,
+        id: "minimax",
     },
 ];
 
@@ -675,8 +684,9 @@ mod tests {
     /// 顺序来自 PROVIDER_SPECS。
     #[test]
     fn provider_kind_table_is_single_source_of_truth() {
-        assert_eq!(ProviderKind::all().count(), 4);
+        assert_eq!(ProviderKind::all().count(), 5);
         assert_eq!(ProviderKind::DeepSeek.as_str(), "deepseek");
+        assert_eq!(ProviderKind::Minimax.as_str(), "minimax");
 
         // serde 手写实现与 as_str 一致：全部 id 可 JSON 往返
         for kind in ProviderKind::all() {

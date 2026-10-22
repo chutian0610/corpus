@@ -23,6 +23,7 @@ export const PROVIDER_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'anthropic', label: 'Anthropic' },
   { id: 'deepseek', label: 'DeepSeek' },
   { id: 'openai_compatible', label: 'OpenAI 兼容端点' },
+  { id: 'minimax', label: 'MiniMax' },
 ]
 
 /** 页面类型 → 中文标签（引擎 PageKind 的展示层单一口径）。

@@ -544,7 +544,10 @@ where
     // 默认 max 的超长思考正是分析输出被拦腰截断的元凶），
     // reasoning_split=true 确保思考分离进 reasoning_content、不混入
     // 正文流。strong 档保留思考（成文质量受益），仅设输出上限。
-    let fast = if config.fast.provider == ProviderKind::OpenAICompatible {
+    let fast = if matches!(
+        config.fast.provider,
+        ProviderKind::OpenAICompatible | ProviderKind::Minimax
+    ) {
         crate::rig_llm::build_llm_port_with(
             &config.fast,
             Some(ANALYSIS_MAX_TOKENS),
@@ -557,7 +560,7 @@ where
     ingest_file_with_ports(vault_root, src_path, config, &fast, &strong, on_progress).await
 }
 
-/// 分析端口（OpenAICompatible）的透传参数——`ingest_file` 原样并入
+/// 分析端口（OpenAICompatible / Minimax）的透传参数——`ingest_file` 原样并入
 /// 请求体顶层（`AgentBuilder::additional_params`，provider passthrough）。
 ///
 /// MiniMax 官方文档事实（2026-10 核对）：
