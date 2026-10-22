@@ -32,6 +32,25 @@ pub enum Error {
         reason: String,
     },
 
+    /// create_vault 的目标目录已经是一个 Corpus Vault（存在 .corpus/vault.json）。
+    ///
+    /// 与 [`Error::VaultPathExists`]（泛泛的「非空拒绝」）区分：此错误明确
+    /// 引导用户走「打开」而非重复创建（应用壳启动页据此提示）。
+    #[error("该目录已是一个 Vault，请从启动页打开：{path}")]
+    AlreadyAVault {
+        /// 已是 Vault 的目标路径。
+        path: PathBuf,
+    },
+
+    /// 页面相对路径非法（read_page 等只读入口的路径安全校验）。
+    #[error("非法页面路径：{path}（{reason}）")]
+    InvalidPagePath {
+        /// 被拒绝的相对路径原样。
+        path: String,
+        /// 具体原因（绝对路径 / `..` 逃逸 / 非 `.md` / 解析逃出 Vault 等）。
+        reason: String,
+    },
+
     /// Ingest 的 raw 文件不在 Vault 的 raw/ 目录内。
     #[error("raw 文件必须在 Vault 的 raw/ 目录内：{}（Vault：{}）", raw.display(), vault.display())]
     RawNotInVault {
@@ -39,6 +58,22 @@ pub enum Error {
         raw: PathBuf,
         /// Vault 根路径。
         vault: PathBuf,
+    },
+
+    /// import_raw 的源是目录：目录批量导入属票据 T8，当前明确拒绝。
+    #[error("导入源是目录，暂不支持目录批量导入（属票据 T8）：{path}")]
+    ImportSourceIsDirectory {
+        /// 被拒绝的目录路径。
+        path: PathBuf,
+    },
+
+    /// import_raw 的源文件无法读取（不存在 / 无权限等）。
+    #[error("导入源无法读取：{path}（{reason}）")]
+    ImportSourceUnreadable {
+        /// 源文件路径。
+        path: PathBuf,
+        /// 底层错误描述。
+        reason: String,
     },
 
     /// LLM 返回的输出无法解析为引擎期望的结构（重试耗尽后）。

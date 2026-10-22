@@ -8,7 +8,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{fresh_vault_path, git, tree_snapshot, ScriptedLlmPort};
+use common::{fresh_vault_path, git, tree_snapshot, ScriptedLlmPort, StreamingLlmPort};
 use corpus_engine::{
     apply, create_vault, ingest, parse_page, Error, IngestDraft, IngestOutcome, IngestReport,
     IngestStage, PageAction, PageKind, TemplateId,
@@ -275,10 +275,130 @@ async fn two_llm_steps_each_once_with_correct_tier_and_schema_prompt() {
     // 第二段 apply：落盘进度
     apply(&root, &draft, |stage| stages.push(stage_name(&stage))).expect("apply 失败");
 
-    // 进度阶段：读取 → 分析 → 生成 → 落盘（两段合计，依序且齐全）
+    // 进度阶段：读取 → 分析 → 生成 → 落盘（两段合计，依序且齐全）。
+    // 分析/生成会因流式 chars 上报重复出现（节流合并后仍可能多报），
+    // 折叠相邻同名再断言顺序。
+    let collapsed: Vec<String> = stages
+        .into_iter()
+        .fold(Vec::new(), |mut acc: Vec<String>, s| {
+            if acc.last().map(|last| last != &s).unwrap_or(true) {
+                acc.push(s);
+            }
+            acc
+        });
     assert_eq!(
-        stages,
+        collapsed,
         vec!["reading", "analyzing", "generating", "applying"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 流式进度透明度（chars 增量 + 节流）
+// ---------------------------------------------------------------------------
+
+/// 带进度记录的摄取助手：返回（分析 chars 序列、生成 (pages, chars)
+/// 序列）。Draft 只取不落盘（进度断言与落盘无关）。
+async fn run_with_progress<F, S>(
+    root: &Path,
+    raw_rel: &str,
+    fast: F,
+    strong: S,
+) -> (Vec<usize>, Vec<(usize, usize)>)
+where
+    F: corpus_engine::LlmPort,
+    S: corpus_engine::LlmPort,
+{
+    let mut analyzing: Vec<usize> = Vec::new();
+    let mut generating: Vec<(usize, usize)> = Vec::new();
+    draft_of(
+        ingest(root, raw_rel, &fast, &strong, |stage| match stage {
+            IngestStage::Analyzing { chars } => analyzing.push(chars),
+            IngestStage::Generating { pages, chars } => generating.push((pages, chars)),
+            _ => {}
+        })
+        .await
+        .expect("摄取失败"),
+    );
+    (analyzing, generating)
+}
+
+/// chars 事件断言：首事件 0（阶段开始）、末事件到达总字数、严格递增、
+/// 连续小增量被节流合并（约每 50 字一报，远少于 10 字/段的分段总数）。
+fn assert_chars_progress(chars: &[usize], total: usize, what: &str) {
+    assert!(!chars.is_empty(), "{what}阶段应有 chars 事件");
+    assert_eq!(chars[0], 0, "{what}首事件应为阶段开始（chars=0）");
+    assert_eq!(*chars.last().unwrap(), total, "{what}末事件应到达总字数");
+    assert!(
+        chars.windows(2).all(|w| w[0] < w[1]),
+        "{what}chars 应严格递增：{chars:?}"
+    );
+    let chunks = total.div_ceil(10);
+    assert!(
+        chars.len() <= total / 50 + 2,
+        "{what}连续小增量（{chunks} 段）应合并成约每 50 字一报：{chars:?}"
+    );
+}
+
+/// 验收：流式 fake 分段吐增量（10 字/段、零间隔）时，分析/生成两步的
+/// 进度事件携带递增 chars 且节流生效（小增量合并）；生成事件保持
+/// pages 字段。
+#[tokio::test]
+async fn streamed_progress_reports_throttled_increasing_chars() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    // 10 字/段、零间隔：时间阈值（200ms）不会触发，只走字符阈值（50 字）
+    let fast = StreamingLlmPort::over(vec![analysis_json()], 10, 0);
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10, 0);
+    let (analyzing, generating) = run_with_progress(&root, &raw, fast, strong).await;
+
+    assert_chars_progress(&analyzing, analysis_json().chars().count(), "分析");
+    assert_chars_progress(
+        &generating.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+        bodies_json().chars().count(),
+        "生成",
+    );
+    // 生成事件携带计划页面数（标准脚本：1 Source + 1 Entity + 1 Concept）
+    assert!(
+        generating.iter().all(|(pages, _)| *pages == 3),
+        "生成事件应携带 pages=3：{generating:?}"
+    );
+}
+
+/// 验收：只实现 complete 的端口走 trait 默认回退——整体结果作为单次
+/// 增量，chars 从 0 直达总字数（恰好一次上报）。
+#[tokio::test]
+async fn default_fallback_port_reports_single_chars_update() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = ScriptedLlmPort::new(vec![analysis_json()]);
+    let strong = ScriptedLlmPort::new(vec![bodies_json()]);
+    let (analyzing, generating) = run_with_progress(&root, &raw, fast, strong).await;
+    assert_eq!(analyzing, vec![0, analysis_json().chars().count()]);
+    assert_eq!(generating, vec![(3, 0), (3, bodies_json().chars().count())]);
+}
+
+/// 验收：时间阈值路径——分段间隔 250ms（> 200ms 阈值）时，小增量
+/// （15 字/段，达不到 50 字字符阈值）逐段上报。
+#[tokio::test]
+async fn slow_stream_reports_each_delta_via_time_threshold() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let analysis = r#"{"source_title":"T","source_summary":"s","entities":[],"concepts":[]}"#;
+    let total = analysis.chars().count();
+    let fast = StreamingLlmPort::over(vec![analysis.to_string()], 15, 250);
+    // strong 不设间隔、整段吐出：生成阶段与本断言无关
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let (analyzing, _generating) = run_with_progress(&root, &raw, fast, strong).await;
+
+    let mut expected = vec![0usize];
+    let mut acc = 0usize;
+    while acc < total {
+        acc = (acc + 15).min(total);
+        expected.push(acc);
+    }
+    assert_eq!(
+        analyzing, expected,
+        "间隔超过时间阈值的每个小增量都应上报（不受 50 字阈值限制）"
     );
 }
 
@@ -889,4 +1009,280 @@ async fn non_vault_directory_is_rejected() {
         .expect_err("非 Vault 目录必须拒绝");
     assert!(matches!(err, Error::NotAVault { .. }), "got: {err:?}");
     let _ = dir;
+}
+
+// ---------------------------------------------------------------------------
+// LLM 输出治理：熔断 / 重试约束 / 调用统计与日志
+// ---------------------------------------------------------------------------
+
+/// 造一个超过分析熔断上限（30,000 字符）的分析输出（形状仍是 JSON——
+/// 熔断先于解析，形状无所谓，但保持 JSON 以证明「超限不看内容」）。
+fn oversized_analysis(extra: usize) -> String {
+    format!(
+        r#"{{"source_title":"T","source_summary":"{}","entities":[],"concepts":[]}}"#,
+        "长".repeat(30_000 + extra)
+    )
+}
+
+/// 读 Vault 的 llm-calls.log 全部行（文件须存在）。
+fn llm_calls_log(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(".corpus/llm-calls.log"))
+        .expect("llm-calls.log 应存在")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 验收：分析输出超熔断上限 → 该次按 Oversized 失败（不进解析），
+/// 重试的 user 消息追加强约束句，第二次正常输出则整单成功。
+#[tokio::test]
+async fn oversized_output_trips_breaker_then_retry_succeeds() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = StreamingLlmPort::over(vec![oversized_analysis(10), analysis_json()], 10_000, 0);
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("第二次输出正常，整单应成功"),
+    );
+
+    let analyze_stats: Vec<_> = draft
+        .llm_calls
+        .iter()
+        .filter(|s| s.purpose == corpus_engine::LlmCallPurpose::Analyze)
+        .collect();
+    assert_eq!(
+        analyze_stats.len(),
+        2,
+        "分析应恰好两次调用：{:?}",
+        draft.llm_calls
+    );
+    assert_eq!(
+        analyze_stats[0].outcome,
+        corpus_engine::LlmCallOutcome::Oversized
+    );
+    assert!(analyze_stats[0]
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("超过上限"));
+    assert!(analyze_stats[0].output_chars > 30_000);
+    assert_eq!(analyze_stats[1].outcome, corpus_engine::LlmCallOutcome::Ok);
+
+    // 重试的 user 消息追加强约束
+    let calls = fast.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[1].1.contains("禁止复述原文"),
+        "重试 user 应含强约束：{}",
+        calls[1].1
+    );
+    assert!(!calls[0].1.contains("禁止复述原文"), "首次尝试不应有约束句");
+
+    // 日志：两行 JSON、结果分别是 oversized / ok
+    let log = llm_calls_log(&root);
+    assert!(log.len() >= 2, "日志应至少记录两次分析调用：{log:?}");
+    assert!(log[0].contains("\"oversized\"") && log[1].contains("\"ok\""));
+}
+
+/// 验收：两次输出均超限 → BadLlmOutput，错误含两次输出字数；
+/// 日志仍留下两条 Oversized 记录（摄取失败日志不丢）。
+#[tokio::test]
+async fn both_attempts_oversized_reports_char_counts() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = StreamingLlmPort::over(
+        vec![oversized_analysis(100), oversized_analysis(50)],
+        10_000,
+        0,
+    );
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
+        .await
+        .expect_err("两次超限应报错");
+    let msg = err.to_string();
+    assert!(msg.contains("超过上限"), "错误应含上限说明：{msg}");
+    let first = oversized_analysis(100).chars().count();
+    let second = oversized_analysis(50).chars().count();
+    assert!(
+        msg.contains(&first.to_string()) && msg.contains(&second.to_string()),
+        "错误应含两次输出字数（{first}/{second}）：{msg}"
+    );
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2, "失败路径日志不丢：{log:?}");
+    assert!(log.iter().all(|l| l.contains("\"oversized\"")));
+}
+
+/// 验收：解析失败（非超限）重试同样追加强约束句，统计记录 ParseFailed。
+#[tokio::test]
+async fn parse_failure_retry_appends_constraint_and_stats() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let fast = StreamingLlmPort::over(vec!["这不是 JSON".to_string(), analysis_json()], 10_000, 0);
+    let strong = StreamingLlmPort::over(vec![bodies_json()], 10_000, 0);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("第二次解析成功，整单应成功"),
+    );
+    let analyze_stats: Vec<_> = draft
+        .llm_calls
+        .iter()
+        .filter(|s| s.purpose == corpus_engine::LlmCallPurpose::Analyze)
+        .collect();
+    assert_eq!(
+        analyze_stats[0].outcome,
+        corpus_engine::LlmCallOutcome::ParseFailed
+    );
+    assert_eq!(analyze_stats[1].outcome, corpus_engine::LlmCallOutcome::Ok);
+    assert!(fast.recorded_calls()[1].1.contains("禁止复述原文"));
+}
+
+/// 验收：标准两步成功时统计齐全（fast/analyze + strong/compose、ok、
+/// 字数耗时 > 0），日志逐行可解析、且不含 raw 原文（隐私：只有长度）。
+#[tokio::test]
+async fn llm_calls_log_records_all_steps_without_raw_content() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "RAW_MARKER_XYZ 唯一标记的正文内容");
+    let report = ingest_ok(&root, &raw).await;
+
+    assert_eq!(
+        report.llm_calls.len(),
+        2,
+        "两步各一次：{:?}",
+        report.llm_calls
+    );
+    assert_eq!(report.llm_calls[0].tier, corpus_engine::LlmTier::Fast);
+    assert_eq!(report.llm_calls[1].tier, corpus_engine::LlmTier::Strong);
+    assert!(report
+        .llm_calls
+        .iter()
+        .all(|s| s.outcome == corpus_engine::LlmCallOutcome::Ok));
+    assert!(report.llm_calls.iter().all(|s| s.output_chars > 0));
+    // user_chars 随文档进入 prompt（必然包含标记）——但日志行绝不能含原文
+    assert!(report.llm_calls[0].user_chars > 0);
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2, "恰好两行：{log:?}");
+    for line in &log {
+        let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
+        assert!(v["tier"].is_string() && v["purpose"].is_string() && v["output_chars"].is_u64());
+        // 成功调用不携带失败诊断字段（serde 序列化不含 key）
+        assert!(
+            v.get("output_head").is_none()
+                && v.get("output_tail").is_none()
+                && v.get("has_think_tag").is_none(),
+            "成功调用不得序列化失败诊断字段：{line}"
+        );
+        assert!(
+            !line.contains("RAW_MARKER_XYZ"),
+            "日志不得包含 raw 原文：{line}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 思考块剥离与失败诊断（推理模型思考混流 / 截断场景）
+// ---------------------------------------------------------------------------
+
+/// 推理模型内联思考 + 中途截断的分析输出（模拟思考 token 挤占
+/// max_tokens：`<think>` 混流在前，JSON 在列表中间戛然而止）。
+fn think_wrapped_truncated_analysis() -> String {
+    let mut json = String::from("{\"source_title\":\"T\",\"source_summary\":\"");
+    json.push_str(&"长".repeat(300));
+    json.push_str(
+        "\",\"entities\":[{\"title\":\"X\",\"summary\":\"Y\"}],\"concepts\":[{\"title\":\"Z\",\"summ",
+    );
+    format!("<think>\n用户给了一篇论文，让我先想想结构……\n好，开始输出。\n</think>\n{json}")
+}
+
+/// 验收：`<think>` 块包裹的合法输出（分析 + 成文两步都有）剥离后解析
+/// 成功，整单走通落盘；成功调用不携带失败诊断字段。
+#[tokio::test]
+async fn think_wrapped_output_parses_after_stripping() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let wrapped_analysis = format!(
+        "<think>\n先想想这篇论文讲什么……\n自注意力是核心。\n</think>\n{analysis}",
+        analysis = analysis_json()
+    );
+    let wrapped_bodies = format!("<think>成文思路……</think>{bodies}", bodies = bodies_json());
+    let fast = ScriptedLlmPort::new(vec![wrapped_analysis]);
+    let strong = ScriptedLlmPort::new(vec![wrapped_bodies]);
+    let draft = draft_of(
+        ingest(&root, &raw, &fast, &strong, no_progress())
+            .await
+            .expect("思考块包裹的输出应剥离后解析成功"),
+    );
+    // 两步各一次调用、全部 ok（思考块不触发解析失败重试）
+    assert_eq!(fast.call_count(), 1);
+    assert_eq!(strong.call_count(), 1);
+    assert!(
+        draft
+            .llm_calls
+            .iter()
+            .all(|s| s.outcome == corpus_engine::LlmCallOutcome::Ok),
+        "{:?}",
+        draft.llm_calls
+    );
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2);
+    for line in &log {
+        let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
+        assert!(
+            v.get("output_head").is_none()
+                && v.get("output_tail").is_none()
+                && v.get("has_think_tag").is_none(),
+            "成功调用即使输出含 <think> 也不得序列化诊断字段：{line}"
+        );
+    }
+
+    // 整单走通：apply 落盘成功
+    apply(&root, &draft, no_progress()).expect("apply 失败");
+    assert!(root.join("wiki/sources").is_dir());
+}
+
+/// 验收：截断 JSON（思考混流在前、列表中途戛然而止）两次均失败 →
+/// ParseFailed 记录含 output_head / output_tail / has_think_tag，日志行
+/// JSON 可解析且这些字段齐全：head 保留思考块起点、tail 停在截断点、
+/// 错误摘要附开头/结尾摘录。
+#[tokio::test]
+async fn parse_failure_log_records_output_diagnostics() {
+    let (_dir, root) = setup_vault("vault");
+    let raw = write_raw(&root, "a.md", "论文正文内容");
+    let truncated = think_wrapped_truncated_analysis();
+    let fast = ScriptedLlmPort::new(vec![truncated.clone(), truncated]);
+    let strong = ScriptedLlmPort::new(vec![]);
+    let err = ingest(&root, &raw, &fast, &strong, no_progress())
+        .await
+        .expect_err("两次截断输出必须报错");
+    assert!(matches!(err, Error::BadLlmOutput(_)), "got: {err:?}");
+    assert_eq!(fast.call_count(), 2);
+
+    let log = llm_calls_log(&root);
+    assert_eq!(log.len(), 2, "失败路径日志不丢：{log:?}");
+    for line in &log {
+        let v: serde_json::Value = serde_json::from_str(line).expect("每行应是合法 JSON");
+        assert_eq!(v["outcome"], "parse_failed");
+        assert_eq!(v["has_think_tag"], true, "输出含 <think> 应被检出：{line}");
+        let head = v["output_head"].as_str().expect("head 应为字符串");
+        let tail = v["output_tail"].as_str().expect("tail 应为字符串");
+        assert_eq!(head.chars().count(), 300, "head 应为前 300 字符：{head}");
+        assert_eq!(tail.chars().count(), 300, "tail 应为后 300 字符：{tail}");
+        assert!(head.starts_with("<think>"), "head 应保留思考块起点：{head}");
+        assert!(
+            tail.ends_with("\"summ"),
+            "tail 应停在 JSON 截断点（一眼可见断在哪）：{tail}"
+        );
+        // 错误摘要末尾附开头/结尾摘录（前端悬停 title 直接可见）
+        let error = v["error"].as_str().expect("error 应为字符串");
+        assert!(
+            error.contains("JSON 解析失败") && error.contains("开头：") && error.contains("结尾："),
+            "错误摘要应附输出摘录：{error}"
+        );
+    }
 }

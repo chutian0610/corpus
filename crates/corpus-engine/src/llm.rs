@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -22,6 +22,25 @@ pub trait LlmPort: Send + Sync {
     /// 请求一次补全：`system` 是可选的系统指令（Rig 实现映射到
     /// `AgentBuilder::preamble`），`user` 是用户消息；返回模型输出文本。
     async fn complete(&self, system: Option<&str>, user: &str) -> Result<String>;
+
+    /// 流式补全：模型的文本增量一到达就经 `on_delta` 回调，返回值仍是
+    /// 聚合后的完整输出（与 [`LlmPort::complete`] 语义一致）。
+    ///
+    /// 默认实现回退到 [`LlmPort::complete`]，把整体结果作为一次
+    /// `on_delta` 回调——既有实现者（含 `--no-default-features` 的测试
+    /// 路径）零改动获得该接口；支持真流式的实现（如
+    /// [`crate::rig_llm::RigLlmPort`]）覆写之。回调要求 `Send`：流式
+    /// future 会被装箱跨线程轮询（Tauri 线程池）。
+    async fn complete_stream(
+        &self,
+        system: Option<&str>,
+        user: &str,
+        on_delta: &mut (dyn for<'s> FnMut(&'s str) + Send),
+    ) -> Result<String> {
+        let output = self.complete(system, user).await?;
+        on_delta(&output);
+        Ok(output)
+    }
 }
 
 /// 连通测试的结果快照。
@@ -42,6 +61,105 @@ pub const TEST_USER_PROMPT: &str = "Reply with exactly: OK";
 
 /// 连通测试回复在报告中的最大保留长度。
 const REPORT_REPLY_MAX_CHARS: usize = 200;
+
+// ---------------------------------------------------------------------------
+// 调用统计（LlmCallStats）
+// ---------------------------------------------------------------------------
+
+/// LLM 档位（Ingest 两步各一档：fast 分析 / strong 成文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTier {
+    /// fast 档：第一步结构化分析。
+    Fast,
+    /// strong 档：第二步成文。
+    Strong,
+}
+
+/// LLM 调用用途（与档位一一对应：fast 只用于分析、strong 只用于成文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmCallPurpose {
+    /// 第一步：fast 档结构化分析。
+    Analyze,
+    /// 第二步：strong 档成文。
+    Compose,
+}
+
+/// 单次 LLM 调用的结果分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmCallOutcome {
+    /// 输出解析成功，结果被管道采纳。
+    Ok,
+    /// 输出无法解析为引擎期望的结构（JSON 违约）。
+    ParseFailed,
+    /// 输出超过字符熔断上限（疑似模型复述原文或陷入重复）。
+    Oversized,
+    /// 端口调用本身失败（网络 / 鉴权 / 远端错误）。
+    Error,
+}
+
+/// 单次 LLM 调用的统计快照。
+///
+/// 隐私设计：成功调用**不含任何 prompt / 输出原文**，只有长度与耗时；
+/// 失败调用（解析失败 / 超限）额外记录输出首尾片段（见
+/// [`LlmCallStats::output_head`] 的隐私取舍）。落盘为 Vault 本地的
+/// `.corpus/llm-calls.log` JSON 行（该文件在 `.corpus/.gitignore` 忽略
+/// 范围内），事后可 grep 排查「模型到底吐了多少字、卡在哪一步」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmCallStats {
+    /// 调用完成时刻（RFC 3339，本地时区）。
+    pub ts: String,
+    /// 档位（fast / strong）。
+    pub tier: LlmTier,
+    /// 用途（analyze / compose）。
+    pub purpose: LlmCallPurpose,
+    /// 第几次尝试（1 起；解析失败 / 超限会重试一次）。
+    pub attempt: usize,
+    /// system 消息字符数（无 system 为 0）。
+    pub system_chars: usize,
+    /// user 消息字符数（重试会追加约束句，按实际发送的消息计）。
+    pub user_chars: usize,
+    /// 模型输出字符数（以端口返回的聚合文本为准）。
+    pub output_chars: usize,
+    /// 本次调用耗时（毫秒）。
+    pub duration_ms: u64,
+    /// 结果分类。
+    pub outcome: LlmCallOutcome,
+    /// 失败原因摘要（截断 200 字，末尾附输出摘录；成功时无此字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 失败诊断：输出前 300 字符（仅解析失败 / 超限时记录）。
+    ///
+    /// 隐私取舍：片段仅在失败时落盘（成功调用保持 `None` 且不序列化）、
+    /// 只存 Vault 本地 `.corpus/llm-calls.log`（git 忽略），用于诊断推理
+    /// 模型思考混流 / 输出截断——如思考 token 挤占 `max_tokens` 预算导致
+    /// JSON 中途截断时，截断点在哪一眼可见。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_head: Option<String>,
+    /// 失败诊断：输出后 300 字符（隐私取舍同 [`LlmCallStats::output_head`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    /// 失败诊断：输出是否含 `<think>` / `</think>` 思考标签——判断推理
+    /// 模型的思考文本是否内联进了输出流（隐私取舍同
+    /// [`LlmCallStats::output_head`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_think_tag: Option<bool>,
+}
+
+/// 分析步（fast 档）的服务端输出上限（token）。
+///
+/// 换算依据：分析输出熔断是 30,000 字符（见 [`crate::ingest`]），中文约
+/// 1.5 字/token，30,000 ÷ 1.5 = 20,000。这是 rig 端口 `AgentBuilder::
+/// max_tokens` 的第一道闸（服务端硬顶）；引擎侧字符熔断是第二道闸。
+pub const ANALYSIS_MAX_TOKENS: u64 = 20_000;
+
+/// 成文步（strong 档）的服务端输出上限（token）。
+///
+/// 换算依据：成文输出熔断是 60,000 字符（见 [`crate::ingest`]），
+/// 60,000 ÷ 1.5 = 40,000。
+pub const COMPOSE_MAX_TOKENS: u64 = 40_000;
 
 /// 对注入的 [`LlmPort`] 发一次最小补全并计时（协议层，可离线用 Fake 驱动）。
 ///
@@ -134,6 +252,22 @@ mod tests {
             .await
             .expect_err("应透传错误");
         assert!(matches!(err, Error::Llm(msg) if msg.contains("模拟远端故障")));
+    }
+
+    /// 默认流式实现回退 complete：整体结果作为一次 on_delta 回调，
+    /// 返回值与非流式完全一致（只实现 complete 的 port 零改动可用）。
+    #[tokio::test]
+    async fn default_complete_stream_falls_back_to_single_delta() {
+        let fake = FakeLlmPort::ok("分段不了的整体回复");
+        let mut deltas: Vec<String> = Vec::new();
+        let output = fake
+            .complete_stream(Some("s"), "u", &mut |delta| {
+                deltas.push(delta.to_string());
+            })
+            .await
+            .expect("默认流式实现应成功");
+        assert_eq!(output, "分段不了的整体回复");
+        assert_eq!(deltas, vec!["分段不了的整体回复".to_string()]);
     }
 
     #[tokio::test]

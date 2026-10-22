@@ -7,10 +7,19 @@
 //! （AppHandle: Emitter，见 T3 调研笔记第 4 节），并按全局配置
 //! `apply_mode` 分支：`auto` 显式 apply，`manual` 不落盘返回 Draft 检视
 //! 清单（完整人审流程属票据 T5）。
+//! T-UX（Ingest 流程修正）：`ingest_file` 改为两段——先经引擎
+//! `import_raw` 把任意位置的源文件导入（复制）进 raw/，再走既有管道
+//! （管道只接受 raw/ 内路径的契约不变）；用户不再被要求先手动把
+//! 文件拷进 raw/。
+//! T-UX：应用壳两级结构（启动页 + 工作区）的支撑命令——`open_vault`
+//! （引擎校验 + 最近列表登记）、`list_pages`（页面树）、`read_page`
+//! （预览用只读文本，路径安全由引擎 `resolve_page_path` 校验）；
+//! `add_recent_vault` 退役（「打开」统一走 `open_vault` 的校验口径，
+//! 不再允许无校验登记）。
 
 use corpus_engine::{
     AppConfig, ApplyMode, ConfigStore, ConnectionReport, IngestOutcome, IngestReport, IngestStage,
-    ModelTier, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    ModelTier, OpenedVault, PageTree, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -42,8 +51,10 @@ pub fn run() {
             set_config,
             test_connection,
             list_recent_vaults,
-            add_recent_vault,
             remove_recent_vault,
+            open_vault,
+            list_pages,
+            read_page,
             ingest_file,
         ])
         .run(tauri::generate_context!())
@@ -109,18 +120,6 @@ async fn list_recent_vaults(store: State<'_, ConfigStore>) -> Result<Vec<RecentV
     store.list_recent_vaults().map_err(|e| e.to_string())
 }
 
-/// 手动登记一个已存在的 Vault（「打开已有 Vault」入口，后续票据接续）。
-#[tauri::command]
-async fn add_recent_vault(
-    store: State<'_, ConfigStore>,
-    path: String,
-    template_id: TemplateId,
-) -> Result<(), String> {
-    store
-        .add_recent_vault(&path, &template_id)
-        .map_err(|e| e.to_string())
-}
-
 /// 从最近列表移除一个 Vault（只动注册表，不删文件）。
 #[tauri::command]
 async fn remove_recent_vault(store: State<'_, ConfigStore>, path: String) -> Result<(), String> {
@@ -130,11 +129,54 @@ async fn remove_recent_vault(store: State<'_, ConfigStore>, path: String) -> Res
     Ok(())
 }
 
-/// ingest_file 命令响应：引擎 [`IngestReport`] 平铺 + Apply 模式语义。
+/// 打开一个已有 Vault（T-UX 启动页 / 工作区的核心入口）。
+///
+/// 引擎 `open_vault` 做只读校验（`.corpus/vault.json` 存在且模板 id 可
+/// 解析），通过后由本命令登记最近列表（全局配置层职责：引擎不越权，
+/// 壳层攒齐两份数据再写）。登记失败不阻断打开——Vault 已真实有效，
+/// 只是「最近」少了这条记录，打日志即可。
+#[tauri::command]
+async fn open_vault(store: State<'_, ConfigStore>, path: String) -> Result<OpenedVault, String> {
+    let opened = corpus_engine::open_vault(&path).map_err(|e| e.to_string())?;
+    if let Err(e) = store.add_recent_vault(&path, &opened.template_id) {
+        eprintln!("写入最近 Vault 注册表失败（不影响打开结果）：{e}");
+    }
+    Ok(opened)
+}
+
+/// 列出当前 Vault 的 wiki/ 页面树（文件面板数据源）。
+///
+/// 纯文件系统遍历（引擎零 LLM 零写入），路径不合法 / 非 Vault 由引擎
+/// 报中文错误。
+#[tauri::command]
+async fn list_pages(vault_path: String) -> Result<PageTree, String> {
+    corpus_engine::list_pages(&vault_path).map_err(|e| e.to_string())
+}
+
+/// 只读读取 `wiki/` 下某页面的原始文本（预览面板；正式渲染属 T4）。
+///
+/// 路径安全全部由引擎 [`corpus_engine::resolve_page_path`] 单一关口承担
+/// （拒绝绝对路径 / `..` / 非 `.md`，canonicalize 断言不逃出 Vault）；
+/// 读取前先对 `vault_path` 跑 `open_vault` 级校验（`.corpus/vault.json`
+/// 存在且模板可解析），与「打开」同一口径。
+#[tauri::command]
+async fn read_page(vault_path: String, rel_path: String) -> Result<String, String> {
+    corpus_engine::open_vault(&vault_path).map_err(|e| e.to_string())?;
+    let full =
+        corpus_engine::resolve_page_path(&vault_path, &rel_path).map_err(|e| e.to_string())?;
+    std::fs::read_to_string(&full).map_err(|e| format!("读取 {} 失败：{e}", full.display()))
+}
+
+/// ingest_file 命令响应：引擎 [`IngestReport`] 平铺 + 导入信息 + Apply 模式语义。
 #[derive(Debug, Clone, Serialize)]
 struct IngestFileReport {
     #[serde(flatten)]
     report: IngestReport,
+    /// 导入后的 raw 文件相对 Vault 路径（如 `raw/foo.md`，引擎
+    /// `import_raw` 的结果；管道实际摄取的就是它）。
+    imported_raw_path: String,
+    /// 本次是否新导入进 raw/（false = 已在库 / 同内容去重）。
+    newly_imported: bool,
     /// Draft 是否已落盘（指纹跳过与 manual 模式为 false）。
     applied: bool,
     /// manual 模式：Draft 人读检视清单（每页一行，降级页带标注）。
@@ -143,12 +185,20 @@ struct IngestFileReport {
     note: Option<String>,
 }
 
-/// 摄取一个 raw 文件：指纹检查 → 两步 LLM → Draft，再按全局配置
-/// `apply_mode` 决定是否落盘（CONTEXT.md「Apply」）。
+/// 摄取一个文档（两段）：先 `import_raw` 把任意位置的源文件导入
+/// （复制）进 Vault 的 raw/（源文件不动；同名去重 / 后缀递增），再走
+/// 既有 Ingest 管道：指纹检查 → 两步 LLM → Draft，按全局配置
+/// `apply_mode` 决定是否落盘（CONTEXT.md「Apply」）。管道契约不变——
+/// 只接受 raw/ 内路径，入口由本命令的导入段保证。
 ///
-/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文）；
+/// 两步端口按全局配置的双模型档位构造（fast 分析 / strong 成文），
+/// 并按档位预设服务端输出上限（max_tokens：分析 20k / 成文 40k token，
+/// 见 [`corpus_engine::ANALYSIS_MAX_TOKENS`]）；引擎侧另有字符熔断与
+/// 调用统计（[`IngestReport::llm_calls`]，随报告透传到前端）。
 /// 引擎的 `on_progress` 回调在这里桥接为全局 `ingest-progress` 事件
-/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。
+/// （payload 即引擎的 `IngestStage`，`stage` 字段 snake_case）。分析/
+/// 生成两步的 LLM 输出走引擎流式增量：同阶段重复事件携带递增 `chars`
+/// （模型已输出字符数，引擎侧已节流），本命令原样 emit 不再加工。
 /// 模板取自 Vault 创建时绑定的 `.corpus/vault.json`。
 /// - `auto`：显式 apply（原子写 + 恰好一个 git 提交 + 指纹记录）；
 /// - `manual`：不落盘不提交，返回 Draft 的 summary_lines 并注明
@@ -160,21 +210,45 @@ async fn ingest_file(
     vault_path: String,
     raw_path: String,
 ) -> Result<IngestFileReport, String> {
+    // 第一段：导入（任意位置 → raw/；已在库则原样通过）。
+    let imported = corpus_engine::import_raw(&vault_path, &raw_path).map_err(|e| e.to_string())?;
+
     let config: AppConfig = store.get_config().map_err(|e| e.to_string())?;
-    let fast = corpus_engine::build_llm_port(&config.fast).map_err(|e| e.to_string())?;
-    let strong = corpus_engine::build_llm_port(&config.strong).map_err(|e| e.to_string())?;
+    // 服务端输出硬顶（第一道闸）：fast 档只用于分析、strong 档只用于
+    // 成文，按档位构造即等价于按用途设限（complete 协议无法按调用携带
+    // 用途，取舍见引擎 build_llm_port_with_cap 文档）。引擎侧另有字符
+    // 熔断第二道闸。
+    let fast = corpus_engine::build_llm_port_with_cap(
+        &config.fast,
+        Some(corpus_engine::ANALYSIS_MAX_TOKENS),
+    )
+    .map_err(|e| e.to_string())?;
+    let strong = corpus_engine::build_llm_port_with_cap(
+        &config.strong,
+        Some(corpus_engine::COMPOSE_MAX_TOKENS),
+    )
+    .map_err(|e| e.to_string())?;
 
     let emit_progress = |stage: IngestStage| {
         // 事件推送失败只影响进度展示，不阻断摄取
         let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
     };
 
-    match corpus_engine::ingest(&vault_path, &raw_path, &fast, &strong, emit_progress)
-        .await
-        .map_err(|e| e.to_string())?
+    // 第二段：既有 Ingest 管道（只接受 raw/ 内路径）。
+    match corpus_engine::ingest(
+        &vault_path,
+        &imported.raw_abs,
+        &fast,
+        &strong,
+        emit_progress,
+    )
+    .await
+    .map_err(|e| e.to_string())?
     {
         IngestOutcome::Skipped(report) => Ok(IngestFileReport {
             report,
+            imported_raw_path: imported.raw_rel,
+            newly_imported: imported.imported,
             applied: false,
             summary_lines: Vec::new(),
             note: None,
@@ -185,6 +259,8 @@ async fn ingest_file(
                     .map_err(|e| e.to_string())?;
                 Ok(IngestFileReport {
                     report: draft.report(Some(commit)),
+                    imported_raw_path: imported.raw_rel,
+                    newly_imported: imported.imported,
                     applied: true,
                     summary_lines: Vec::new(),
                     note: None,
@@ -193,6 +269,8 @@ async fn ingest_file(
             // 人审模式：Draft 不落盘（零写入零提交），交还检视清单
             ApplyMode::Manual => Ok(IngestFileReport {
                 report: draft.report(None),
+                imported_raw_path: imported.raw_rel,
+                newly_imported: imported.imported,
                 applied: false,
                 summary_lines: draft.summary_lines(),
                 note: Some(MANUAL_REVIEW_NOTE.to_string()),

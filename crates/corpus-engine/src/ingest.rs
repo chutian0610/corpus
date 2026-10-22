@@ -13,11 +13,29 @@
 //!   自动执行还是人审触发由配置 `apply_mode` 决定，引擎不预设——
 //!   壳层读到 `manual` 时不调 apply，Draft 留待人审。
 //!
+//! LLM 输出治理（双层闸）：
+//! - 服务端硬顶：端口构造时按档位设 `max_tokens`（rig 侧，见
+//!   [`crate::llm::ANALYSIS_MAX_TOKENS`] / [`crate::llm::COMPOSE_MAX_TOKENS`]）；
+//! - 引擎熔断：[`with_retry_stream`] 对聚合输出做字符上限检查（分析
+//!   30,000 / 成文 60,000，常量可调），超限即视为该次失败、不进入
+//!   解析——防模型复述原文 / 陷入重复把分析阶段拖成数万字。
+//!
+//! 解析前剥离思考块：推理模型（如 MiniMax-M3）经 OpenAI 兼容端点默认
+//! 开思考，`<think>…</think>` 文本可能内联在输出流里——不剥离会污染
+//! first-`{` 到 last-`}` 的 JSON 提取窗口（见 [`strip_think_blocks`]）。
+//! 剥离只影响解析；`chars` 计数保持原样（如实反映模型输出量）。
+//!
+//! 全程每次 LLM 调用都记 [`LlmCallStats`]（档位/用途/字数/耗时/结果，
+//! 无原文；失败时附输出首尾片段诊断），随 [`IngestReport`] 返回并即时
+//! 追加到 Vault 的 `.corpus/llm-calls.log`（JSON 行，被 .gitignore 忽略）。
+//!
 //! 引擎不依赖 tauri：进度经 `on_progress: impl FnMut(IngestStage)` 回调
 //! 上报（见 T3 调研笔记第 4 节架构提示），壳层负责转成事件。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +44,7 @@ use crate::atomic::atomic_write;
 use crate::error::{Error, Result};
 use crate::fingerprint::{sha256_hex, StateStore};
 use crate::git;
-use crate::llm::LlmPort;
+use crate::llm::{LlmCallOutcome, LlmCallPurpose, LlmCallStats, LlmPort, LlmTier};
 use crate::page::{
     parse_page, slugify, wikilink, PageAction, PageDraft, PageFrontmatter, PageKind,
 };
@@ -37,6 +55,11 @@ use crate::vault::vault_template_id;
 pub const INGEST_COMMIT_PREFIX: &str = "corpus: ingest";
 
 /// 进度阶段：粗粒度、低频（读取/分析/生成/落盘），壳层映射为 UI 步骤。
+///
+/// 分析/生成两步的 LLM 输出经流式增量上报：同阶段会重复发出携带递增
+/// `chars`（模型已输出字符数）的事件（节流见 [`with_retry_stream`]）；
+/// `chars: 0` 表示阶段开始。增量只报字数不报内容——分析输出是 JSON、
+/// 生成输出会剧透 Wiki 正文，展示原文无意义且可能闪烁。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum IngestStage {
@@ -45,12 +68,17 @@ pub enum IngestStage {
         /// raw 文件相对 Vault 的路径。
         raw: String,
     },
-    /// 第一步：fast 档结构化分析。
-    Analyzing,
-    /// 第二步：strong 档成文（`pages` 为计划页面数）。
+    /// 第一步：fast 档结构化分析（流式）。
+    Analyzing {
+        /// 模型已输出的字符数（0 = 阶段开始）。
+        chars: usize,
+    },
+    /// 第二步：strong 档成文（流式；`pages` 为计划页面数）。
     Generating {
         /// 计划生成正文的页面数。
         pages: usize,
+        /// 模型已输出的字符数（0 = 阶段开始）。
+        chars: usize,
     },
     /// 落盘：原子写 + git 提交 + log/index 更新。
     Applying {
@@ -140,6 +168,8 @@ pub struct IngestDraft {
     pub pages: Vec<PageDraft>,
     /// 使用摘要兜底正文的页面路径（第二步 LLM 漏产出的降级页）。
     pub degraded_paths: Vec<String>,
+    /// 本次 Ingest 全部 LLM 调用统计（分析 + 成文，含重试）。
+    pub llm_calls: Vec<LlmCallStats>,
 }
 
 impl IngestDraft {
@@ -179,6 +209,7 @@ impl IngestDraft {
                 })
                 .collect(),
             commit,
+            llm_calls: self.llm_calls.clone(),
         }
     }
 
@@ -208,6 +239,8 @@ pub struct IngestReport {
     pub pages: Vec<IngestedPage>,
     /// Apply 产生的 git 短 hash（skipped 与未 Apply 时为 `None`）。
     pub commit: Option<String>,
+    /// 本次 Ingest 的 LLM 调用统计（跳过路径为空——零调用）。
+    pub llm_calls: Vec<LlmCallStats>,
 }
 
 /// 单个产出页面。
@@ -231,6 +264,9 @@ pub struct IngestedPage {
 /// `raw_path` 接受绝对路径或相对 `vault_root` 的路径，必须位于 Vault 的
 /// `raw/` 目录内（否则 [`Error::RawNotInVault`]）。`fast` / `strong` 分别
 /// 是两步所用档位的 [`LlmPort`]（注入方决定真实或 fake）。
+///
+/// `on_progress` 要求 `Send`：LLM 流式 future 跨线程轮询（见
+/// [`LlmPort::complete_stream`]），进度回调随之进入 `Send` 上下文。
 pub async fn ingest<F>(
     vault_root: impl AsRef<Path>,
     raw_path: impl AsRef<Path>,
@@ -239,7 +275,7 @@ pub async fn ingest<F>(
     mut on_progress: F,
 ) -> Result<IngestOutcome>
 where
-    F: FnMut(IngestStage),
+    F: FnMut(IngestStage) + Send,
 {
     let vault_root = vault_root.as_ref();
     if !vault_root.join("wiki").is_dir() {
@@ -270,6 +306,7 @@ where
                 .unwrap_or_else(|| raw_file_stem(&raw_rel)),
             pages: Vec::new(),
             commit: None,
+            llm_calls: Vec::new(),
         }));
     }
 
@@ -283,9 +320,15 @@ where
             .join(", "),
     })?;
 
-    // 第一步：结构化分析（fast 档）。
-    on_progress(IngestStage::Analyzing);
-    let mut analysis = analyze(fast, template, &raw_text).await?;
+    // LLM 调用统计收集器：全程累积并即时落 llm-calls.log（见类型文档）。
+    let mut recorder = LlmCallRecorder::new(vault_root);
+
+    // 第一步：结构化分析（fast 档，流式增量经节流上报 chars）。
+    on_progress(IngestStage::Analyzing { chars: 0 });
+    let mut analysis = analyze(fast, template, &raw_text, &mut recorder, &mut |chars| {
+        on_progress(IngestStage::Analyzing { chars });
+    })
+    .await?;
     if analysis.source_title.trim().is_empty() {
         analysis.source_title = raw_file_stem(&raw_rel);
     }
@@ -294,15 +337,34 @@ where
     let existing = scan_existing_pages(vault_root)?;
     let plan = build_plan(&analysis, &raw_rel, &existing)?;
 
-    // 第二步：成文（strong 档）。
-    on_progress(IngestStage::Generating { pages: plan.len() });
-    let bodies = compose(strong, template, &raw_text, &raw_rel, &plan).await?;
+    // 第二步：成文（strong 档，流式增量经节流上报 chars）。
+    on_progress(IngestStage::Generating {
+        pages: plan.len(),
+        chars: 0,
+    });
+    let bodies = compose(
+        strong,
+        template,
+        &raw_text,
+        &raw_rel,
+        &plan,
+        &mut recorder,
+        &mut |chars| {
+            on_progress(IngestStage::Generating {
+                pages: plan.len(),
+                chars,
+            })
+        },
+    )
+    .await?;
 
+    let llm_calls = recorder.finish();
     Ok(IngestOutcome::Draft(build_draft(
         &raw_rel,
         plan,
         &bodies,
         &fingerprint,
+        llm_calls,
     )))
 }
 
@@ -397,43 +459,346 @@ no code fences). Shape:
 Every item MUST have a non-empty title; aliases must contain at least the \
 title itself when no better alias exists; use [] when a list is empty.";
 
-/// LLM 调用 + 解析的重试助手（两步共用）：解析失败重试一次，两次都
-/// 失败报 [`Error::BadLlmOutput`]（`what` 为步骤名，进错误消息）。
-async fn with_retry<T>(
+/// 流式进度节流：距上次上报至少这么久（时间阈值）……
+const REPORT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// ……或累计新增至少这么多字符（字符阈值），二者满足其一才上报。
+const REPORT_MIN_NEW_CHARS: usize = 50;
+
+/// 第一步（分析）的输出熔断上限（字符）。正常分析 JSON 应在几千字内，
+/// 远小于此值；超过即视为模型复述原文 / 陷入重复，该次调用按失败处理。
+/// 可按需调整（服务端 max_tokens 是第一道闸，这是引擎侧第二道）。
+pub const ANALYSIS_MAX_OUTPUT_CHARS: usize = 30_000;
+
+/// 第二步（成文）的输出熔断上限（字符）。可按需调整。
+pub const COMPOSE_MAX_OUTPUT_CHARS: usize = 60_000;
+
+/// 统计与日志文件的相对路径（Vault 内；被 `.corpus/.gitignore` 忽略）。
+pub const LLM_CALLS_LOG_REL: &str = ".corpus/llm-calls.log";
+
+/// 错误摘要写入统计时的最大保留长度（字符）。
+const STATS_ERROR_MAX_CHARS: usize = 200;
+
+/// 失败诊断片段长度：输出首尾各保留的字符数（进 [`LlmCallStats`] 的
+/// `output_head` / `output_tail`，见 llm.rs 隐私取舍说明）。
+const STATS_SNIPPET_CHARS: usize = 300;
+
+/// 错误摘要末尾摘录的长度：开头 / 结尾各保留的字符数（单行化）。
+const ERROR_EXCERPT_CHARS: usize = 80;
+
+/// 上次输出超长时，重试 user 消息末尾追加的强约束。
+const RETRY_CONSTRAINT_OVERSIZED: &str =
+    "上次输出超长。只输出符合要求的紧凑内容，禁止复述原文、禁止重复。";
+
+/// 上次输出无法解析时，重试 user 消息末尾追加的强约束。
+const RETRY_CONSTRAINT_UNPARSEABLE: &str =
+    "上次输出无法解析。只输出符合要求的紧凑内容，禁止复述原文、禁止重复。";
+
+/// 一次调用的画像：档位 + 用途 + 步骤名 + 字符熔断上限（分析/成文各自
+/// 一份，[`with_retry_stream`] 据此填统计与判断超限）。
+struct CallProfile {
+    tier: LlmTier,
+    purpose: LlmCallPurpose,
+    /// 步骤名（进错误消息，如「结构化分析」「成文」）。
+    what: &'static str,
+    max_output_chars: usize,
+}
+
+/// LLM 调用统计收集器：ingest 全程累积，同时把每条 [`LlmCallStats`]
+/// 即时追加为 [`LLM_CALLS_LOG_REL`] 的一行 JSON——即使摄取失败报错
+/// （无法返回报告），日志里也已留下每次调用的长度与耗时供排查。
+pub(crate) struct LlmCallRecorder {
+    vault_root: PathBuf,
+    calls: Vec<LlmCallStats>,
+}
+
+impl LlmCallRecorder {
+    fn new(vault_root: &Path) -> Self {
+        Self {
+            vault_root: vault_root.to_path_buf(),
+            calls: Vec::new(),
+        }
+    }
+
+    /// 记录一条统计：追加日志行（best-effort，失败只打 stderr 不阻断
+    /// 摄取——诊断数据不能反噬主流程）+ 累积进内存（进报告）。
+    fn record(&mut self, stats: LlmCallStats) {
+        if let Err(err) = append_llm_call_line(&self.vault_root, &stats) {
+            eprintln!("追加 LLM 调用日志失败（不影响摄取结果）：{err}");
+        }
+        self.calls.push(stats);
+    }
+
+    /// 收束为报告字段。
+    fn finish(self) -> Vec<LlmCallStats> {
+        self.calls
+    }
+}
+
+/// 追加一行 JSON 到 Vault 的 llm-calls.log（不存在则创建）。
+fn append_llm_call_line(vault_root: &Path, stats: &LlmCallStats) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vault_root.join(LLM_CALLS_LOG_REL))?;
+    writeln!(file, "{}", serde_json::to_string(stats)?)?;
+    Ok(())
+}
+
+/// LLM 流式调用 + 输出熔断 + 解析的重试助手（两步共用）：
+///
+/// - **熔断**：聚合输出超过 `profile.max_output_chars` 即视为该次失败
+///   （不进入 parse——超限内容即使是合法 JSON 也不采信），原因写明
+///   「输出 N 字超过上限 M，疑似模型复述原文或陷入重复」；
+/// - **重试**：解析失败 / 超限均重试一次，重试的 user 消息末尾按上次
+///   失败原因追加强约束句（[`RETRY_CONSTRAINT_OVERSIZED`] /
+///   [`RETRY_CONSTRAINT_UNPARSEABLE`]）；两次失败报 [`Error::BadLlmOutput`]
+///   （`what` 为步骤名，错误含两次输出字数）；端口调用错误（网络 /
+///   鉴权 / 远端）记录统计后原样透传，不重试（与既有语义一致——
+///   重试只针对输出质量问题）；
+/// - **统计**：每次尝试记一条 [`LlmCallStats`]（`recorder` 落日志 +
+///   进报告）。解析失败 / 超限的记录额外附失败诊断（输出首尾片段 +
+///   思考标签检测，见 [`fill_failure_diagnostics`]），错误摘要末尾附
+///   开头/结尾摘录（[`error_with_excerpt`]）——截断点与思考混流一眼
+///   可见；端口调用错误（无输出）不记片段。
+///
+/// 文本增量经 [`LlmPort::complete_stream`] 即时到达，`on_chars` 是节流后
+/// 的 chars 上报（模型已输出字符数）：距上次上报 ≥[`REPORT_MIN_INTERVAL`]
+/// 或累计新增 ≥[`REPORT_MIN_NEW_CHARS`] 才放行——连续小增量合并成一报，
+/// 避免高频回调淹没进度通道。流结束后补一次终值（尾部增量可能未达阈值）。
+/// 每次尝试独立计数（重试的输出与上次无关）。
+async fn with_retry_stream<T>(
+    recorder: &mut LlmCallRecorder,
     port: &dyn LlmPort,
     system: Option<&str>,
     user: &str,
-    what: &str,
+    profile: CallProfile,
     parse: impl Fn(&str) -> Result<T>,
+    on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<T> {
+    let CallProfile {
+        tier,
+        purpose,
+        max_output_chars,
+        what,
+    } = profile;
+    let system_chars = system.map_or(0, |s| s.chars().count());
     let mut last_error = String::new();
+    let mut attempt_chars: Vec<usize> = Vec::with_capacity(2);
+    // 上次失败后追加在 user 末尾的强约束（首次尝试为空）。
+    let mut retry_note = String::new();
     for _attempt in 0..2 {
-        let output = port.complete(system, user).await?;
+        let attempt_user = if retry_note.is_empty() {
+            user.to_string()
+        } else {
+            format!("{user}\n\n{retry_note}")
+        };
+        let start = std::time::Instant::now();
+        let mut chars = 0usize;
+        let mut reported_chars = 0usize;
+        let mut last_report = std::time::Instant::now();
+        let output = match port
+            .complete_stream(system, &attempt_user, &mut |delta| {
+                chars += delta.chars().count();
+                if last_report.elapsed() >= REPORT_MIN_INTERVAL
+                    || chars - reported_chars >= REPORT_MIN_NEW_CHARS
+                {
+                    on_chars(chars);
+                    reported_chars = chars;
+                    last_report = std::time::Instant::now();
+                }
+            })
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                recorder.record(LlmCallStats {
+                    ts: chrono::Local::now().to_rfc3339(),
+                    tier,
+                    purpose,
+                    attempt: attempt_chars.len() + 1,
+                    system_chars,
+                    user_chars: attempt_user.chars().count(),
+                    output_chars: chars,
+                    duration_ms: elapsed_ms(start),
+                    outcome: LlmCallOutcome::Error,
+                    error: Some(truncate_chars(&err.to_string(), STATS_ERROR_MAX_CHARS)),
+                    // 端口调用本身失败：无模型输出可诊断
+                    output_head: None,
+                    output_tail: None,
+                    has_think_tag: None,
+                });
+                return Err(err);
+            }
+        };
+        if chars != reported_chars {
+            on_chars(chars);
+        }
+        let output_chars = output.chars().count();
+        attempt_chars.push(output_chars);
+        let stats = |outcome: LlmCallOutcome, error: Option<String>| LlmCallStats {
+            ts: chrono::Local::now().to_rfc3339(),
+            tier,
+            purpose,
+            attempt: attempt_chars.len(),
+            system_chars,
+            user_chars: attempt_user.chars().count(),
+            output_chars,
+            duration_ms: elapsed_ms(start),
+            outcome,
+            error,
+            output_head: None,
+            output_tail: None,
+            has_think_tag: None,
+        };
+
+        // 熔断：超限即失败，不进入 parse（即使内容恰好是合法 JSON）。
+        if output_chars > max_output_chars {
+            let reason = format!(
+                "输出 {output_chars} 字超过上限 {max_output_chars}，疑似模型复述原文或陷入重复"
+            );
+            let mut record = stats(
+                LlmCallOutcome::Oversized,
+                Some(error_with_excerpt(&reason, &output)),
+            );
+            fill_failure_diagnostics(&mut record, &output);
+            recorder.record(record);
+            last_error = reason;
+            retry_note = RETRY_CONSTRAINT_OVERSIZED.to_string();
+            continue;
+        }
         match parse(&output) {
-            Ok(parsed) => return Ok(parsed),
-            Err(err) => last_error = err.to_string(),
+            Ok(parsed) => {
+                recorder.record(stats(LlmCallOutcome::Ok, None));
+                return Ok(parsed);
+            }
+            Err(err) => {
+                last_error = err.to_string();
+                let mut record = stats(
+                    LlmCallOutcome::ParseFailed,
+                    Some(error_with_excerpt(&last_error, &output)),
+                );
+                fill_failure_diagnostics(&mut record, &output);
+                recorder.record(record);
+                retry_note = RETRY_CONSTRAINT_UNPARSEABLE.to_string();
+            }
         }
     }
     Err(Error::BadLlmOutput(format!(
-        "{what}输出两次均无法解析（最后一次：{last_error}）"
+        "{what}输出两次均失败（第 1 次 {} 字，第 2 次 {} 字；最后一次：{last_error}）",
+        attempt_chars[0], attempt_chars[1]
     )))
 }
 
+/// 已耗时（毫秒，u64 饱和截断）。
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    start.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+/// 取前 `max_chars` 个字符（Unicode 安全）。
+fn head_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// 取后 `max_chars` 个字符（不足则原样；Unicode 安全）。
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().skip(count - max_chars).collect()
+    }
+}
+
+/// 控制字符（换行 / 制表等）单行化为空格（摘录进悬停 title 用）。
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// 失败摘要：原因（截断 [`STATS_ERROR_MAX_CHARS`]）+ 末尾输出摘录
+/// 「开头：⟨前 80 字单行化⟩…结尾：⟨后 80 字单行化⟩」——前端统计表
+/// 悬停 title 直接可见截断点与思考混流证据，摘录整体不被截断。
+fn error_with_excerpt(reason: &str, output: &str) -> String {
+    format!(
+        "{}；开头：{}…结尾：{}",
+        truncate_chars(reason, STATS_ERROR_MAX_CHARS),
+        single_line(&head_chars(output, ERROR_EXCERPT_CHARS)),
+        single_line(&tail_chars(output, ERROR_EXCERPT_CHARS)),
+    )
+}
+
+/// 失败诊断：填充输出首尾片段与思考标签检测（仅解析失败 / 超限路径
+/// 调用；成功保持 `None` 且不序列化，隐私取舍见 [`LlmCallStats`]）。
+fn fill_failure_diagnostics(stats: &mut LlmCallStats, output: &str) {
+    stats.output_head = Some(head_chars(output, STATS_SNIPPET_CHARS));
+    stats.output_tail = Some(tail_chars(output, STATS_SNIPPET_CHARS));
+    stats.has_think_tag = Some(output.contains("<think>") || output.contains("</think>"));
+}
+
+/// 从输出中剥离推理模型的思考块（`<think>…</think>`），返回剥离结果
+/// （无思考块时零拷贝借用原文）。
+///
+/// 规则：非贪婪、含多行——每对 `<think>…</think>` 整段移除（可多对）；
+/// 未闭合的 `<think>` 从标签开头到输出末尾整段视为思考。推理模型经
+/// OpenAI 兼容端点默认开思考，思考文本可能内联在输出流里，不剥离会
+/// 污染 first-`{` 到 last-`}` 的 JSON 提取窗口。只影响解析：`chars`
+/// 计数与 [`LlmCallStats::output_chars`] 保持原样（如实反映模型输出量）。
+fn strip_think_blocks(output: &str) -> Cow<'_, str> {
+    if !output.contains("<think>") {
+        return Cow::Borrowed(output);
+    }
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut cleaned = String::with_capacity(output.len());
+    let mut rest = output;
+    while let Some(start) = rest.find(OPEN) {
+        cleaned.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        match after_open.find(CLOSE) {
+            // 闭合：跳过整对思考块，继续找下一对
+            Some(close) => rest = &after_open[close + CLOSE.len()..],
+            // 未闭合：开头到末尾整段视为思考，其后无正文
+            None => return Cow::Owned(cleaned),
+        }
+    }
+    cleaned.push_str(rest);
+    Cow::Owned(cleaned)
+}
+
 /// 第一步调用：schema_prompt 注入 system，raw 全文作为 user；
-/// 解析失败重试一次，再失败报 [`Error::BadLlmOutput`]（零写入）。
+/// 解析失败 / 超限重试一次，再失败报 [`Error::BadLlmOutput`]（零写入）。
+/// `on_chars` 收到节流后的流式 chars 上报。
 async fn analyze(
     fast: &dyn LlmPort,
     template: &WikiTemplate,
     raw: &str,
+    recorder: &mut LlmCallRecorder,
+    on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<AnalysisOutcome> {
     let system = format!("{}\n\n{ANALYSIS_JSON_INSTRUCTIONS}", template.schema_prompt);
     let user = format!("# Raw source\n\n```text\n{raw}\n```\n");
-    with_retry(fast, Some(&system), &user, "结构化分析", parse_analysis).await
+    with_retry_stream(
+        recorder,
+        fast,
+        Some(&system),
+        &user,
+        CallProfile {
+            tier: LlmTier::Fast,
+            purpose: LlmCallPurpose::Analyze,
+            what: "结构化分析",
+            max_output_chars: ANALYSIS_MAX_OUTPUT_CHARS,
+        },
+        parse_analysis,
+        on_chars,
+    )
+    .await
 }
 
-/// 容错解析分析输出：截取首个 `{` 到最后一个 `}` 再走 serde_json。
+/// 容错解析分析输出：先剥离思考块，再截取首个 `{` 到最后一个 `}` 走 serde_json。
 fn parse_analysis(output: &str) -> Result<AnalysisOutcome> {
-    let json = extract_json_object(output);
+    let stripped = strip_think_blocks(output);
+    let json = extract_json_object(&stripped);
     serde_json::from_str(json).map_err(|err| Error::BadLlmOutput(format!("JSON 解析失败：{err}")))
 }
 
@@ -755,13 +1120,16 @@ with [[wikilinks]] using exactly the paths given in the plan. The source page \
 nothing else: {\"pages\": [{\"path\": \"<path from plan, without .md>\", \
 \"body\": \"<markdown>\"}]}.";
 
-/// 第二步调用：一次生成全部页面正文；解析失败重试一次，再失败报错。
+/// 第二步调用：一次生成全部页面正文；解析失败 / 超限重试一次，再失败
+/// 报错。`on_chars` 收到节流后的流式 chars 上报。
 async fn compose(
     strong: &dyn LlmPort,
     template: &WikiTemplate,
     raw: &str,
     raw_rel: &str,
     planned: &[PlannedPage],
+    recorder: &mut LlmCallRecorder,
+    on_chars: &mut (dyn FnMut(usize) + Send),
 ) -> Result<HashMap<String, String>> {
     let plan_json: Vec<serde_json::Value> = planned
         .iter()
@@ -787,7 +1155,21 @@ async fn compose(
         serde_json::to_string_pretty(&plan_json)?,
     );
 
-    let written = with_retry(strong, Some(COMPOSE_SYSTEM), &user, "成文", parse_written).await?;
+    let written = with_retry_stream(
+        recorder,
+        strong,
+        Some(COMPOSE_SYSTEM),
+        &user,
+        CallProfile {
+            tier: LlmTier::Strong,
+            purpose: LlmCallPurpose::Compose,
+            what: "成文",
+            max_output_chars: COMPOSE_MAX_OUTPUT_CHARS,
+        },
+        parse_written,
+        on_chars,
+    )
+    .await?;
     let mut bodies = HashMap::new();
     for page in written.pages {
         let key = page
@@ -801,7 +1183,8 @@ async fn compose(
 }
 
 fn parse_written(output: &str) -> Result<WrittenPages> {
-    let json = extract_json_object(output);
+    let stripped = strip_think_blocks(output);
+    let json = extract_json_object(&stripped);
     serde_json::from_str(json).map_err(|err| Error::BadLlmOutput(format!("JSON 解析失败：{err}")))
 }
 
@@ -828,6 +1211,7 @@ fn build_draft(
     plan: Vec<PlannedPage>,
     bodies: &HashMap<String, String>,
     fingerprint: &str,
+    llm_calls: Vec<LlmCallStats>,
 ) -> IngestDraft {
     let now = chrono::Local::now().to_rfc3339();
     let source_link = plan
@@ -868,6 +1252,7 @@ fn build_draft(
         fingerprint: fingerprint.to_string(),
         pages,
         degraded_paths,
+        llm_calls,
     }
 }
 
@@ -1185,6 +1570,50 @@ mod tests {
         let partial = parse_analysis("{}").expect("空对象合法（全默认值）");
         assert!(partial.entities.is_empty());
         assert!(parse_analysis("垃圾输出").is_err());
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_closed_unclosed_and_multiple() {
+        // 无思考块：零拷贝借用，原样返回
+        assert!(matches!(
+            strip_think_blocks(r#"{"a":1}"#),
+            Cow::Borrowed(r#"{"a":1}"#)
+        ));
+        // 闭合块（含多行）：整段移除，正文保留
+        assert_eq!(
+            &strip_think_blocks("<think>\n多行\n思考\n</think>\n{\"a\":1}"),
+            "\n{\"a\":1}"
+        );
+        // 多对块：逐一非贪婪移除
+        assert_eq!(
+            &strip_think_blocks("<think>A</think>X<think>B</think>Y"),
+            "XY"
+        );
+        // 未闭合：标签开头到末尾整段视为思考，其后无正文
+        assert_eq!(&strip_think_blocks("{\"a\":1}<think>截断的"), "{\"a\":1}");
+        assert_eq!(&strip_think_blocks("<think>只有思考"), "");
+        // 思考里含花括号也不污染：剥离后再提取（不剥离时 first-{ 落在
+        // 思考块内，提取窗口会带上 `</think>` 导致解析失败）
+        let polluted = "<think>思考里有个 { 假对象</think>{\"source_title\":\"T\"}";
+        assert!(parse_analysis(polluted).is_ok(), "思考块应先剥离再提取");
+    }
+
+    #[test]
+    fn failure_excerpt_is_single_lined_and_head_tailed() {
+        let output = format!("{{\"a\":\"{}\",\"b\"", "\n".repeat(90));
+        let excerpt = error_with_excerpt("原因", &output);
+        assert!(excerpt.starts_with("原因；开头："));
+        assert!(excerpt.contains("…结尾："));
+        assert!(
+            !excerpt.contains('\n'),
+            "摘录应单行化（换行转空格）：{excerpt}"
+        );
+        // 90 个换行 + 头尾骨架 = 单行化后 head 80 空格、tail 80 空格
+        let tail = single_line(&tail_chars(&output, ERROR_EXCERPT_CHARS));
+        assert_eq!(tail.chars().count(), ERROR_EXCERPT_CHARS);
+        assert_eq!(head_chars("中文abc", 2), "中文");
+        assert_eq!(tail_chars("abcde", 2), "de");
+        assert_eq!(tail_chars("ab", 5), "ab");
     }
 
     #[test]

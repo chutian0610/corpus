@@ -23,6 +23,13 @@ export interface VaultInfo {
   created_paths: string[]
 }
 
+/** open_vault 的结果：路径与绑定模板元数据（引擎 OpenedVault）。 */
+export interface OpenedVault {
+  root: string
+  template_id: string
+  template_name: string
+}
+
 export interface ModelTier {
   provider: string
   model: string
@@ -51,6 +58,25 @@ export interface RecentVault {
 /** 页面类型（引擎 PageKind serde 表示）。 */
 export type PageKind = 'source' | 'entity' | 'concept'
 
+/** 单个页面条目（引擎 PageEntry）：路径 + 最后更新时间。 */
+export interface PageEntry {
+  /** 相对 wiki/ 的 .md 路径。 */
+  path: string
+  /** frontmatter 的 updated 时间（RFC 3339）；解析失败为 null（界面不展示）。 */
+  updated: string | null
+}
+
+/** 按类型分组的页面清单（引擎 PageGroup）。 */
+export interface PageGroup {
+  kind: PageKind
+  pages: PageEntry[]
+}
+
+/** wiki/ 页面树（引擎 PageTree）：非空分组，按固定类型顺序。 */
+export interface PageTree {
+  groups: PageGroup[]
+}
+
 /** 页面动作：新建 / 精确名命中更新。 */
 export type PageAction = 'create' | 'update'
 
@@ -62,9 +88,39 @@ export interface IngestedPage {
   action: PageAction
 }
 
-/** ingest_file 的结果：跳过路径（指纹命中）、已落盘或人审未落盘的快照。 */
+/** LLM 档位（fast 分析 / strong 成文）。 */
+export type LlmTier = 'fast' | 'strong'
+
+/** LLM 调用用途。 */
+export type LlmCallPurpose = 'analyze' | 'compose'
+
+/** 单次 LLM 调用的结果分类。 */
+export type LlmCallOutcome = 'ok' | 'parse_failed' | 'oversized' | 'error'
+
+/** 单次 LLM 调用统计（引擎 LlmCallStats；无 prompt/输出原文，只有长度与耗时）。 */
+export interface LlmCallStats {
+  /** 调用完成时刻（RFC 3339）。 */
+  ts: string
+  tier: LlmTier
+  purpose: LlmCallPurpose
+  /** 第几次尝试（1 起；解析失败 / 超限会重试一次）。 */
+  attempt: number
+  system_chars: number
+  user_chars: number
+  output_chars: number
+  duration_ms: number
+  outcome: LlmCallOutcome
+  /** 失败原因摘要（成功时无此字段）。 */
+  error?: string
+}
+
+/** ingest_file 的结果：导入信息 + 跳过路径（指纹命中）、已落盘或人审未落盘的快照。 */
 export interface IngestReport {
   skipped: boolean
+  /** 导入后的 raw 文件相对 Vault 路径（如 raw/foo.md；引擎 import_raw 结果，管道摄取的就是它）。 */
+  imported_raw_path: string
+  /** 本次是否新导入进 raw/（false = 已在库或同内容去重命中既有文件）。 */
+  newly_imported: boolean
   /** Draft 是否已落盘（指纹跳过与人审模式为 false）。 */
   applied: boolean
   fingerprint: string
@@ -75,13 +131,18 @@ export interface IngestReport {
   summary_lines: string[]
   /** 人审模式注明（Draft 未落盘，完整人审流程属 T5）。 */
   note: string | null
+  /** 本次摄取的全部 LLM 调用统计（分析 + 成文，含重试；跳过路径为空）。 */
+  llm_calls: LlmCallStats[]
 }
 
-/** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。 */
+/** Ingest 进度事件 payload（引擎 IngestStage，tag=stage）。
+ *
+ *  分析/生成两步是 LLM 流式：同阶段重复事件携带递增 chars（模型已输出
+ *  字符数，引擎侧已节流合并），chars=0 表示阶段开始。 */
 export type IngestProgress =
   | { stage: 'reading'; raw: string }
-  | { stage: 'analyzing' }
-  | { stage: 'generating'; pages: number }
+  | { stage: 'analyzing'; chars: number }
+  | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
 export function listTemplates(): Promise<TemplateInfo[]> {
@@ -108,14 +169,26 @@ export function listRecentVaults(): Promise<RecentVault[]> {
   return invoke<RecentVault[]>('list_recent_vaults')
 }
 
-export function addRecentVault(path: string, templateId: string): Promise<void> {
-  return invoke('add_recent_vault', { path, templateId })
-}
-
 export function removeRecentVault(path: string): Promise<void> {
   return invoke('remove_recent_vault', { path })
 }
 
+/** 打开一个已有 Vault：引擎校验 + 壳层登记最近列表，非 Vault 明确报错。 */
+export function openVault(path: string): Promise<OpenedVault> {
+  return invoke<OpenedVault>('open_vault', { path })
+}
+
+/** 当前 Vault 的 wiki/ 页面树（文件面板数据源）。 */
+export function listPages(vaultPath: string): Promise<PageTree> {
+  return invoke<PageTree>('list_pages', { vaultPath })
+}
+
+/** 只读读取 wiki/ 下某页面的原始文本（预览用；正式渲染属 T4）。 */
+export function readPage(vaultPath: string, relPath: string): Promise<string> {
+  return invoke<string>('read_page', { vaultPath, relPath })
+}
+
+/** 摄取一个文档（任意位置）：命令内先 import_raw 导入 raw/，再走 Ingest 管道。 */
 export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport> {
   return invoke<IngestReport>('ingest_file', { vaultPath, rawPath })
 }

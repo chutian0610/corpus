@@ -3,15 +3,13 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
   ingestFile,
-  listRecentVaults,
   onIngestProgress,
   type IngestProgress,
   type IngestReport,
   type PageKind,
-  type RecentVault,
 } from '../api'
-import { errorMessage, templateDisplayName } from '../display'
-import { currentVault } from '../vault-state'
+import { errorMessage, PAGE_TYPE_LABELS } from '../display'
+import { bumpPages, currentVault } from '../vault-state'
 
 /** 四阶段步骤条（引擎 IngestStage 的 UI 映射）。 */
 const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
@@ -21,45 +19,90 @@ const STEPS: ReadonlyArray<{ key: IngestProgress['stage']; label: string }> = [
   { key: 'applying', label: '落盘' },
 ]
 
-const PAGE_TYPE_LABELS: Record<PageKind, string> = {
-  source: 'Source 页',
-  entity: 'Entity',
-  concept: 'Concept',
+type Phase = 'idle' | IngestProgress['stage'] | 'done' | 'error'
+type StageKey = IngestProgress['stage']
+
+/** 一个阶段的时间标记：开始时刻 + 结束时刻（进行中为 null）。 */
+interface StageMark {
+  key: StageKey
+  start: number
+  end: number | null
 }
 
-type Phase = 'idle' | IngestProgress['stage'] | 'done' | 'error'
+/** LLM 阶段无新增量的提示阈值（毫秒）：超过即显示「仍在等待模型响应」。 */
+const STALL_HINT_THRESHOLD_MS = 15_000
+/** 计时器跳动间隔（毫秒）：驱动「分析中 · 23s」与无进展提示的刷新。 */
+const TICK_MS = 250
 
-const recentVaults = ref<RecentVault[]>([])
-const vaultsError = ref<string | null>(null)
-const selectedVaultPath = ref<string | null>(null)
-const rawPath = ref<string | null>(null)
+const srcPath = ref<string | null>(null)
 const ingesting = ref(false)
 const phase = ref<Phase>('idle')
 const report = ref<IngestReport | null>(null)
 const ingestError = ref<string | null>(null)
 
+/** 阶段时间线（按到达顺序；同阶段的 chars 更新不产生新标记）。 */
+const stageMarks = ref<StageMark[]>([])
+/** 跳动的当前时刻（setInterval 驱动，让耗时计算响应式刷新）。 */
+const now = ref(Date.now())
+/** 当前 LLM 阶段已接收字符数（引擎流式 chars，已节流）。 */
+const llmChars = ref(0)
+/** 最近一次 chars 增量到达时刻（无进展提示的计时起点）。 */
+const lastDeltaAt = ref<number | null>(null)
+
 let unlisten: (() => void) | null = null
+let ticker: number | null = null
+
+/** 阶段切换：闭合上一标记、开启新标记；LLM 阶段重置字数与等待计时。 */
+function enterStage(stage: StageKey): void {
+  const marks = stageMarks.value
+  const last = marks[marks.length - 1]
+  if (last !== undefined) {
+    if (last.key === stage) return // 同阶段的 chars 更新，不产生新标记
+    last.end = Date.now()
+  }
+  marks.push({ key: stage, start: Date.now(), end: null })
+  llmChars.value = 0
+  lastDeltaAt.value = Date.now()
+}
+
+/** 结束时间线（完成或失败）：定格最后阶段的耗时。 */
+function closeStages(): void {
+  const last = stageMarks.value[stageMarks.value.length - 1]
+  if (last !== undefined && last.end === null) last.end = Date.now()
+}
 
 onMounted(async () => {
+  ticker = window.setInterval(() => {
+    now.value = Date.now()
+  }, TICK_MS)
   // 进度事件：命令执行中由后端 emit；卸载必须 unlisten（调研笔记第 4 节）
   unlisten = await onIngestProgress((progress) => {
-    if (ingesting.value) phase.value = progress.stage
+    if (!ingesting.value) return
+    if (phase.value !== progress.stage) {
+      phase.value = progress.stage
+      enterStage(progress.stage)
+    }
+    if (progress.stage === 'analyzing' || progress.stage === 'generating') {
+      if (progress.chars > llmChars.value) {
+        llmChars.value = progress.chars
+        lastDeltaAt.value = Date.now()
+      }
+    }
   })
-  try {
-    recentVaults.value = await listRecentVaults()
-  } catch (err) {
-    vaultsError.value = errorMessage(err)
-  }
-  if (currentVault.value) selectedVaultPath.value = currentVault.value.path
 })
 
 onUnmounted(() => {
   unlisten?.()
   unlisten = null
+  if (ticker !== null) window.clearInterval(ticker)
+  ticker = null
 })
 
+/** 摄取只作用于当前打开的 Vault（工作区面板；无 Vault 时不会挂载）。 */
+const vault = computed(() => currentVault.value)
+
 const canIngest = computed(
-  () => selectedVaultPath.value !== null && rawPath.value !== null && !ingesting.value,
+  () => vault.value !== null && srcPath.value !== null && !ingesting.value,
 )
 
 /** 人审模式结果：Draft 未落盘（apply_mode=manual，完整人审流程属 T5）。 */
@@ -78,30 +121,98 @@ const currentStep = computed(() => {
   return idx
 })
 
-async function chooseRawFile(): Promise<void> {
+/** 某步骤的时间标记（阶段单调推进，按 key 找首个即可）。 */
+function markOf(idx: number): StageMark | null {
+  const key = STEPS[idx]!.key
+  return stageMarks.value.find((m) => m.key === key) ?? null
+}
+
+/** 标记的已耗时（进行中用跳动的 now；夹到 0——now 刻度可能略滞后于
+ *  阶段开始的 Date.now，避免刚切换时显示 -1s）。 */
+function elapsedOf(mark: StageMark): number {
+  return Math.max(0, (mark.end ?? now.value) - mark.start)
+}
+
+/** 毫秒 → 人读时长（"23s" / "1m05s"）。 */
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000)
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}m${String(seconds).padStart(2, '0')}s`
+}
+
+function isActiveStep(idx: number): boolean {
+  return ingesting.value && idx === currentStep.value
+}
+
+/** 步骤主行：进行中显示跳动耗时（"分析中 · 23s"），完成后回显步骤名。 */
+function stepTitle(idx: number): string {
+  const label = STEPS[idx]!.label
+  if (!isActiveStep(idx)) return label
+  const mark = markOf(idx)
+  return mark === null ? `${label}中` : `${label}中 · ${formatDuration(elapsedOf(mark))}`
+}
+
+/** 步骤副行：完成后定格该阶段总耗时；LLM 进行中只报字数不展示内容
+ *  （分析输出是 JSON、生成输出会剧透 Wiki 正文，展示原文无意义）。 */
+function stepSub(idx: number): string | null {
+  if (isActiveStep(idx)) {
+    if (phase.value === 'analyzing') return `已接收 ${llmChars.value} 字（模型输出中）`
+    if (phase.value === 'generating') return `已生成 ${llmChars.value} 字（模型输出中）`
+    return null
+  }
+  if (idx < currentStep.value) {
+    const mark = markOf(idx)
+    if (mark === null) return null
+    return `耗时 ${formatDuration(elapsedOf(mark))}`
+  }
+  return null
+}
+
+/** 无进展提示：分析/生成超过 15s 没有新的 chars 增量时提示「仍在等待
+ *  模型响应（已 45s）」；有新增量即消失。 */
+const stallHint = computed(() => {
+  if (!ingesting.value || lastDeltaAt.value === null) return null
+  if (phase.value !== 'analyzing' && phase.value !== 'generating') return null
+  const stalledFor = now.value - lastDeltaAt.value
+  if (stalledFor <= STALL_HINT_THRESHOLD_MS) return null
+  return `仍在等待模型响应（已 ${Math.floor(stalledFor / 1000)}s）`
+})
+
+async function chooseDocFile(): Promise<void> {
+  // 任意位置的文档：导入 raw/ 由命令端自动完成（复制，源文件不动）
   const picked = await open({
     multiple: false,
     filters: [{ name: '文档（Markdown / 纯文本）', extensions: ['md', 'markdown', 'txt'] }],
   })
   if (typeof picked === 'string') {
-    rawPath.value = picked
+    srcPath.value = picked
     ingestError.value = null
   }
 }
 
 async function runIngest(): Promise<void> {
-  if (!canIngest.value || selectedVaultPath.value === null || rawPath.value === null) return
+  if (!canIngest.value || vault.value === null || srcPath.value === null) return
   ingesting.value = true
+  // 进度时间线归零：读取阶段从点击开始计时（后端首事件同 key 自动去重）
+  stageMarks.value = []
+  llmChars.value = 0
+  lastDeltaAt.value = null
   phase.value = 'reading'
+  enterStage('reading')
   report.value = null
   ingestError.value = null
   try {
-    report.value = await ingestFile(selectedVaultPath.value, rawPath.value)
+    report.value = await ingestFile(vault.value.path, srcPath.value)
     phase.value = 'done'
+    // 落盘成功：Wiki 有新页面，通知文件面板重拉页面树
+    if (report.value.applied) bumpPages()
   } catch (err) {
     ingestError.value = errorMessage(err)
     phase.value = 'error'
   } finally {
+    closeStages()
     ingesting.value = false
   }
 }
@@ -115,35 +226,23 @@ function pageTypeLabel(kind: PageKind): string {
   <main class="page">
     <header class="page-header">
       <h2>摄取（Ingest）</h2>
-      <p class="subtitle">把 raw/ 中的文档编译进 Wiki：指纹检查 → 两步 LLM → Draft → Apply（自动或人审由配置决定）</p>
+      <p class="subtitle">从任意位置选文件 → 自动导入 raw/ → 编译进 Wiki：指纹检查 → 两步 LLM → Draft → Apply（自动或人审由配置决定）</p>
+      <p v-if="vault" class="subtitle vault-line">
+        当前 Vault：<code :title="vault.path">{{ vault.path }}</code>
+      </p>
     </header>
 
     <section class="card step">
-      <h3>1 · 选择 Vault 与 raw 文件</h3>
-      <div v-if="vaultsError" class="load-error">
-        <p>Vault 列表加载失败：{{ vaultsError }}</p>
+      <h3>1 · 选择文档（任意位置）</h3>
+      <label class="field-label" for="raw-path">文档（任意位置；摄取时自动复制进当前 Vault 的 raw/，源文件不动）</label>
+      <div class="path-row">
+        <output id="raw-path" class="path-box" :title="srcPath ?? undefined">
+          {{ srcPath ?? '尚未选择文件' }}
+        </output>
+        <button type="button" class="btn" :disabled="ingesting" @click="chooseDocFile">
+          浏览…
+        </button>
       </div>
-      <div v-else-if="recentVaults.length === 0" class="hint">
-        尚无最近打开的 Vault——请先在「创建 Vault」页创建或到设置页登记已有 Vault。
-      </div>
-      <template v-else>
-        <label class="field-label" for="vault-select">Vault</label>
-        <select id="vault-select" v-model="selectedVaultPath" class="select" :disabled="ingesting">
-          <option v-for="v in recentVaults" :key="v.path" :value="v.path">
-            {{ v.path }}（{{ templateDisplayName(v.template_id) }}）
-          </option>
-        </select>
-
-        <label class="field-label" for="raw-path">raw 文件（须位于所选 Vault 的 raw/ 目录内）</label>
-        <div class="path-row">
-          <output id="raw-path" class="path-box" :title="rawPath ?? undefined">
-            {{ rawPath ?? '尚未选择文件' }}
-          </output>
-          <button type="button" class="btn" :disabled="ingesting" @click="chooseRawFile">
-            浏览…
-          </button>
-        </div>
-      </template>
     </section>
 
     <div class="actions">
@@ -167,9 +266,13 @@ function pageTypeLabel(kind: PageKind): string {
           :class="{ active: idx === currentStep, done: idx < currentStep }"
         >
           <span class="step-dot" />
-          <span>{{ step.label }}</span>
+          <span class="step-body">
+            <span class="step-line">{{ stepTitle(idx) }}</span>
+            <span v-if="stepSub(idx) !== null" class="step-sub">{{ stepSub(idx) }}</span>
+          </span>
         </li>
       </ol>
+      <p v-if="stallHint" class="hint stall" role="status">{{ stallHint }}</p>
       <p v-if="phase === 'done' && report?.skipped" class="hint">
         文件内容未变化（指纹命中），已跳过——零 LLM 调用、零写入。
       </p>
@@ -184,6 +287,10 @@ function pageTypeLabel(kind: PageKind): string {
     <section v-if="report && phase === 'done'" class="card result success">
       <h3>{{ report.skipped ? '指纹命中，已跳过' : manualPending ? '摄取完成（Draft 未落盘）' : '摄取完成' }}</h3>
       <dl class="meta">
+        <div class="meta-row">
+          <dt>导入</dt>
+          <dd>{{ report.newly_imported ? `已导入 ${report.imported_raw_path}` : `已在库：${report.imported_raw_path}` }}</dd>
+        </div>
         <div class="meta-row">
           <dt>Source</dt>
           <dd>{{ report.source_title }}</dd>
@@ -224,6 +331,40 @@ function pageTypeLabel(kind: PageKind): string {
           </tr>
         </tbody>
       </table>
+
+      <template v-if="report.llm_calls && report.llm_calls.length > 0">
+        <h4 class="pages-title">LLM 调用统计（{{ report.llm_calls.length }} 次）</h4>
+        <table class="pages-table">
+          <thead>
+            <tr>
+              <th>档位</th>
+              <th>用途</th>
+              <th>尝试</th>
+              <th>输出字数</th>
+              <th>耗时</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(call, i) in report.llm_calls" :key="i">
+              <td>{{ call.tier === 'fast' ? '快速' : '强力' }}</td>
+              <td>{{ call.purpose === 'analyze' ? '分析' : '成文' }}</td>
+              <td>{{ call.attempt }}</td>
+              <td>{{ call.output_chars.toLocaleString() }}</td>
+              <td>{{ call.duration_ms >= 1000 ? `${(call.duration_ms / 1000).toFixed(1)}s` : `${call.duration_ms}ms` }}</td>
+              <td>
+                <span :title="call.error ?? ''">{{
+                  call.outcome === 'ok' ? '成功'
+                  : call.outcome === 'oversized' ? '超限熔断'
+                  : call.outcome === 'parse_failed' ? '解析失败'
+                  : '调用错误'
+                }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="hint">完整统计同步记录在 Vault 的 .corpus/llm-calls.log（不含任何 prompt / 输出原文）。</p>
+      </template>
     </section>
   </main>
 </template>
@@ -233,7 +374,7 @@ function pageTypeLabel(kind: PageKind): string {
   width: 100%;
   max-width: 760px;
   margin: 0 auto;
-  padding: 40px 24px 64px;
+  padding: 28px 24px 48px;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -242,6 +383,15 @@ function pageTypeLabel(kind: PageKind): string {
 .page-header .subtitle {
   color: var(--text-muted);
   margin-top: 6px;
+}
+
+.page-header .vault-line {
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.page-header .vault-line code {
+  font-size: 12px;
 }
 
 .step h3 {
@@ -265,18 +415,6 @@ function pageTypeLabel(kind: PageKind): string {
 
 .field-label:first-of-type {
   margin-top: 0;
-}
-
-.select {
-  width: 100%;
-  min-height: 38px;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--text-strong);
-  font-size: 13px;
-  font-family: var(--mono);
 }
 
 .path-row {
@@ -305,12 +443,6 @@ function pageTypeLabel(kind: PageKind): string {
   margin-top: 10px;
   font-size: 13px;
   color: var(--text-muted);
-}
-
-.load-error p {
-  font-size: 14px;
-  color: var(--danger);
-  word-break: break-all;
 }
 
 .actions {
@@ -371,6 +503,7 @@ function pageTypeLabel(kind: PageKind): string {
   font-size: 13px;
   color: var(--text-muted);
   background: var(--surface);
+  min-width: 0;
 }
 
 .step-item.active {
@@ -391,6 +524,33 @@ function pageTypeLabel(kind: PageKind): string {
   border-radius: 50%;
   background: currentColor;
   flex: none;
+}
+
+.step-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.step-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.step-sub {
+  font-size: 11px;
+  font-weight: 400;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hint.stall {
+  color: var(--text-strong);
+  font-size: 12px;
 }
 
 .result.error {

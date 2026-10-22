@@ -8,34 +8,95 @@
 //! - system prompt 经 `AgentBuilder::preamble()` 注入；
 //! - DynModel 是 `Clone`（Arc 内部），端口持有一次构造的模型即可。
 
+use futures_util::StreamExt;
+use rig::agent::MultiTurnStreamItem;
 use rig::operation::Completion;
 use rig::providers::anthropic::AnthropicConfig;
 use rig::providers::openai::{OpenAIConfig, Route};
+use rig::streaming::{Item, StreamEvent};
 use rig::{AgentBuilder, DynModel};
 
 use crate::config::{ModelTier, ProviderKind};
 use crate::error::{Error, Result};
 use crate::llm::{test_connection_with, ConnectionReport, LlmPort};
 
-/// LlmPort 的 Rig 实现：持有构造好的 `DynModel<Completion>`。
+/// LlmPort 的 Rig 实现：持有构造好的 `DynModel<Completion>` 与可选的
+/// 服务端输出上限（token）。
+///
+/// `max_tokens` 是 `AgentBuilder` 的**构建期**参数（rig 0.44），而
+/// `complete` / `complete_stream` 协议无法按调用携带用途——因此上限在
+/// 端口构造时预设：Ingest 两条路径与档位一一对应（fast 只用于分析、
+/// strong 只用于成文），按档位构造端口即等价于按用途设限（取舍见
+/// [`build_llm_port_with_cap`]）。这是服务端硬顶（第一道闸），引擎侧
+/// 的字符熔断是第二道闸（见 [`crate::ingest`]）。
 pub struct RigLlmPort {
     model: DynModel<Completion>,
+    max_tokens: Option<u64>,
+}
+
+impl RigLlmPort {
+    /// 按本次调用的 system（可选）构造 AgentBuilder，应用端口预设的
+    /// preamble 与 max_tokens（两处构建共用）。
+    fn agent_builder(&self, system: Option<&str>) -> AgentBuilder {
+        let mut builder = AgentBuilder::new(self.model.clone());
+        if let Some(system) = system {
+            builder = builder.preamble(system);
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            builder = builder.max_tokens(max_tokens);
+        }
+        builder
+    }
 }
 
 #[async_trait::async_trait]
 impl LlmPort for RigLlmPort {
     async fn complete(&self, system: Option<&str>, user: &str) -> Result<String> {
-        let mut builder = AgentBuilder::new(self.model.clone());
-        if let Some(system) = system {
-            builder = builder.preamble(system);
-        }
-        let agent = builder.build();
+        let agent = self.agent_builder(system).build();
         let response = agent
             .prompt(user.to_string())
             .max_turns(1)
             .await
             .map_err(|e| Error::Llm(e.to_string()))?;
         Ok(response.output())
+    }
+
+    /// 真流式：`agent.prompt(..).stream()` 循环消费 [`MultiTurnStreamItem`]，
+    /// 文本增量一到达就回调 `on_delta`；终值以 `FinalResponse` 的聚合文本
+    /// 为准（`PromptResponse::output()` 与非流式 [`LlmPort::complete`]
+    /// 同源，返回语义一致）。流意外提前结束时以已聚合增量兜底。
+    async fn complete_stream(
+        &self,
+        system: Option<&str>,
+        user: &str,
+        on_delta: &mut (dyn for<'s> FnMut(&'s str) + Send),
+    ) -> Result<String> {
+        let agent = self.agent_builder(system).build();
+        let mut stream = agent.prompt(user.to_string()).max_turns(1).stream();
+        let mut aggregated = String::new();
+        while let Some(item) = stream.next().await {
+            match item.map_err(|e| Error::Llm(e.to_string()))? {
+                MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                    text,
+                    ..
+                })) => {
+                    aggregated.push_str(&text);
+                    on_delta(&text);
+                }
+                MultiTurnStreamItem::FinalResponse(response) => {
+                    return Ok(response.output());
+                }
+                _ => {}
+            }
+        }
+        if aggregated.is_empty() {
+            Err(Error::Llm(
+                "流式响应提前结束（未产生任何文本与最终结果）".to_string(),
+            ))
+        } else {
+            // 无 FinalResponse 的异常结束：增量聚合兜底，不丢已到手的输出
+            Ok(aggregated)
+        }
     }
 }
 
@@ -123,10 +184,28 @@ pub fn build_model(tier: &ModelTier, api_key: &str) -> Result<DynModel<Completio
 }
 
 /// 按档位构造端口：校验配置 → 从环境变量解析 key → 工厂建模型。
+///
+/// 不设输出上限（连通测试等最小调用用这个；上限对只回一个词的探针
+/// 无意义）。
 pub fn build_llm_port(tier: &ModelTier) -> Result<RigLlmPort> {
+    build_llm_port_with_cap(tier, None)
+}
+
+/// 按档位构造端口并预设服务端输出上限（token，`AgentBuilder::max_tokens`，
+/// rig 0.44 构建期参数）。
+///
+/// 取舍：`complete` / `complete_stream` 协议无法按调用携带用途参数，
+/// `max_tokens` 只能在端口构造时定死；Ingest 的两条路径与档位一一对应
+/// （fast 档只用于分析、strong 档只用于成文），因此调用方按档位传上限
+/// 即等价于按用途设限——桌面壳对 fast 档传 [`crate::llm::ANALYSIS_MAX_TOKENS`]、
+/// strong 档传 [`crate::llm::COMPOSE_MAX_TOKENS`]。这是服务端硬顶
+/// （第一道闸）；引擎侧还有按字符数的熔断（第二道闸，见 [`crate::ingest`]），
+/// 两道闸独立生效。
+pub fn build_llm_port_with_cap(tier: &ModelTier, max_tokens: Option<u64>) -> Result<RigLlmPort> {
     let api_key = tier.resolve_api_key()?;
     Ok(RigLlmPort {
         model: build_model(tier, &api_key)?,
+        max_tokens,
     })
 }
 
@@ -275,5 +354,32 @@ mod tests {
             Ok(_) => panic!("期望 MissingApiKey，实际成功构造"),
             Err(other) => panic!("期望 MissingApiKey，实际 {other}"),
         }
+    }
+
+    /// 上限是端口构造期预设（complete 协议无法按调用携带）：带 cap 构造
+    /// 的端口持有该值，build_llm_port 保持无上限（连通探针不设限）。
+    /// 字段值会被 agent_builder 应用于 AgentBuilder::max_tokens（构建期
+    /// 参数，与 preamble 同链），此处断言预设语义。
+    #[test]
+    fn port_carries_configured_output_cap() {
+        let model = build_model(
+            &tier(
+                ProviderKind::OpenAICompatible,
+                "qwen3-max",
+                Some("https://gw/v1"),
+            ),
+            "key",
+        )
+        .expect("构造 DynModel 失败");
+        let capped = RigLlmPort {
+            model: model.clone(),
+            max_tokens: Some(crate::llm::ANALYSIS_MAX_TOKENS),
+        };
+        assert_eq!(capped.max_tokens, Some(20_000));
+        let uncapped = RigLlmPort {
+            model,
+            max_tokens: None,
+        };
+        assert_eq!(uncapped.max_tokens, None);
     }
 }

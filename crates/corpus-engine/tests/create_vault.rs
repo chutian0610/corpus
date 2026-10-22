@@ -62,10 +62,11 @@ fn create_vault_creates_complete_skeleton_for_every_template() {
             template.id
         );
 
-        // .corpus/.gitignore 忽略指纹缓存 state.db（可再生，不入库）
+        // .corpus/.gitignore 忽略指纹缓存 state.db 与 LLM 调用日志
+        // llm-calls.log（可再生 / 本地诊断数据，不入库）
         assert_eq!(
             fs::read_to_string(root.join(".corpus/.gitignore")).unwrap(),
-            "state.db\n"
+            "state.db\nllm-calls.log\n"
         );
 
         // vault.json 记录模板绑定，且可经公共 API 读回
@@ -172,6 +173,28 @@ fn existing_empty_directory_is_accepted() {
     assert!(root.join("wiki/index.md").exists());
     let status = git(&root, &["status", "--porcelain"]);
     assert!(status.is_empty(), "工作区不干净：{status}");
+}
+
+#[test]
+fn existing_corpus_vault_is_rejected_with_open_guidance() {
+    // 目标已是 Corpus Vault：报 AlreadyAVault（引导「打开」）而非泛泛的
+    // VaultPathExists，且目录保持原样
+    let (_dir, root) = fresh_vault_path("vault");
+    create_vault(&root, &TemplateId::from("generic")).expect("首次创建应成功");
+
+    let err = create_vault(&root, &TemplateId::from("research")).unwrap_err();
+    assert!(matches!(err, Error::AlreadyAVault { .. }), "got: {err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("该目录已是一个 Vault") && message.contains("请从启动页打开"),
+        "错误信息须引导打开而非重复创建：{message}"
+    );
+
+    // 模板绑定不受影响（仍是首次创建时的 generic）
+    assert_eq!(
+        corpus_engine::vault_template_id(&root).unwrap(),
+        TemplateId::from("generic")
+    );
 }
 
 #[test]

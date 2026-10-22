@@ -1,5 +1,7 @@
 /** 展示层翻译：模板 id → 中文名。id 集合与清单以引擎下发的 TemplateInfo 为准 */
 
+import type { PageKind } from './api'
+
 export const TEMPLATE_DISPLAY_NAMES: Record<string, string> = {
   generic: '通用知识库',
   research: '研究',
@@ -23,10 +25,31 @@ export const PROVIDER_OPTIONS: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'openai_compatible', label: 'OpenAI 兼容端点' },
 ]
 
+/** 页面类型 → 中文标签（引擎 PageKind 的展示层单一口径）。
+ *
+ * 文件面板的分组标题与摄取产出表的类型徽标共用这一处定义，
+ * 新增页面类型时只改这里（同 TEMPLATE_DISPLAY_NAMES 模式）。 */
+export const PAGE_TYPE_LABELS: Record<PageKind, string> = {
+  source: 'Source 页',
+  entity: 'Entity',
+  concept: 'Concept',
+}
+
 /** RFC3339 时间戳 → 本地化展示 */
 export function formatDateTime(iso: string): string {
   const date = new Date(iso)
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
+}
+
+/** 路径最后一段（目录名 / 文件名），兼容 Windows 分隔符 */
+export function pathBasename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  return parts.length > 0 ? parts[parts.length - 1] : path
+}
+
+/** 页面路径（相对 wiki/）的展示名：末段文件名去 .md 后缀 */
+export function pageDisplayName(path: string): string {
+  return pathBasename(path).replace(/\.md$/, '')
 }
 
 /** 把 Tauri invoke 抛出的错误统一转为可展示文本。
