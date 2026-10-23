@@ -11,15 +11,17 @@ import WorkspaceRibbon from './components/WorkspaceRibbon.vue'
 import FilePanel from './components/FilePanel.vue'
 import PagePreview from './components/PagePreview.vue'
 import IngestPage from './components/IngestPage.vue'
+import QueryPage from './components/QueryPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import StatusBar from './components/StatusBar.vue'
 import { listRecentVaults, type PageEntry } from './api'
 import { errorMessage } from './display'
 import { closeVault, currentVault, openVault, pageTree } from './vault-state'
+import { resetQuerySession } from './query-state'
 
-/** 主区形态：功能面板（摄取 / 设置）或文件预览。
+/** 主区形态：功能面板（摄取 / 查询 / 设置）或文件预览。
  *  多标签页与右侧边栏明确不做（T4 随页面浏览一起做）。 */
-type MainPanel = 'ingest' | 'settings' | 'preview'
+type MainPanel = 'ingest' | 'query' | 'settings' | 'preview'
 
 const booting = ref(true)
 const startupError = ref<string | null>(null)
@@ -47,7 +49,7 @@ onMounted(async () => {
   }
 })
 
-function selectPanel(panel: 'ingest' | 'settings'): void {
+function selectPanel(panel: 'ingest' | 'query' | 'settings'): void {
   activePanel.value = panel
 }
 
@@ -85,12 +87,13 @@ function onConfigSaved(): void {
   configVersion.value++
 }
 
-/** 切换 Vault：回启动页，清选中、回退栈与面板态。 */
+/** 切换 Vault：回启动页，清选中、回退栈、面板态与会话内问答历史。 */
 function switchVault(): void {
   closeVault()
   activePanel.value = 'ingest'
   selectedPage.value = null
   backStack.value = []
+  resetQuerySession()
 }
 </script>
 
@@ -108,6 +111,7 @@ function switchVault(): void {
     <FilePanel :selected="selectedPage?.path ?? null" @select="openPreview" />
     <main class="main-area">
       <IngestPage v-if="activePanel === 'ingest'" />
+      <QueryPage v-else-if="activePanel === 'query'" @navigate="navigateTo" />
       <SettingsPage v-else-if="activePanel === 'settings'" @saved="onConfigSaved" />
       <PagePreview
         v-else-if="selectedPage"
