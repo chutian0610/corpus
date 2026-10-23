@@ -263,12 +263,12 @@ export type IngestProgress =
 /** 查询进度事件 payload（引擎 QueryEvent，tag=stage）。
  *
  *  searching 带词法词项；answering 是 LLM 流式（同阶段重复事件携带
- *  递增 chars，引擎侧已节流合并，chars=0 表示阶段开始——与 ingest
- *  同口径，只报字数不报内容）；done 表示查询完成（结果在
- *  queryAsk() 的 Promise 结果里）。 */
+ *  递增 chars 与**累积回答文本** answer，引擎侧已节流合并，chars=0
+ *  表示阶段开始——与 ingest 同口径的节流，文本供回答区流式渲染）；
+ *  done 表示查询完成（结果在 queryAsk() 的 Promise 结果里）。 */
 export type QueryProgress =
   | { stage: 'searching'; terms: string[] }
-  | { stage: 'answering'; chars: number }
+  | { stage: 'answering'; chars: number; answer: string }
   | { stage: 'done' }
 
 /** 词法打分后的候选页（引擎 ScoredPage，score 降序）。 */

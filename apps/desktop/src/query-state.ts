@@ -33,6 +33,9 @@ export const phase = ref<QueryPhase>('idle')
 export const searchTerms = ref<string[]>([])
 /** answering 阶段已接收字符数（引擎流式 chars，已节流）。 */
 export const answerChars = ref(0)
+/** answering 阶段的累积回答文本（引擎随事件下发，节流快照，单调
+ *  增长）——回答区流式渲染的数据源；完成后完整回答走历史条目。 */
+export const answerText = ref('')
 /** 最近一次查询的错误（null = 无）。 */
 export const queryError = ref<string | null>(null)
 /** 会话内问答历史（本次打开应用以来）。 */
@@ -52,8 +55,11 @@ function ensureProgressListener(): void {
       searchTerms.value = progress.terms
     } else if (progress.stage === 'answering') {
       phase.value = 'answering'
-      // 同阶段 chars 单调递增（重连等异常下也不回退）
+      // 同阶段 chars / 累积文本单调递增（重连等异常下也不回退）
       if (progress.chars > answerChars.value) answerChars.value = progress.chars
+      if (progress.answer.length >= answerText.value.length) {
+        answerText.value = progress.answer
+      }
     }
     // done：结果经 queryAsk 的 Promise 到达，事件只作阶段收尾信号
   })
@@ -67,6 +73,7 @@ export async function askQuestion(vaultPath: string, question: string): Promise<
   phase.value = 'searching'
   searchTerms.value = []
   answerChars.value = 0
+  answerText.value = ''
   queryError.value = null
   ensureProgressListener()
   try {
@@ -99,5 +106,6 @@ export function resetQuerySession(): void {
   history.value = []
   searchTerms.value = []
   answerChars.value = 0
+  answerText.value = ''
   queryError.value = null
 }

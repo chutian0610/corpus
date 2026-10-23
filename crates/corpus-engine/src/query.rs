@@ -7,14 +7,16 @@
 //!    候选（[`SEARCH_TOP_N`]）。词法层是查询的第一级，独立可测
 //!    （验收：候选选取不依赖 LLM）；
 //! 2. 读候选页正文（每页截断至 [`QUERY_CONTEXT_PAGE_MAX_CHARS`]，防
-//!    上下文爆炸）→ [`LlmPort::complete_stream`] 综合（system 指示：
-//!    只基于给定页面回答、引用必须用候选页的 `[[path|title]]` 形式、
-//!    不知道就说不知道），流式增量经节流上报 [`QueryEvent::Answering`]；
+//!    上下文爆炸；正文复用检索扫描已读出的内容，不二次读盘）→
+//!    [`LlmPort::complete_stream`] 综合（system 指示：只基于给定页面
+//!    回答、引用必须用候选页的 `[[path|title]]` 形式、不知道就说不知
+//!    道），流式增量经节流聚合后随 [`QueryEvent::Answering`] 上报
+//!    （字数 + 累积回答文本，前端流式渲染）；
 //! 3. 沉淀：`config.query_pages == true` 时经与 ingest apply 同一事务
 //!    核心（[`crate::ingest::write_pages_and_commit`]：原子写 + index
 //!    全量重建 + log 追加 + 恰好一个提交）落 Query page
-//!    （type=query，title=问题截断，body=完整回答，related=候选页，
-//!    aliases=[问题]）；false 时跳过落盘。
+//!    （type=query，title=问题截断，body=完整回答，related=回答实际
+//!    引用到的候选页，aliases=[问题]）；false 时跳过落盘。
 //!
 //! 边界行为：无候选页 → 直接返回「知识库中没有相关页面」，**不调
 //! LLM、不沉淀**（没有上下文的综合只会幻觉，落盘只会垃圾）；LLM 调用
@@ -67,7 +69,7 @@ plainly (e.g. \"知识库中没有相关内容\") instead of guessing. Answer in
 language of the question (default to Chinese).";
 
 /// 查询进度事件（tag=stage 风格，与 IngestStage 同口径）：
-/// `Searching` → `Answering`（流式增量，节流沿用 ingest 模式）→ `Done`。
+/// `Searching` → `Answering`（流式快照，节流沿用 ingest 模式）→ `Done`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum QueryEvent {
@@ -76,12 +78,17 @@ pub enum QueryEvent {
         /// 分词产物（去重排序；CJK 按字/二元组 + ASCII 按词）。
         terms: Vec<String>,
     },
-    /// LLM 综合回答中：同阶段重复事件携带递增 `chars`（模型已输出
-    /// 字符数，节流口径同 ingest），`chars: 0` 表示阶段开始。只报字数
-    /// 不报内容——增量内容会在完成后随结果整体到达。
+    /// LLM 综合回答中：同阶段重复事件携带节流后的进度快照——`chars`
+    /// 为模型已输出字符数（口径同 ingest，`0` 表示阶段开始），`answer`
+    /// 为**累积回答文本**（节流时刻的聚合前缀，单调增长；未闭合的
+    /// `[[` 由前端渲染管线天然按文本容错，完成后完整渲染）。回答会
+    /// 剧透的顾虑不成立（Query page 的正文就是回答本身），流式呈现
+    /// 是查询面板的核心体验。
     Answering {
         /// 模型已输出的字符数（0 = 阶段开始）。
         chars: usize,
+        /// 累积回答文本（节流快照；`chars: 0` 时为空串）。
+        answer: String,
     },
     /// 查询完成（结果与沉淀信息在返回值 `QueryOutcome` 中）。
     Done,
@@ -217,6 +224,24 @@ fn score_page(terms: &[String], title: &str, aliases: &[String], body: &str) -> 
 /// 单页解析失败宽松跳过（与 list_pages 同哲学）；非 Vault 报
 /// [`Error::NotAVault`]；空白问题（分词为空）返回空候选。
 pub fn search_pages(vault_root: impl AsRef<Path>, question: &str) -> Result<Vec<ScoredPage>> {
+    let ranked = search_ranked_pages(vault_root, question)?;
+    Ok(ranked.into_iter().map(|c| c.page).collect())
+}
+
+/// 词法候选检索的完整形态（内部 API）：候选页带着**检索扫描时已读出
+/// 的正文**——编排层拼 LLM 上下文直接复用，消除二次 fs 读。
+struct ScoredCandidate {
+    /// 公共候选信息（path/title/score）。
+    page: ScoredPage,
+    /// 页面正文（检索时已读出）。
+    body: String,
+}
+
+/// [`search_pages`] 的完整形态（编排层用）：见其文档。
+fn search_ranked_pages(
+    vault_root: impl AsRef<Path>,
+    question: &str,
+) -> Result<Vec<ScoredCandidate>> {
     let root = vault_root.as_ref();
     if !root.join("wiki").is_dir() {
         return Err(Error::NotAVault {
@@ -228,7 +253,7 @@ pub fn search_pages(vault_root: impl AsRef<Path>, question: &str) -> Result<Vec<
     if terms.is_empty() {
         return Ok(Vec::new());
     }
-    let mut scored: Vec<ScoredPage> = Vec::new();
+    let mut scored: Vec<ScoredCandidate> = Vec::new();
     for page in scan_pages(root)? {
         let score = score_page(
             &terms,
@@ -237,14 +262,22 @@ pub fn search_pages(vault_root: impl AsRef<Path>, question: &str) -> Result<Vec<
             &page.body,
         );
         if score > 0 {
-            scored.push(ScoredPage {
-                path: page.path,
-                title: page.frontmatter.title,
-                score,
+            scored.push(ScoredCandidate {
+                page: ScoredPage {
+                    path: page.path,
+                    title: page.frontmatter.title,
+                    score,
+                },
+                body: page.body,
             });
         }
     }
-    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    scored.sort_by(|a, b| {
+        b.page
+            .score
+            .cmp(&a.page.score)
+            .then_with(|| a.page.path.cmp(&b.page.path))
+    });
     scored.truncate(SEARCH_TOP_N);
     Ok(scored)
 }
@@ -321,7 +354,7 @@ where
     // 第一级：词法候选（确定性，零 LLM）。
     let terms = tokenize_question(&question);
     on_event(QueryEvent::Searching { terms });
-    let candidates = search_pages(vault_root, &question)?;
+    let candidates = search_ranked_pages(vault_root, &question)?;
 
     // 无候选：不调 LLM、不沉淀（没有上下文的综合只会幻觉）。
     if candidates.is_empty() {
@@ -336,18 +369,32 @@ where
         });
     }
 
-    // 第二级：候选正文 → LLM 综合（流式增量经节流上报）。
-    let context = build_context(vault_root, &candidates)?;
-    on_event(QueryEvent::Answering { chars: 0 });
-    let answer = synthesize(vault_root, port, &question, &context, &mut |chars| {
-        on_event(QueryEvent::Answering { chars })
-    })
+    // 第二级：候选正文（检索时已读出，直接复用）→ LLM 综合（流式
+    // 增量经节流聚合，字数 + 累积文本随事件上报）。
+    let context = build_context(&candidates);
+    on_event(QueryEvent::Answering {
+        chars: 0,
+        answer: String::new(),
+    });
+    let answer = synthesize(
+        vault_root,
+        port,
+        &question,
+        &context,
+        &mut |chars, answer| {
+            on_event(QueryEvent::Answering {
+                chars,
+                answer: answer.to_string(),
+            })
+        },
+    )
     .await?;
-    let citations = extract_citations(&answer, &candidates);
+    let candidate_pages: Vec<ScoredPage> = candidates.iter().map(|c| c.page.clone()).collect();
+    let citations = extract_citations(&answer, &candidate_pages);
 
     // 沉淀：Query page（配置可关闭；与 ingest apply 同一事务核心）。
     let (query_page_path, commit) = if config.query_pages {
-        let page = build_query_page(vault_root, &question, &answer, &candidates)?;
+        let page = build_query_page(vault_root, &question, &answer, &citations)?;
         let commit = settle(vault_root, &page)?;
         (Some(page.path), Some(commit))
     } else {
@@ -358,7 +405,7 @@ where
     Ok(QueryOutcome {
         question,
         answer,
-        candidates,
+        candidates: candidate_pages,
         citations,
         query_page_path,
         commit,
@@ -386,52 +433,51 @@ where
 }
 
 /// 拼装候选页上下文：每页一段，wikilink 形式标题 + 截断后的正文。
-fn build_context(vault_root: &Path, candidates: &[ScoredPage]) -> Result<String> {
-    let wiki = vault_root.join("wiki");
+/// 正文直接消费检索扫描（[`search_ranked_pages`]）已读出的内容，
+/// 不二次读盘；单页截断至 [`QUERY_CONTEXT_PAGE_MAX_CHARS`]。
+fn build_context(candidates: &[ScoredCandidate]) -> String {
     let mut context = String::new();
     for candidate in candidates {
-        let content = fs::read_to_string(wiki.join(&candidate.path)).unwrap_or_default();
-        let body = match parse_page(&content) {
-            Ok((_, body)) => body,
-            // 检索时还能解析、此刻读不出的竞争情况：正文留空不阻断
-            Err(_) => String::new(),
-        };
         let link = candidate
+            .page
             .path
             .strip_suffix(".md")
-            .unwrap_or(&candidate.path);
+            .unwrap_or(&candidate.page.path);
         context.push_str(&format!(
             "\n## {}\n\n{}\n",
-            wikilink(link, &candidate.title),
-            truncate_chars(body.trim(), QUERY_CONTEXT_PAGE_MAX_CHARS)
+            wikilink(link, &candidate.page.title),
+            truncate_chars(candidate.body.trim(), QUERY_CONTEXT_PAGE_MAX_CHARS)
         ));
     }
-    Ok(context)
+    context
 }
 
-/// LLM 综合一次：流式增量经节流上报 chars（口径同 ingest，常量复用），
-/// 聚合结果即回答（自由文本，无解析/重试层）；调用记入 llm-calls.log
-///（用途 query，失败自动落 debug 日志——诊断口径与 ingest 一致）。
+/// LLM 综合一次：流式增量经节流聚合后随 `on_progress` 上报（chars +
+/// 累积文本快照，口径同 ingest，常量复用），聚合结果即回答（自由文
+/// 本，无解析/重试层）；调用记入 llm-calls.log（用途 query，失败自动
+/// 落 debug 日志——诊断口径与 ingest 一致）。
 async fn synthesize(
     vault_root: &Path,
     port: &dyn LlmPort,
     question: &str,
     context: &str,
-    on_chars: &mut (dyn FnMut(usize) + Send),
+    on_progress: &mut (dyn FnMut(usize, &str) + Send),
 ) -> Result<String> {
     let user = format!("# 问题\n\n{question}\n\n# 候选页面\n{context}");
     let mut recorder = crate::ingest::LlmCallRecorder::new(vault_root);
     let start = std::time::Instant::now();
     let mut chars = 0usize;
+    let mut buffer = String::new();
     let mut reported = 0usize;
     let mut last_report = std::time::Instant::now();
     let result = port
         .complete_stream(Some(ANSWER_SYSTEM_PROMPT), &user, &mut |delta| {
+            buffer.push_str(delta);
             chars += delta.chars().count();
             if last_report.elapsed() >= REPORT_MIN_INTERVAL
                 || chars - reported >= REPORT_MIN_NEW_CHARS
             {
-                on_chars(chars);
+                on_progress(chars, &buffer);
                 reported = chars;
                 last_report = std::time::Instant::now();
             }
@@ -441,7 +487,7 @@ async fn synthesize(
         Ok(answer) => {
             // 补一次终值（尾部增量可能未达节流阈值）
             if chars != reported {
-                on_chars(chars);
+                on_progress(chars, &buffer);
             }
             recorder.record(LlmCallStats {
                 ts: chrono::Local::now().to_rfc3339(),
@@ -492,54 +538,49 @@ async fn synthesize(
     }
 }
 
-/// 从回答中提取引用：扫描 `[[target|label]]`，target 归一化后与候选页
-/// 的路径（去 `.md`）或标题匹配；按回答中的出现顺序去重，未命中候选
-/// 的目标忽略（防伪造引用混进引用列表）。
+/// 从回答中提取引用：扫描 `[[target|label]]`（[`crate::page::extract_wikilink_targets`]
+/// 单一解析实现），target 归一化后与候选页的路径（去 `.md`）或标题
+/// 匹配；按回答中的出现顺序去重，未命中候选的目标忽略（防伪造引用
+/// 混进引用列表）。
 fn extract_citations(answer: &str, candidates: &[ScoredPage]) -> Vec<QueryCitation> {
     let mut out: Vec<QueryCitation> = Vec::new();
-    let mut rest = answer;
-    while let Some(pos) = rest.find("[[") {
-        let after = &rest[pos + 2..];
-        let Some(end) = after.find("]]") else {
-            break; // 未闭合：其后不会再有完整链接
-        };
-        let inner = &after[..end];
-        let target = inner.split_once('|').map_or(inner, |(t, _)| t).trim();
-        if !target.is_empty() {
-            let norm = normalize_name(target);
-            let matched = candidates.iter().find(|c| {
-                normalize_name(c.path.strip_suffix(".md").unwrap_or(&c.path)) == norm
-                    || normalize_name(&c.title) == norm
-            });
-            if let Some(c) = matched {
-                let citation = QueryCitation {
-                    path: c.path.clone(),
-                    title: c.title.clone(),
-                };
-                if !out.contains(&citation) {
-                    out.push(citation);
-                }
+    for target in crate::page::extract_wikilink_targets(answer) {
+        let norm = normalize_name(&target);
+        let matched = candidates.iter().find(|c| {
+            normalize_name(c.path.strip_suffix(".md").unwrap_or(&c.path)) == norm
+                || normalize_name(&c.title) == norm
+        });
+        if let Some(c) = matched {
+            let citation = QueryCitation {
+                path: c.path.clone(),
+                title: c.title.clone(),
+            };
+            if !out.contains(&citation) {
+                out.push(citation);
             }
         }
-        rest = &after[end + 2..];
     }
     out
 }
 
-/// 组装 Query page：title = 问题截断；aliases = [问题]（title 自身在
-/// 集合内由 [`merge_aliases`] 兜底）；related = 候选页 wikilink；
-/// body = 完整回答；tags = [query]。同题（title 或别名归一化相等的
-/// 既有 Query page）→ 更新原页（保留 path/created，别名并集）——重复
-/// 追问不产生重复页面，与 ingest 精确名去重同哲学。
+/// 组装 Query page：title = 问题截断（**仅显示与路径 slug 用**）；
+/// aliases = [问题]（title 自身在集合内由 [`merge_aliases`] 兜底）；
+/// related = **回答实际引用到的候选页**（citations，对齐 CONTEXT.md
+/// 「记录问题、回答与引用过的页面」口径；无引用则空）；body = 完整
+/// 回答；tags = [query]。同题去重键是**完整问题**（问题原文或别名与
+/// 既有 Query page 的 title/aliases 归一化相等）→ 更新原页（保留
+/// path/created，别名并集）——重复追问不产生重复页面；前 30 字相同
+/// 但完整问题不同的两个提问互不命中，各自成页，与 ingest 精确名去重
+/// 同哲学。
 fn build_query_page(
     vault_root: &Path,
     question: &str,
     answer: &str,
-    candidates: &[ScoredPage],
+    citations: &[QueryCitation],
 ) -> Result<PageDraft> {
     let title = truncate_chars(question, QUERY_TITLE_MAX_CHARS);
     let now = chrono::Local::now().to_rfc3339();
-    let existing = find_existing_query(vault_root, &title);
+    let existing = find_existing_query(vault_root, question);
     let (path, created, mut aliases) = match &existing {
         Some(old) => (old.0.clone(), old.1.created.clone(), old.1.aliases.clone()),
         None => (
@@ -549,7 +590,7 @@ fn build_query_page(
         ),
     };
     merge_aliases(&mut aliases, &[question.to_string()], &title);
-    let related = candidates
+    let related = citations
         .iter()
         .map(|c| wikilink(c.path.strip_suffix(".md").unwrap_or(&c.path), &c.title))
         .collect();
@@ -577,11 +618,13 @@ fn build_query_page(
     })
 }
 
-/// 同题既有 Query page（路径 + frontmatter）：title 或任一别名与
-/// `title` 归一化相等即命中；解析失败的单页跳过。
-fn find_existing_query(vault_root: &Path, title: &str) -> Option<(String, PageFrontmatter)> {
+/// 同题既有 Query page（路径 + frontmatter）：去重键是**完整问题**
+/// `question`（归一化）——既有页的 title 或任一别名与它归一化相等即
+/// 命中（问题原文落在 aliases，≤30 字的问题同时就是 title）。title
+/// 是问题截断（仅显示/路径用），不参与去重键。解析失败的单页跳过。
+fn find_existing_query(vault_root: &Path, question: &str) -> Option<(String, PageFrontmatter)> {
     let dir = vault_root.join("wiki").join(PageKind::Query.dir());
-    let norm = normalize_name(title);
+    let norm = normalize_name(question);
     for entry in fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {

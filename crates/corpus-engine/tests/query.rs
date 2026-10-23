@@ -278,7 +278,8 @@ async fn query_full_chain_streams_cites_and_settles() {
     );
     assert!(user.contains(question), "问题应原样进入 user 消息");
 
-    // 流式事件：Searching（带词项）→ Answering（0 → 递增）→ Done
+    // 流式事件：Searching（带词项）→ Answering（0 → 递增 chars + 累积
+    // 文本）→ Done
     let events = events.lock().unwrap().clone();
     assert!(
         matches!(&events[0], QueryEvent::Searching { terms } if !terms.is_empty()),
@@ -288,25 +289,37 @@ async fn query_full_chain_streams_cites_and_settles() {
         matches!(events[events.len() - 1], QueryEvent::Done),
         "{events:?}"
     );
-    let chars_seq: Vec<usize> = events
+    let snapshots: Vec<(usize, String)> = events
         .iter()
         .filter_map(|ev| match ev {
-            QueryEvent::Answering { chars } => Some(*chars),
+            QueryEvent::Answering { chars, answer } => Some((*chars, answer.clone())),
             _ => None,
         })
         .collect();
     assert_eq!(
-        chars_seq.first(),
-        Some(&0),
+        snapshots.first().map(|(chars, _)| *chars),
+        Some(0),
         "Answering 应以 chars=0 开始：{events:?}"
     );
     assert!(
-        chars_seq.windows(2).all(|w| w[0] <= w[1]),
-        "chars 单调递增：{chars_seq:?}"
+        snapshots.windows(2).all(|w| w[0].0 <= w[1].0),
+        "chars 单调递增：{:?}",
+        snapshots.iter().map(|(c, _)| c).collect::<Vec<_>>()
     );
     assert!(
-        *chars_seq.last().expect("应有 Answering 事件") > 0,
-        "流式应有非零增量：{chars_seq:?}"
+        snapshots.last().map(|(chars, _)| *chars).unwrap_or(0) > 0,
+        "流式应有非零增量：{snapshots:?}"
+    );
+    // 累积文本：逐条前缀增长，末条（节流终值）覆盖完整回答
+    assert!(
+        snapshots.windows(2).all(|w| w[1].1.starts_with(&w[0].1)),
+        "累积文本应前缀增长：{snapshots:?}"
+    );
+    let expected = answer_text();
+    assert!(
+        snapshots.len() >= 2
+            && snapshots.last().map(|(_, a)| a.as_str()) == Some(expected.as_str()),
+        "节流终值的累积文本应为完整回答：{snapshots:?}"
     );
 
     // 结果：回答 + 引用（按回答出现顺序，只含真实 wikilink 到的候选页）
@@ -339,13 +352,15 @@ async fn query_full_chain_streams_cites_and_settles() {
         fm.aliases
     );
     assert_eq!(fm.tags, vec!["query".to_string()]);
-    assert!(
-        fm.related.iter().any(|r| r.contains("concepts/自注意力"))
-            && fm
-                .related
-                .iter()
-                .any(|r| r.contains("sources/attention-is-all-you-need")),
-        "related 应含候选页 wikilink：{:?}",
+    // related = 回答**实际引用**的候选页（3 个候选中只引用了 2 个，未
+    // 引用的 entities/transformer 不进 related），按引用出现顺序
+    assert_eq!(
+        fm.related,
+        vec![
+            "[[concepts/自注意力|自注意力]]".to_string(),
+            "[[sources/attention-is-all-you-need|Attention Is All You Need]]".to_string(),
+        ],
+        "related 应等于实际引用（非全部候选）：{:?}",
         fm.related
     );
     assert_eq!(fm.sources, Vec::<String>::new(), "Query page 无 raw 溯源");
@@ -519,4 +534,105 @@ async fn query_rejects_blank_question_and_non_vault() {
         "{err:?}"
     );
     assert_eq!(port.call_count(), 0);
+}
+
+/// 验收（评审修正）：单页正文超过 [`QUERY_CONTEXT_PAGE_MAX_CHARS`]
+/// （4000 字）时注入 LLM 的上下文被截断——头部保留（含省略号）、
+/// 尾部哨兵不出现。
+#[tokio::test]
+async fn query_context_truncates_oversized_page_body() {
+    let (_dir, root) = setup_vault("vault");
+    let head = "开头可辨标记。";
+    let tail_marker = "尾部哨兵_TAIL_SENTINEL_不得注入";
+    let body = format!("{head}{}{tail_marker}", "正文段落。".repeat(1200));
+    assert!(body.chars().count() > corpus_engine::QUERY_CONTEXT_PAGE_MAX_CHARS);
+    write_entity_page(&root, "long", "长页", &body);
+
+    let port = ScriptedLlmPort::new(vec!["见 [[entities/long|长页]]。".to_string()]);
+    let outcome = query_with_port(&root, "长页", &port, &config_with(false), |_| {})
+        .await
+        .expect("查询失败");
+
+    let (_, user) = &port.recorded_calls()[0];
+    assert!(user.contains(head), "截断应保头部：{user}");
+    assert!(
+        !user.contains(tail_marker),
+        "超 4000 字的正文应被截断、尾部不得注入：{user}"
+    );
+    assert!(user.contains('…'), "截断应带省略号");
+    assert_eq!(outcome.answer, "见 [[entities/long|长页]]。");
+}
+
+/// 验收（评审修正）：同题去重键是**完整问题**——前 30 字相同但完整
+/// 问题不同的两个提问互不命中，沉淀为两个独立 Query page（各自别名
+/// 保留各自问题原文），后问不覆写先问的回答。
+#[tokio::test]
+async fn questions_sharing_title_prefix_settle_as_separate_pages() {
+    let (_dir, root) = setup_vault("vault");
+    ingest_sample(&root).await;
+
+    // 共同前缀 ≥ 30 字（title 截断后完全一致），尾部一字之差
+    let common = "Transformer 的自注意力机制在不同的序列长度与批次设置下分别有怎样的表现差异呢";
+    assert!(common.chars().count() >= 30);
+    let q1 = format!("{common}？甲版本");
+    let q2 = format!("{common}？乙版本");
+    assert_eq!(
+        truncate30(&q1),
+        truncate30(&q2),
+        "两个问题的 title 截断必须相同（测试前提）"
+    );
+
+    let first = query_with_port(
+        &root,
+        &q1,
+        &ScriptedLlmPort::new(vec!["甲的回答。".to_string()]),
+        &config_with(true),
+        |_| {},
+    )
+    .await
+    .expect("首次查询失败");
+    let path1 = first.query_page_path.clone().expect("应沉淀");
+
+    let second = query_with_port(
+        &root,
+        &q2,
+        &ScriptedLlmPort::new(vec!["乙的回答。".to_string()]),
+        &config_with(true),
+        |_| {},
+    )
+    .await
+    .expect("二次查询失败");
+    let path2 = second.query_page_path.clone().expect("应沉淀");
+
+    assert_ne!(path1, path2, "不同完整问题不得复用同一路径");
+    let queries = root.join("wiki/queries");
+    let count = fs::read_dir(&queries)
+        .expect("queries 目录应存在")
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|e| e.to_str()) == Some("md"))
+        .count();
+    assert_eq!(count, 2, "应有两个独立 Query page");
+
+    // 互不覆写：两页各保留自己的回答与问题别名，title 都是截断前缀
+    for (path, marker, question) in [(&path1, "甲的回答。", &q1), (&path2, "乙的回答。", &q2)]
+    {
+        let raw = fs::read_to_string(root.join("wiki").join(path)).unwrap();
+        let (fm, body) = corpus_engine::parse_page(&raw).expect("Query page 应合法");
+        assert_eq!(fm.title, truncate30(question), "title = 问题截断：{fm:?}");
+        assert!(
+            fm.aliases.iter().any(|a| a == question),
+            "别名应含完整问题：{:?}",
+            fm.aliases
+        );
+        assert!(body.contains(marker), "回答不得被另问覆写：{raw}");
+    }
+}
+
+/// 问题前 30 字截断（与引擎 QUERY_TITLE_MAX_CHARS 口径一致，测试断言用）。
+fn truncate30(question: &str) -> String {
+    let mut out: String = question.chars().take(30).collect();
+    if question.chars().count() > 30 {
+        out.push('…');
+    }
+    out
 }

@@ -131,3 +131,48 @@ export function parseMetaLink(item: string): MetaLink {
   const label = (m[2] ?? '').trim() || target
   return { target, label }
 }
+
+// ---------------------------------------------------------------------------
+// wikilink 点击处理（QueryPage 正文与 PagePreview 正文/元信息区共用）
+// ---------------------------------------------------------------------------
+
+/** 从容器点击事件里提取被点击 wikilink 的 data-target。
+ *
+ *  非 wikilink 点击返回 null（调用方直接返回）；命中时已 preventDefault
+ *  （wikilink 是受控 `<a>`，不能让浏览器导航走）。 */
+export function wikilinkTargetFromEvent(ev: MouseEvent): string | null {
+  const el = (ev.target as HTMLElement).closest('a.wikilink')
+  if (el === null) return null
+  ev.preventDefault()
+  return el.getAttribute('data-target') ?? ''
+}
+
+/** 解析 wikilink target 并分发：命中 → `onNavigate(页面路径)`；死链 →
+ *  `onDeadLink(target)`（未提供则静默忽略——QueryPage 的死链分支只是
+ *  不跳转，PagePreview 另有提示条）。 */
+export function dispatchWikilinkTarget(
+  target: string,
+  resolve: WikiLinkResolver,
+  onNavigate: (pagePath: string) => void,
+  onDeadLink?: (target: string) => void,
+): void {
+  const resolved = resolve(target)
+  if (resolved === null) {
+    onDeadLink?.(target)
+    return
+  }
+  onNavigate(resolved)
+}
+
+/** 容器点击委托的完整实现（正文区共用）：提取 target → 解析分发。
+ *  死链分支差异经 `onDeadLink` 参数注入（不传 = 忽略）。 */
+export function handleWikilinkClick(
+  ev: MouseEvent,
+  resolve: WikiLinkResolver,
+  onNavigate: (pagePath: string) => void,
+  onDeadLink?: (target: string) => void,
+): void {
+  const target = wikilinkTargetFromEvent(ev)
+  if (target === null) return
+  dispatchWikilinkTarget(target, resolve, onNavigate, onDeadLink)
+}

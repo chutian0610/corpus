@@ -11,7 +11,13 @@ import { computed, ref, watch } from 'vue'
 import { readPage } from '../api'
 import { errorMessage, formatDateTime, pageDisplayName, PAGE_TYPE_LABELS } from '../display'
 import { currentVault, pageTree } from '../vault-state'
-import { buildResolver, parseMetaLink, renderWikiMarkdown } from '../wiki-links'
+import {
+  buildResolver,
+  dispatchWikilinkTarget,
+  handleWikilinkClick,
+  parseMetaLink,
+  renderWikiMarkdown,
+} from '../wiki-links'
 
 const props = defineProps<{
   /** 相对 wiki/ 的页面路径（FilePanel 选中项 / wikilink 跳转目标）。 */
@@ -83,29 +89,16 @@ function showDeadNotice(target: string): void {
   }, 4000)
 }
 
-/** 正文容器点击委托：a.wikilink → 解析跳转或死链提示。 */
+/** 正文容器点击委托（共享 helper）：a.wikilink → 解析跳转或死链提示。 */
 function onBodyClick(ev: MouseEvent): void {
-  const el = (ev.target as HTMLElement).closest('a.wikilink')
-  if (el === null) return
-  ev.preventDefault()
-  const target = el.getAttribute('data-target') ?? ''
-  const resolved = resolver.value(target)
-  if (resolved === null) {
-    showDeadNotice(target)
-    return
-  }
-  emit('navigate', resolved)
+  handleWikilinkClick(ev, resolver.value, (p) => emit('navigate', p), showDeadNotice)
 }
 
-/** 元信息区的 wikilink 点击（与正文同一解析口径）。 */
+/** 元信息区的 wikilink 点击（与正文同一解析口径；target 已从条目
+ *  解出，无需再从事件找 a.wikilink，直接走共享分发）。 */
 function onMetaLinkClick(ev: MouseEvent, target: string): void {
   ev.preventDefault()
-  const resolved = resolver.value(target)
-  if (resolved === null) {
-    showDeadNotice(target)
-    return
-  }
-  emit('navigate', resolved)
+  dispatchWikilinkTarget(target, resolver.value, (p) => emit('navigate', p), showDeadNotice)
 }
 </script>
 

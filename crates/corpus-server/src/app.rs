@@ -298,7 +298,8 @@ struct IngestReq {
 ///   多请求环境，并发摄取会交织 git 提交与指纹状态，同一时刻只允许
 ///   一个；桌面壳无此限制（Tauri 单窗口天然串行）——这是 web 形态
 ///   新增的语义，且 guard 随 handler future 结束（含 panic unwind 后
-///   由 Mutex 修复毒锁语义）自动释放；
+///   由 Mutex 修复毒锁语义）自动释放。查询（`query_ask`）不占此锁：
+///   写盘并发安全由引擎级写锁兜底（见其注释）；
 /// - **进度不经本响应**：`on_progress` 回调发 broadcast channel，由
 ///   GET /api/events 的 SSE 连接以 `event: ingest-progress` 推送；
 ///   本响应等到摄取完成，body 即完整 [`IngestFileReport`]（与 Tauri
@@ -340,10 +341,11 @@ struct QueryAskReq {
 /// [`corpus_engine::query`]（词法候选 → strong 档流式综合 → 按
 /// `query_pages` 沉淀 Query page），双壳行为一致。
 ///
-/// - **与 ingest 共用全局互斥**（同一 `ingest_lock`）：查询是只读 +
-///   沉淀写单页，但沉淀写的是同一个 git 仓库（Query page + index +
-///   log + 提交），与摄取并发会交织 git 提交——同一时刻只允许一个
-///   写事务，`try_lock` 命中即 409；
+/// - **不占 [`AppState::ingest_lock`]**：该锁只守「摄取 vs 摄取」的
+///   壳层互斥（见 `ingest` 注释）；查询的并发安全已下沉引擎——引擎
+///   级写锁只串行化 ingest apply 与 query 沉淀共用的落盘事务核心
+///   （`write_pages_and_commit`），LLM 调用阶段不持锁，查询与摄取
+///   互不阻塞，这里无需再加壳层互斥与 409 分支；
 /// - **流式进度**：`on_event` 回调以新事件名 `query-progress` 发往
 ///   既有广播通道，经 GET /api/events 的 SSE 连接推送（通道已是
 ///   「事件名 + payload」对，零改动扩展）；本响应等到查询完成，
@@ -352,11 +354,6 @@ async fn query_ask(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<QueryAskReq>,
 ) -> Result<Json<QueryOutcome>, ApiError> {
-    let _guard = state.ingest_lock.try_lock().map_err(|_| {
-        ApiError::conflict(
-            "已有另一个摄取或查询正在进行（服务端同一时刻只允许一个写事务），请等待其完成后再试",
-        )
-    })?;
     let config = state.store.get_config()?;
     let progress_tx = state.progress_tx.clone();
     let outcome = corpus_engine::query(
@@ -946,14 +943,13 @@ mod tests {
         );
     }
 
-    /// 验收（T9）：查询与摄取**共用同一把全局互斥**——查询沉淀写的是
-    /// 同一个 git 仓库（Query page + index + log + 提交），与摄取并发
-    /// 会交织提交。预锁命中即 409（互斥检查先于引擎调用与 Vault 校验，
-    /// 无需真实 Vault）；释放后非 Vault 请求落回引擎的 400（不得再报
-    /// 并发冲突）。真实查询链路由引擎 Fake 端口测试 + e2e（假 LLM）
+    /// 验收（T9 评审修正）：查询**不再占用** `ingest_lock`（壳层 409
+    /// 分支已移除）——预锁摄取互斥后查询照常进入引擎（并发安全由引
+    ///擎级写锁兜底，LLM 阶段不持锁），非 Vault 请求落引擎的 400 而非
+    /// 任何并发冲突。真实查询链路由引擎 Fake 端口测试 + e2e（假 LLM）
     /// 覆盖，server 层无注入点（与 ingest 同口径）。
     #[tokio::test]
-    async fn concurrent_query_shares_ingest_lock_409() {
+    async fn query_does_not_contend_with_ingest_lock() {
         let env = test_env();
         let _guard = env.state.ingest_lock.lock().await;
 
@@ -965,27 +961,15 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        let message = body["message"].as_str().expect("409 应为 {message}");
-        assert!(
-            message.contains("查询") && message.contains("正在进行"),
-            "409 文案应说明查询共用写事务互斥：{message}"
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "查询不得因摄取互斥被 409：{body}"
         );
-
-        drop(_guard);
-        let (status, body) = send(
-            &env.app,
-            post_json(
-                "/api/query",
-                &json!({"vault_path": "/tmp/any", "question": "测试"}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "非 Vault 落引擎 400");
         let message = body["message"].as_str().unwrap_or_default();
         assert!(
-            !message.contains("正在进行"),
-            "互斥释放后不得再报并发冲突：{message}"
+            !message.contains("正在进行") && !message.contains("冲突"),
+            "查询不得报并发冲突（引擎写锁兜底）：{message}"
         );
     }
 

@@ -4,13 +4,15 @@
  *
  *  回答里的 [[wikilink]] 复用 wiki-links 渲染管线（与 PagePreview 同一
  *  安全模型：markdown-it html:false + inline rule 受控 <a>，v-html 内容
- *  为受控 token 转义输出），可点击跳转（navigate 委托给 App 的预览路由）。
- *  引用列表条目同理可点击。流式回答区按引擎口径只展示字数（增量内容
- *  完成后随结果整体到达）。 */
+ *  为受控 token 转义输出），可点击跳转（navigate 委托给 App 的预览路由，
+ *  点击处理走共享 helper）。回答区**流式渲染**：引擎随事件下发累积
+ *  回答文本（节流快照），未闭合的 [[ 按文本容错，完成后完整渲染。
+ *  引用列表条目同理可点击。 */
 import { computed, ref } from 'vue'
 import type { QueryCitation } from '../api'
 import {
   answerChars,
+  answerText,
   askQuestion,
   asking,
   history,
@@ -19,7 +21,7 @@ import {
   searchTerms,
 } from '../query-state'
 import { currentVault, pageTree } from '../vault-state'
-import { buildResolver, renderWikiMarkdown } from '../wiki-links'
+import { buildResolver, handleWikilinkClick, renderWikiMarkdown } from '../wiki-links'
 
 const emit = defineEmits<{
   (e: 'navigate', pagePath: string): void
@@ -53,15 +55,10 @@ function ask(): void {
   void askQuestion(vault.value.path, q)
 }
 
-/** 回答区 / 引用列表的点击委托：a.wikilink → 跳转（死链交由预览面板
- *  的既有死链提示口径处理，这里只解析命中的）。 */
+/** 回答区点击委托（共享 helper）：a.wikilink → 跳转；死链无提示分支
+ *  （未传 onDeadLink，静默不跳转——死链红色虚线样式已在渲染期可见）。 */
 function onBodyClick(ev: MouseEvent): void {
-  const el = (ev.target as HTMLElement).closest('a.wikilink')
-  if (el === null) return
-  ev.preventDefault()
-  const target = el.getAttribute('data-target') ?? ''
-  const resolved = resolver.value(target)
-  if (resolved !== null) emit('navigate', resolved)
+  handleWikilinkClick(ev, resolver.value, (pagePath) => emit('navigate', pagePath))
 }
 
 /** 引用列表条目点击：直接跳引用页。 */
@@ -106,6 +103,15 @@ function openCitation(citation: QueryCitation): void {
           </span>
         </template>
         <template v-else-if="phase === 'answering'">
+          <!-- 流式回答：累积文本随事件到达即渲染（未闭合 [[ 按文本容错） -->
+          <!-- 安全说明同 PagePreview：v-html 内容为受控 token 转义输出，非裸插值 -->
+          <!-- eslint-disable-next-line vue/no-v-html -->
+          <article
+            v-if="answerText !== ''"
+            class="answer-body streaming"
+            @click="onBodyClick"
+            v-html="renderAnswer(answerText)"
+          />
           <span class="progress-line">正在综合回答…已接收 {{ answerChars }} 字（模型输出中）</span>
         </template>
       </div>
@@ -240,6 +246,12 @@ function openCitation(citation: QueryCitation): void {
   gap: 8px;
   font-size: 13px;
   color: var(--text-strong);
+}
+
+/* 流式回答区：左侧竖线提示「仍在生成」，正文排版与历史回答一致 */
+.answer-body.streaming {
+  border-left: 3px solid var(--accent-border);
+  padding-left: 12px;
 }
 
 .terms {

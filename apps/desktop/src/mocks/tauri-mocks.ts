@@ -82,7 +82,7 @@ interface PageTree {
 /** 查询（T9）形状镜像自引擎 serde 输出。 */
 type QueryProgress =
   | { stage: 'searching'; terms: string[] }
-  | { stage: 'answering'; chars: number }
+  | { stage: 'answering'; chars: number; answer: string }
   | { stage: 'done' }
 
 interface QueryCitation {
@@ -400,22 +400,23 @@ async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestRep
 
 /**
  * 假查询（T9，镜像引擎 query 编排的负载形状）：searching（带假分词）
- * → answering（假流式按 ~250ms 间隔吐递增 chars）→ 返回假回答 + 假
- * 引用；query_pages 默认开——按问题 slug 沉淀假 Query page（内存态，
- * 重复提问同题更新），并让假页面树长出 queries 分组。不写任何文件。
+ * → answering（假流式按 ~250ms 间隔吐 chars + 累积回答文本）→ 返回假
+ * 回答 + 假引用；query_pages 默认开——按问题 slug 沉淀假 Query page
+ * （内存态，重复提问同题更新），并让假页面树长出 queries 分组。不写
+ * 任何文件。
  */
 async function fakeQueryAsk(question: string): Promise<QueryOutcome> {
   const { emit } = await import('@tauri-apps/api/event')
   await new Promise((resolve) => setTimeout(resolve, 300))
   await emit('query-progress', { stage: 'searching', terms: fakeTokenize(question) })
   await new Promise((resolve) => setTimeout(resolve, 500))
-  await emit('query-progress', { stage: 'answering', chars: 0 })
+  await emit('query-progress', { stage: 'answering', chars: 0, answer: '' })
   const answer = [
     '（浏览器模式假回答）自注意力让序列中每个位置直接关注全部位置，是 [[entities/transformer|Transformer]] 的核心机制。',
     '',
     '详细概念见 [[concepts/自注意力|自注意力]]；论文出处见 [[sources/attention-is-all-you-need|Attention Is All You Need]]。',
   ].join('\n')
-  await emitQueryChars(answer.length, 250)
+  await emitAnswerStream(answer, 250)
   await emit('query-progress', { stage: 'done' })
   // 沉淀（query_pages=true 的默认路径）：同题更新（路径不变）
   const slug = fakeSlug(question)
@@ -461,14 +462,20 @@ function fakeSlug(question: string): string {
   return slug === '' ? 'untitled' : slug
 }
 
-/** 假流式（查询 answering 阶段）：按 ~12 段把 total 字吐完。 */
-async function emitQueryChars(total: number, stepMs: number): Promise<void> {
+/** 假流式（查询 answering 阶段）：按 ~12 段把回答吐完，每段携带
+ *  chars 与累积文本快照（引擎 QueryEvent::Answering 的形状）。 */
+async function emitAnswerStream(answer: string, stepMs: number): Promise<void> {
   const { emit } = await import('@tauri-apps/api/event')
-  const step = Math.max(1, Math.ceil(total / 12))
-  for (let chars = step; ; chars = Math.min(total, chars + step)) {
+  const chars: string[] = [...answer]
+  const step = Math.max(1, Math.ceil(chars.length / 12))
+  for (let n = step; ; n = Math.min(chars.length, n + step)) {
     await new Promise((resolve) => setTimeout(resolve, stepMs))
-    await emit('query-progress', { stage: 'answering', chars } satisfies QueryProgress)
-    if (chars >= total) break
+    await emit('query-progress', {
+      stage: 'answering',
+      chars: n,
+      answer: chars.slice(0, n).join(''),
+    } satisfies QueryProgress)
+    if (n >= chars.length) break
   }
 }
 

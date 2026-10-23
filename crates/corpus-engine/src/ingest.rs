@@ -1911,6 +1911,26 @@ fn pages_meta(
 // Apply 事务：原子写 + git 提交 + log/index 维护
 // ---------------------------------------------------------------------------
 
+/// 引擎级写锁（模块级单例）：ingest apply 与 query 沉淀走**同一个**
+/// 落盘事务核心（[`write_pages_and_commit`]，写的是同一个 git 仓库的
+/// 页面 + index + log + 提交），并发执行会交织提交与快照恢复。互斥
+/// 下沉在引擎侧后，锁只覆盖**写盘段**——两边的 LLM 调用阶段都不持锁
+/// （查询不阻塞摄取，摄取的长时间综合也不阻塞查询的词法检索）。
+///
+/// std Mutex：写盘段是同步代码、不跨 `.await`，临界区毫秒级到秒级
+///（git 提交），短暂阻塞 async 线程可接受；毒锁自动恢复（写盘 panic
+/// 后快照已尽力恢复，锁不传染后续事务）。
+static CORPUS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 持引擎写锁执行 `f`（[`write_pages_and_commit`] 专用；锁语义见
+/// [`CORPUS_WRITE_LOCK`]）。
+fn with_corpus_write_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = CORPUS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f()
+}
+
 /// 写前快照：`None` 表示文件原本不存在（恢复时删除）。
 #[derive(Debug)]
 struct FileSnapshot {
@@ -1972,7 +1992,10 @@ pub(crate) fn render_index_line(entry: &IndexEntry) -> String {
 }
 
 /// 摘要首句（纯函数）：跳过 Markdown 标题行与空行，取首个非空行，
-/// 剥 wikilink 标记（`[[a|b]]`→`b`、`[[a]]`→`a`），截断约 60 字。
+/// 剥 wikilink 标记（`[[a|b]]`→`b`、`[[a]]`→`a`），截断约 60 字——
+/// 超长时**优先在句读边界截断**（60 字窗口内最后一个句号/问号/叹号/
+/// 分号，全半角皆可；首句经 `lines()` 逐行取出故换行边界天然不出现），
+/// 窗口内无边界才按字符硬截（60 字 + 省略号）。
 ///
 /// 数据源说明：页面 frontmatter 没有 summary 字段（T3 schema 七必填
 /// 之外无该字段），富行的摘要取正文首句——设计补充评论中
@@ -1984,33 +2007,33 @@ pub(crate) fn index_digest(body: &str) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .unwrap_or("");
-    truncate_chars(&strip_wikilinks(first), DIGEST_MAX_CHARS)
+    let plain = strip_wikilinks(first);
+    if plain.chars().count() <= DIGEST_MAX_CHARS {
+        return plain;
+    }
+    let window: Vec<char> = plain.chars().take(DIGEST_MAX_CHARS).collect();
+    if let Some(cut) = window
+        .iter()
+        .rposition(|c| matches!(c, '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'))
+    {
+        return window[..cut + 1].iter().collect();
+    }
+    truncate_chars(&plain, DIGEST_MAX_CHARS)
 }
 
 /// 剥一段文本里的 wikilink 标记：`[[target|label]]` → `label`，
 /// `[[target]]` → `target`（富行摘要里嵌链接会让截断落在括号中间，
-/// 渲染出破碎链接——摘要只留纯文本）。
+/// 渲染出破碎链接——摘要只留纯文本）。扫描走 [`crate::page::scan_wikilinks`]
+/// 单一解析实现（未闭合的 `[[` 按字面文本保留，不是链接）。
 pub(crate) fn strip_wikilinks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("[[") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find("]]") {
-            Some(end) => {
-                let inner = &after[..end];
-                let label = inner.split_once('|').map_or(inner, |(_, label)| label);
-                out.push_str(label);
-                rest = &after[end + 2..];
-            }
-            // 未闭合的 `[[`：按字面文本保留（不是链接）
-            None => {
-                out.push_str("[[");
-                rest = after;
-            }
-        }
+    let mut offset = 0usize;
+    for hit in crate::page::scan_wikilinks(text) {
+        out.push_str(&text[offset..hit.start]);
+        out.push_str(&hit.label);
+        offset = hit.end;
     }
-    out.push_str(rest);
+    out.push_str(&text[offset..]);
     out
 }
 
@@ -2112,10 +2135,33 @@ fn write_and_commit(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
 /// tempfile persist 原子写 + **index.md 全量重建**（[`rebuild_index`]，
 /// 页面落盘后执行，磁盘即全量事实源）+ log 追加 + 恰好一个 git 提交。
 ///
-/// 任一步失败恢复快照并清空暂存区（commit 前的 `git add` 可能把文件
-/// 写进了 index），不留半写状态。`extra_git_files` 是除页面与
-/// index/log 外要一并提交的 Vault 相对路径（ingest 传 raw 文件）。
+/// **引擎级写互斥**：本函数是全部写盘事务的唯一入口，整体持
+/// [`CORPUS_WRITE_LOCK`]（见其文档）——调用方（ingest apply / query
+/// 沉淀）的 LLM 调用阶段在锁外，写盘段在此串行。任一步失败恢复快照
+/// 并清空暂存区（commit 前的 `git add` 可能把文件写进了 index），不
+/// 留半写状态。`extra_git_files` 是除页面与 index/log 外要一并提交的
+/// Vault 相对路径（ingest 传 raw 文件）。
 pub(crate) fn write_pages_and_commit(
+    vault_root: &Path,
+    pages: &[PageDraft],
+    extra_git_files: &[String],
+    commit_message: &str,
+    log_entry: &str,
+) -> Result<String> {
+    with_corpus_write_lock(|| {
+        write_pages_and_commit_locked(
+            vault_root,
+            pages,
+            extra_git_files,
+            commit_message,
+            log_entry,
+        )
+    })
+}
+
+/// [`write_pages_and_commit`] 的锁内实现（调用方必须已持
+/// [`CORPUS_WRITE_LOCK`]）。
+fn write_pages_and_commit_locked(
     vault_root: &Path,
     pages: &[PageDraft],
     extra_git_files: &[String],
@@ -2439,11 +2485,20 @@ mod tests {
         // 跳过标题行与空行，取首个非空行；wikilink 剥成纯文本
         let body = "# Transformer\n\n[[entities/transformer|Transformer]] 是完全基于注意力的架构。\n\n第二段。";
         assert_eq!(index_digest(body), "Transformer 是完全基于注意力的架构。");
-        // 超长截断 ~60 字（Unicode 安全 + 省略号）
-        let long = format!("长摘要。{}", "字".repeat(80));
+        // 超长截断：60 字窗口内有句读边界 → 在**最后一个**句号处截断
+        //（保留完整句子，无省略号）
+        let long = format!("第一句在这里结束。{}无边界填充", "字".repeat(80));
         let digest = index_digest(&format!("# 标题\n\n{long}"));
+        assert_eq!(digest, "第一句在这里结束。", "应在句读边界截断：{digest}");
+        // 窗口内无任何句读边界 → 硬截（60 字 + 省略号，既有行为）
+        let boundless = "字".repeat(80);
+        let digest = index_digest(&format!("# 标题\n\n{boundless}"));
         assert_eq!(digest.chars().count(), 61, "60 字 + 省略号：{digest}");
         assert!(digest.ends_with('…'));
+        // 半角句读同样是边界
+        let half = format!("Head sentence. {}", "x".repeat(80));
+        let digest = index_digest(&half);
+        assert_eq!(digest, "Head sentence.", "半角句号也是边界：{digest}");
         // 全是标题行：摘要在 index 行里是可辨识但空的兜底
         assert_eq!(index_digest("# 只有标题\n\n"), "");
         // 未闭合的 [[ 按字面保留

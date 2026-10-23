@@ -62,7 +62,8 @@ pub use page::{parse_page, PageAction, PageKind};
 pub use provider::Provider;
 pub use query::{
     query_with_port, search_pages, QueryCitation, QueryEvent, QueryOutcome, ScoredPage,
-    NO_CANDIDATE_ANSWER, QUERY_COMMIT_PREFIX, SEARCH_TOP_N,
+    NO_CANDIDATE_ANSWER, QUERY_COMMIT_PREFIX, QUERY_CONTEXT_PAGE_MAX_CHARS, QUERY_TITLE_MAX_CHARS,
+    SEARCH_TOP_N,
 };
 pub use registry::RecentVault;
 #[cfg(feature = "rig")]
