@@ -170,6 +170,11 @@ async fn list_pages_groups_ingested_pages_by_kind() {
         sources.pages[0].updated.is_some(),
         "引擎产出的页面 updated 必有值"
     );
+    assert_eq!(
+        sources.pages[0].title.as_deref(),
+        Some("Attention Is All You Need"),
+        "T4：页面树条目携带 frontmatter title"
+    );
 
     let entities = group(&tree, PageKind::Entity);
     assert_eq!(
@@ -178,6 +183,15 @@ async fn list_pages_groups_ingested_pages_by_kind() {
         "notes.txt 与 ._transformer.md 应被跳过"
     );
     assert_eq!(entities.pages[0].path, "entities/transformer.md");
+    assert_eq!(entities.pages[0].title.as_deref(), Some("Transformer"));
+    assert!(
+        entities.pages[0]
+            .aliases
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("Transformer")),
+        "aliases 应含 title 自身（merge_aliases 不变量）：{:?}",
+        entities.pages[0].aliases
+    );
 
     let concepts = group(&tree, PageKind::Concept);
     let paths: Vec<&str> = concepts.pages.iter().map(|p| p.path.as_str()).collect();
@@ -186,7 +200,16 @@ async fn list_pages_groups_ingested_pages_by_kind() {
         concepts.pages[0].updated, None,
         "无 frontmatter 的手工页面宽松列出，updated 为 None"
     );
+    assert_eq!(
+        concepts.pages[0].title, None,
+        "无 frontmatter 的手工页面 title 同样宽松为 None"
+    );
+    assert!(
+        concepts.pages[0].aliases.is_empty(),
+        "无 frontmatter 的手工页面 aliases 为空"
+    );
     assert!(concepts.pages[1].updated.is_some());
+    assert_eq!(concepts.pages[1].title.as_deref(), Some("自注意力"));
 
     // 纯遍历：调用前后全树快照一致（零写入）
     let before = tree_snapshot(&root, "wiki");

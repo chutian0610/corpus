@@ -6,7 +6,8 @@
  * 共用同一入口，避免各页面自行拼装。模块级响应式单例是最小实现，
  * 无需引入状态库。 */
 import { ref } from 'vue'
-import { openVault as openVaultApi, type OpenedVault } from './api'
+import { listPages as listPagesApi, openVault as openVaultApi, type PageTree, type OpenedVault } from './api'
+import { errorMessage } from './display'
 
 export interface CurrentVault {
   /** Vault 根目录。 */
@@ -20,11 +21,38 @@ export interface CurrentVault {
 /** 当前打开的 Vault；null = 启动页。 */
 export const currentVault = ref<CurrentVault | null>(null)
 
-/** 页面树版本号：Apply 落盘后 bump，FilePanel 据此重拉 list_pages。 */
+/** 页面树版本号：Apply 落盘后 bump，页面树消费方据此重拉。 */
 export const pagesVersion = ref(0)
 
 export function bumpPages(): void {
   pagesVersion.value++
+}
+
+/** 当前 Vault 的 wiki/ 页面树（T4 起共享：FilePanel 展示 + PagePreview
+ *  wikilink 解析共用同一份，避免两处各拉一遍）。null = 未加载。 */
+export const pageTree = ref<PageTree | null>(null)
+export const pageTreeLoading = ref(false)
+export const pageTreeError = ref<string | null>(null)
+
+/** 拉取当前 Vault 的页面树（file 面板挂载 / 切 Vault / pagesVersion bump
+ *  时调用）。Vault 未打开时清空树。 */
+export async function reloadPageTree(): Promise<void> {
+  const vault = currentVault.value
+  if (!vault) {
+    pageTree.value = null
+    pageTreeError.value = null
+    return
+  }
+  pageTreeLoading.value = true
+  pageTreeError.value = null
+  try {
+    pageTree.value = await listPagesApi(vault.path)
+  } catch (err) {
+    pageTreeError.value = errorMessage(err)
+    pageTree.value = null
+  } finally {
+    pageTreeLoading.value = false
+  }
 }
 
 /** 打开一个 Vault：引擎校验 + 最近列表登记，成功后设为当前工作区。
