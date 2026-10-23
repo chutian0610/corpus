@@ -2102,7 +2102,7 @@ fn write_and_commit(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
     write_pages_and_commit(
         vault_root,
         &draft.pages,
-        &[draft.raw_path.clone()],
+        std::slice::from_ref(&draft.raw_path),
         &message,
         &log_entry,
     )

@@ -644,10 +644,7 @@ mod tests {
                 "/api/ingest",
                 &json!({"vault_path": "/x", "src_path": "/y"}),
             ),
-            post_json(
-                "/api/query",
-                &json!({"vault_path": "/x", "question": "q"}),
-            ),
+            post_json("/api/query", &json!({"vault_path": "/x", "question": "q"})),
             get("/api/events?token=irrelevant"),
         ] {
             let (req, _) = {
