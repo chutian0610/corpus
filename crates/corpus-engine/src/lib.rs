@@ -18,6 +18,9 @@
 //! - T-W 范围：`ingest_file` 编排（import → 带上限端口 → ingest → 按
 //!   `apply_mode` apply）从桌面命令层下沉为公共 API（[`ingest::IngestFileReport`]），
 //!   桌面壳与 corpus-server 双壳共用，行为一致（票据 #17 v1）。
+//! - T9 范围：[`query`]——自然语言查询最小闭环（词法候选零 LLM →
+//!   strong 档流式综合 → Query page 沉淀，配置可关），词法层
+//!   [`query::search_pages`] 独立确定性可测。
 
 mod atomic;
 mod git;
@@ -31,6 +34,7 @@ pub mod ingest;
 pub mod llm;
 pub mod page;
 pub mod provider;
+pub mod query;
 pub mod registry;
 #[cfg(feature = "rig")]
 pub mod rig_llm;
@@ -52,10 +56,14 @@ pub use ingest::{
 };
 pub use llm::{
     ConnectionReport, LlmCallOutcome, LlmCallPurpose, LlmCallStats, LlmPort, LlmTier,
-    ANALYSIS_MAX_TOKENS, COMPOSE_MAX_TOKENS,
+    ANALYSIS_MAX_TOKENS, COMPOSE_MAX_TOKENS, QUERY_MAX_TOKENS,
 };
 pub use page::{parse_page, PageAction, PageKind};
 pub use provider::Provider;
+pub use query::{
+    query_with_port, search_pages, QueryCitation, QueryEvent, QueryOutcome, ScoredPage,
+    NO_CANDIDATE_ANSWER, QUERY_COMMIT_PREFIX, SEARCH_TOP_N,
+};
 pub use registry::RecentVault;
 #[cfg(feature = "rig")]
 pub use rig_llm::{
@@ -66,6 +74,9 @@ pub use rig_llm::{
 // `ingest_file_with_ports` 永远可用（见 ingest 模块文档）。
 #[cfg(feature = "rig")]
 pub use ingest::ingest_file;
+// 查询同构：真实端口变体 `query` 属 rig；注入变体 `query_with_port` 永远可用。
+#[cfg(feature = "rig")]
+pub use query::query;
 pub use template::{
     builtin_template_infos, builtin_templates, template_by_id, TemplateId, TemplateInfo,
 };

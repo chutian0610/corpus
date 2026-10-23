@@ -25,7 +25,7 @@ use crate::page::{parse_page, split_frontmatter, PageFrontmatter, PageKind};
 /// [`list_pages`] 的结果：按页面类型分组的页面清单。
 #[derive(Debug, Clone, Serialize)]
 pub struct PageTree {
-    /// 非空分组，按 [`PageKind::ALL`] 固定顺序（sources / entities / concepts）。
+    /// 非空分组，按 [`PageKind::ALL`] 固定顺序（sources / entities / concepts / queries）。
     pub groups: Vec<PageGroup>,
 }
 
@@ -242,14 +242,19 @@ mod tests {
     #[test]
     fn all_covers_every_kind_exactly_once() {
         // ALL 覆盖每个已知变体且不重复（新增类型时此清单是唯一改动点）
-        for kind in [PageKind::Source, PageKind::Entity, PageKind::Concept] {
+        for kind in [
+            PageKind::Source,
+            PageKind::Entity,
+            PageKind::Concept,
+            PageKind::Query,
+        ] {
             assert_eq!(
                 PageKind::ALL.iter().filter(|k| **k == kind).count(),
                 1,
                 "{kind:?} 应在 ALL 中恰好出现一次"
             );
         }
-        assert_eq!(PageKind::ALL.len(), 3);
+        assert_eq!(PageKind::ALL.len(), 4);
     }
 
     #[test]
