@@ -41,7 +41,7 @@ const resolver = computed(() =>
 const fm = computed(() => result.value?.frontmatter ?? null)
 const pageTitle = computed(() => fm.value?.title ?? pageDisplayName(props.relPath))
 const typeLabel = computed(() =>
-  fm.value ? (PAGE_TYPE_LABELS[fm.value.page_type] ?? fm.value.page_type) : null,
+  fm.value ? (PAGE_TYPE_LABELS[fm.value.type] ?? fm.value.type) : null,
 )
 
 /** Markdown 正文 → HTML（wikilink 已替换为 a.wikilink / a.wikilink.dead）。 */
@@ -123,7 +123,7 @@ function onMetaLinkClick(ev: MouseEvent, target: string): void {
     <template v-else-if="result">
       <aside v-if="fm" class="meta">
         <div class="meta-row">
-          <span v-if="typeLabel" class="badge" :class="`badge-${fm?.page_type}`">{{ typeLabel }}</span>
+          <span v-if="typeLabel" class="badge" :class="`badge-${fm?.type}`">{{ typeLabel }}</span>
           <span v-if="fm" class="meta-time">更新于 {{ formatDateTime(fm.updated) }}</span>
         </div>
         <div v-if="fm.aliases.length > 0" class="meta-row">

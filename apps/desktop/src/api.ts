@@ -134,7 +134,8 @@ export interface PageTree {
 
 /** 页面 frontmatter（引擎 PageFrontmatter 的 TS 镜像，T4 元信息区数据源）。 */
 export interface PageFrontmatter {
-  page_type: PageKind
+  /** 页面类型（引擎 serde rename 为 `type`）。 */
+  type: PageKind
   title: string
   aliases: string[]
   tags: string[]
