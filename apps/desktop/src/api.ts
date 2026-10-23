@@ -109,12 +109,16 @@ export interface RecentVault {
 /** 页面类型（引擎 PageKind serde 表示）。 */
 export type PageKind = 'source' | 'entity' | 'concept'
 
-/** 单个页面条目（引擎 PageEntry）：路径 + 最后更新时间。 */
+/** 单个页面条目（引擎 PageEntry）：路径 + title/别名 + 最后更新时间。 */
 export interface PageEntry {
   /** 相对 wiki/ 的 .md 路径。 */
   path: string
   /** frontmatter 的 updated 时间（RFC 3339）；解析失败为 null（界面不展示）。 */
   updated: string | null
+  /** frontmatter 的 title；无 frontmatter / 解析失败为 null（T4）。 */
+  title: string | null
+  /** frontmatter 的 aliases（wikilink 目标解析用；读不出为空数组）。 */
+  aliases: string[]
 }
 
 /** 按类型分组的页面清单（引擎 PageGroup）。 */
@@ -126,6 +130,30 @@ export interface PageGroup {
 /** wiki/ 页面树（引擎 PageTree）：非空分组，按固定类型顺序。 */
 export interface PageTree {
   groups: PageGroup[]
+}
+
+/** 页面 frontmatter（引擎 PageFrontmatter 的 TS 镜像，T4 元信息区数据源）。 */
+export interface PageFrontmatter {
+  page_type: PageKind
+  title: string
+  aliases: string[]
+  tags: string[]
+  /** 相关页面（wikilink 形式，如 `[[concepts/注意力机制]]`）。 */
+  related: string[]
+  /** 溯源：指回 Source page 的 wikilink 列表。 */
+  sources: string[]
+  created: string
+  updated: string
+  raw_path: string | null
+  fingerprint: string | null
+}
+
+/** read_page_typed 的结果（引擎 ReadPageResult）：结构化 frontmatter +
+ *  正文（不含 YAML 头）。无 frontmatter 的页面（wiki/index.md 等）与
+ *  坏 frontmatter 宽松降级为 frontmatter=null（body 为全文）。 */
+export interface ReadPageResult {
+  frontmatter: PageFrontmatter | null
+  body: string
 }
 
 /** 页面动作：新建 / 精确名命中更新。 */
@@ -227,7 +255,7 @@ interface Transport {
   removeRecentVault(path: string): Promise<void>
   openVault(path: string): Promise<OpenedVault>
   listPages(vaultPath: string): Promise<PageTree>
-  readPage(vaultPath: string, relPath: string): Promise<string>
+  readPage(vaultPath: string, relPath: string): Promise<ReadPageResult>
   ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport>
   onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn>
   /** 服务器侧目录浏览（web 壳「浏览…」的数据源；桌面壳弹系统对话框，
@@ -246,7 +274,8 @@ const tauriTransport: Transport = {
   removeRecentVault: (path) => invoke<void>('remove_recent_vault', { path }),
   openVault: (path) => invoke<OpenedVault>('open_vault', { path }),
   listPages: (vaultPath) => invoke<PageTree>('list_pages', { vaultPath }),
-  readPage: (vaultPath, relPath) => invoke<string>('read_page', { vaultPath, relPath }),
+  readPage: (vaultPath, relPath) =>
+    invoke<ReadPageResult>('read_page_typed', { vaultPath, relPath }),
   ingestFile: (vaultPath, rawPath) => invoke<IngestReport>('ingest_file', { vaultPath, rawPath }),
   onIngestProgress: (handler) =>
     listen<IngestProgress>('ingest-progress', (e) => handler(e.payload)),
@@ -302,7 +331,7 @@ const webTransport: Transport = {
   listPages: (vaultPath) =>
     httpJson<PageTree>(`/api/vaults/pages?vault=${encodeURIComponent(vaultPath)}`),
   readPage: (vaultPath, relPath) =>
-    httpJson<string>(
+    httpJson<ReadPageResult>(
       `/api/vaults/page?vault=${encodeURIComponent(vaultPath)}&rel=${encodeURIComponent(relPath)}`,
     ),
   ingestFile: (vaultPath, rawPath) =>
@@ -358,8 +387,9 @@ export function listPages(vaultPath: string): Promise<PageTree> {
   return transport.listPages(vaultPath)
 }
 
-/** 只读读取 wiki/ 下某页面的原始文本（预览用；正式渲染属 T4）。 */
-export function readPage(vaultPath: string, relPath: string): Promise<string> {
+/** 结构化读取 wiki/ 下某页面（T4 页面渲染用）：frontmatter + 正文，
+ *  无 frontmatter 的页面宽松降级（见 ReadPageResult 注释）。 */
+export function readPage(vaultPath: string, relPath: string): Promise<ReadPageResult> {
   return transport.readPage(vaultPath, relPath)
 }
 
