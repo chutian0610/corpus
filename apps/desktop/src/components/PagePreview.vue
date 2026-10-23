@@ -72,6 +72,17 @@ watch(() => [currentVault.value?.path, props.relPath] as const, load, {
   immediate: true,
 })
 
+/** 死链提示：显示「页面不存在：target」并重置自动消失计时器
+ *  （正文与元信息区共用同一提示条与 timer 清理逻辑）。 */
+function showDeadNotice(target: string): void {
+  deadLinkNotice.value = `页面不存在：${target}`
+  if (noticeTimer !== null) window.clearTimeout(noticeTimer)
+  noticeTimer = window.setTimeout(() => {
+    deadLinkNotice.value = null
+    noticeTimer = null
+  }, 4000)
+}
+
 /** 正文容器点击委托：a.wikilink → 解析跳转或死链提示。 */
 function onBodyClick(ev: MouseEvent): void {
   const el = (ev.target as HTMLElement).closest('a.wikilink')
@@ -80,12 +91,7 @@ function onBodyClick(ev: MouseEvent): void {
   const target = el.getAttribute('data-target') ?? ''
   const resolved = resolver.value(target)
   if (resolved === null) {
-    deadLinkNotice.value = `页面不存在：${target}`
-    if (noticeTimer !== null) window.clearTimeout(noticeTimer)
-    noticeTimer = window.setTimeout(() => {
-      deadLinkNotice.value = null
-      noticeTimer = null
-    }, 4000)
+    showDeadNotice(target)
     return
   }
   emit('navigate', resolved)
@@ -96,12 +102,7 @@ function onMetaLinkClick(ev: MouseEvent, target: string): void {
   ev.preventDefault()
   const resolved = resolver.value(target)
   if (resolved === null) {
-    deadLinkNotice.value = `页面不存在：${target}`
-    if (noticeTimer !== null) window.clearTimeout(noticeTimer)
-    noticeTimer = window.setTimeout(() => {
-      deadLinkNotice.value = null
-      noticeTimer = null
-    }, 4000)
+    showDeadNotice(target)
     return
   }
   emit('navigate', resolved)

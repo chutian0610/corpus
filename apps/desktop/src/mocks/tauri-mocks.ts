@@ -21,6 +21,7 @@
  */
 import { mockIPC } from '@tauri-apps/api/mocks'
 import type { InvokeArgs } from '@tauri-apps/api/core'
+import type { PageEntry, PageFrontmatter, ReadPageResult } from '../api'
 
 interface TemplateInfo {
   id: string
@@ -69,13 +70,6 @@ type IngestProgress =
   | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
-interface PageEntry {
-  path: string
-  updated: string | null
-  title: string | null
-  aliases: string[]
-}
-
 interface PageGroup {
   kind: 'source' | 'entity' | 'concept'
   pages: PageEntry[]
@@ -83,12 +77,6 @@ interface PageGroup {
 
 interface PageTree {
   groups: PageGroup[]
-}
-
-/** read_page_typed 的响应（T4：结构化 frontmatter + 正文）。 */
-interface ReadPageResult {
-  frontmatter: Record<string, unknown> | null
-  body: string
 }
 
 /** 浏览器模式假摄取的产出（不落盘，仅供 UI 调试）。 */
@@ -193,19 +181,20 @@ function fakePageTyped(relPath: string): ReadPageResult {
     : relPath.startsWith('entities/')
       ? 'entity'
       : 'concept'
+  const frontmatter: PageFrontmatter = {
+    type: kind,
+    title,
+    aliases: [title],
+    tags: kind === 'entity' ? ['deep-learning'] : [],
+    related: kind === 'entity' ? ['[[concepts/自注意力]]'] : [],
+    sources: kind === 'concept' ? [] : ['[[sources/attention-is-all-you-need]]'],
+    created: '2026-10-16T10:30:00+08:00',
+    updated: '2026-10-16T10:30:00+08:00',
+    raw_path: kind === 'source' ? 'raw/paper.md' : null,
+    fingerprint: kind === 'source' ? 'browser-mock-fingerprint' : null,
+  }
   return {
-    frontmatter: {
-      type: kind,
-      title,
-      aliases: [title],
-      tags: kind === 'entity' ? ['deep-learning'] : [],
-      related: kind === 'entity' ? ['[[concepts/自注意力]]'] : [],
-      sources: kind === 'concept' ? [] : ['[[sources/attention-is-all-you-need]]'],
-      created: '2026-10-16T10:30:00+08:00',
-      updated: '2026-10-16T10:30:00+08:00',
-      raw_path: kind === 'source' ? 'raw/paper.md' : null,
-      fingerprint: kind === 'source' ? 'browser-mock-fingerprint' : null,
-    },
+    frontmatter,
     body: [
       `# ${title}`,
       '',

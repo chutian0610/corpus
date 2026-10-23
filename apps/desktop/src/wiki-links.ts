@@ -85,8 +85,10 @@ function wikilinkRule(state: StateInline, silent: boolean): boolean {
   const labelTrimmed = label.trim() === '' ? target : label.trim()
 
   if (!silent) {
-    const resolve = state.env.resolve as WikiLinkResolver | undefined
-    const resolved = resolve?.(target) ?? null
+    // resolve 由 renderWikiMarkdown 经 env 必传入（唯一渲染入口），不可能是
+    // undefined，无需兜底分支。
+    const resolve = state.env.resolve as WikiLinkResolver
+    const resolved = resolve(target)
     const open = state.push('wikilink_open', 'a', 1)
     open.attrs = [
       ['class', resolved === null ? 'wikilink dead' : 'wikilink'],
@@ -105,8 +107,8 @@ md.inline.ruler.push('wikilink', wikilinkRule)
 /**
  * Markdown 正文 → HTML（wikilink 已解析为 a.wikilink；死链带 dead 类）。
  *
- * `resolve` 经 render 的 env 传入 inline rule；传 undefined 时全部按
- * 死链渲染（页面树未就绪的兜底，点击仍会现场重解析）。
+ * `resolve` 经 render 的 env 传入 inline rule（必传参，inline rule 直接
+ * 调用，无 undefined 兜底分支）。
  */
 export function renderWikiMarkdown(src: string, resolve: WikiLinkResolver): string {
   return md.render(src, { resolve })
