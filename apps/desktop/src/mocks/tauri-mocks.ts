@@ -21,6 +21,7 @@
  */
 import { mockIPC } from '@tauri-apps/api/mocks'
 import type { InvokeArgs } from '@tauri-apps/api/core'
+import type { PageEntry, PageFrontmatter, ReadPageResult } from '../api'
 
 interface TemplateInfo {
   id: string
@@ -69,11 +70,6 @@ type IngestProgress =
   | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
-interface PageEntry {
-  path: string
-  updated: string | null
-}
-
 interface PageGroup {
   kind: 'source' | 'entity' | 'concept'
   pages: PageEntry[]
@@ -121,7 +117,8 @@ function upsertRecent(path: string, templateId: string): void {
   ]
 }
 
-/** 假页面树：基础三页 + 假摄取（auto 模式）成功后追加的 source 页。 */
+/** 假页面树：基础三页 + 假摄取（auto 模式）成功后追加的 source 页。
+ *  条目携带 frontmatter title / aliases（T4 wikilink 解析数据源）。 */
 let extraSourcePages: PageEntry[] = []
 
 function fakePageTree(): PageTree {
@@ -130,40 +127,87 @@ function fakePageTree(): PageTree {
     groups: [
       {
         kind: 'source',
-        pages: [{ path: 'sources/attention-is-all-you-need.md', updated }, ...extraSourcePages],
+        pages: [
+          {
+            path: 'sources/attention-is-all-you-need.md',
+            updated,
+            title: 'Attention Is All You Need',
+            aliases: ['Attention 论文'],
+          },
+          ...extraSourcePages,
+        ],
       },
-      { kind: 'entity', pages: [{ path: 'entities/transformer.md', updated }] },
-      { kind: 'concept', pages: [{ path: 'concepts/自注意力.md', updated }] },
+      {
+        kind: 'entity',
+        pages: [
+          { path: 'entities/transformer.md', updated, title: 'Transformer', aliases: ['Transformer 架构'] },
+        ],
+      },
+      {
+        kind: 'concept',
+        pages: [
+          { path: 'concepts/自注意力.md', updated, title: '自注意力', aliases: ['Self-Attention'] },
+        ],
+      },
     ],
   }
 }
 
-/** 假页面原文（read_page）：与假页面树一一对应的 frontmatter + 正文。 */
-function fakePageContent(relPath: string): string {
+/** 假页面（read_page_typed）：与假页面树一一对应的结构化 frontmatter +
+ *  正文；index.md（引擎自维护目录，无 frontmatter）宽松降级。 */
+function fakePageTyped(relPath: string): ReadPageResult {
+  if (relPath === 'index.md') {
+    return {
+      frontmatter: null,
+      body: [
+        '# Wiki Index',
+        '',
+        '- [[sources/attention-is-all-you-need|Attention Is All You Need]]',
+        '- [[entities/transformer|Transformer]]',
+        '- [[concepts/自注意力]]',
+        '- [[concepts/不存在的页面|死链示例]]',
+        '',
+      ].join('\n'),
+    }
+  }
   const titles: Record<string, string> = {
     'sources/attention-is-all-you-need.md': 'Attention Is All You Need',
     'entities/transformer.md': 'Transformer',
     'concepts/自注意力.md': '自注意力',
   }
   const title = titles[relPath] ?? relPath
-  return [
-    '---',
-    `type: ${relPath.startsWith('sources/') ? 'source' : relPath.startsWith('entities/') ? 'entity' : 'concept'}`,
-    `title: ${title}`,
-    `aliases: [${title}]`,
-    'tags: []',
-    'related: []',
-    'sources: []',
-    'created: 2026-10-16T10:30:00+08:00',
-    'updated: 2026-10-16T10:30:00+08:00',
-    '---',
-    '',
-    `# ${title}`,
-    '',
-    '（浏览器模式假页面内容——正式渲染属 T4。）',
-    '相关页面：[[entities/transformer|Transformer]]、[[concepts/自注意力]]。',
-    '',
-  ].join('\n')
+  const kind = relPath.startsWith('sources/')
+    ? 'source'
+    : relPath.startsWith('entities/')
+      ? 'entity'
+      : 'concept'
+  const frontmatter: PageFrontmatter = {
+    type: kind,
+    title,
+    aliases: [title],
+    tags: kind === 'entity' ? ['deep-learning'] : [],
+    related: kind === 'entity' ? ['[[concepts/自注意力]]'] : [],
+    sources: kind === 'concept' ? [] : ['[[sources/attention-is-all-you-need]]'],
+    created: '2026-10-16T10:30:00+08:00',
+    updated: '2026-10-16T10:30:00+08:00',
+    raw_path: kind === 'source' ? 'raw/paper.md' : null,
+    fingerprint: kind === 'source' ? 'browser-mock-fingerprint' : null,
+  }
+  return {
+    frontmatter,
+    body: [
+      `# ${title}`,
+      '',
+      '（浏览器模式假页面内容。）',
+      '相关页面：[[entities/transformer|Transformer]]、[[concepts/自注意力]]。',
+      `这是一段死链：[[concepts/幽灵页面|不存在的页面]]。`,
+      '',
+      '```rust',
+      'fn main() { println!("代码块里的 [[entities/transformer]] 不是链接"); }',
+      '```',
+      '',
+    ].join('\n'),
+  }
 }
 
 /** read_page 的路径校验（引擎 resolve_page_path 语义的 JS 简化版）：
@@ -262,7 +306,12 @@ async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestRep
     const rawName = imported_raw_path.split('/').pop() ?? 'browser-mock.md'
     extraSourcePages = [
       ...extraSourcePages,
-      { path: `sources/${rawName.replace(/\.(md|markdown|txt)$/, '')}.md`, updated: stamp },
+      {
+        path: `sources/${rawName.replace(/\.(md|markdown|txt)$/, '')}.md`,
+        updated: stamp,
+        title: rawName.replace(/\.(md|markdown|txt)$/, ''),
+        aliases: [],
+      },
     ]
     return {
       skipped: false,
@@ -367,7 +416,7 @@ mockIPC(
         }
         return fakePageTree()
       }
-      case 'read_page': {
+      case 'read_page_typed': {
         const { vaultPath, relPath } = args as { vaultPath: string; relPath: string }
         if (!knownVaults.has(vaultPath)) {
           throw `路径不是有效的 Corpus Vault：${vaultPath}（缺 wiki/ 目录）`
@@ -375,11 +424,13 @@ mockIPC(
         if (!isValidPagePath(relPath)) {
           throw `非法页面路径：${relPath}（必须是 wiki/ 内的相对 .md 路径）`
         }
-        const known = fakePageTree().groups.some((g) => g.pages.some((p) => p.path === relPath))
+        const known =
+          relPath === 'index.md' ||
+          fakePageTree().groups.some((g) => g.pages.some((p) => p.path === relPath))
         if (!known) {
           throw `读取 ${vaultPath}/wiki/${relPath} 失败：文件不存在（浏览器模式假实现）`
         }
-        return fakePageContent(relPath)
+        return fakePageTyped(relPath)
       }
       case 'ingest_file': {
         const { rawPath } = args as { rawPath: string }

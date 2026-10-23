@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use common::fresh_vault_path;
 
-use corpus_engine::{create_vault, read_page, resolve_page_path, Error, TemplateId};
+use corpus_engine::{create_vault, read_page_typed, resolve_page_path, Error, TemplateId};
 
 /// 建一个带页面文件的 Vault：`page_rel` 相对 `wiki/`（自动建父目录）。
 fn vault_with_page(tag: &str, page_rel: &str) -> (tempfile::TempDir, PathBuf) {
@@ -119,25 +119,46 @@ fn resolve_page_path_rejects_symlink_escaping_vault() {
     ));
 }
 
-/// read_page（桌面壳与 corpus-server 共用的页面读取唯一入口）：三段全在
-/// 引擎——非 Vault 先拒（open_vault 级校验前置）、`..` 逃逸被路径安全
-/// 关口拒绝、正常页面读出原文。
+/// read_page_typed（桌面壳与 corpus-server 共用的页面读取唯一入口）：三段
+/// 全在引擎——非 Vault 先拒（open_vault 级校验前置）、`..` 逃逸被路径
+/// 安全关口拒绝、正常页面读出结构化 frontmatter + 正文（T4）。
 #[test]
-fn read_page_reads_content_and_rejects_non_vault_and_escape() {
+fn read_page_typed_reads_content_and_rejects_non_vault_and_escape() {
     let (dir, root) = vault_with_page("vault", "sources/hello.md");
 
-    // 正常读取：返回页面原文（helper 写入的内容）
+    // helper 写的 hello.md 无 frontmatter：宽松降级为 None + 全文
+    let typed = read_page_typed(&root, "sources/hello.md").expect("正常读取失败");
+    assert!(typed.frontmatter.is_none());
+    assert_eq!(typed.body, "# 页面\n");
+
+    // 带 frontmatter 的页面：结构化字段 + 去头正文（别名随 PageFrontmatter 回读）
+    let entities = root.join("wiki/entities");
+    fs::create_dir_all(&entities).unwrap();
+    fs::write(
+        entities.join("transformer.md"),
+        "---\ntype: entity\ntitle: Transformer\naliases: [Transformer, transformer 架构]\ntags: []\nrelated: []\nsources: []\ncreated: 2026-10-16T10:00:00+08:00\nupdated: 2026-10-16T11:00:00+08:00\n---\n\n架构说明，见 [[concepts/自注意力]]。\n",
+    )
+    .unwrap();
+    let typed = read_page_typed(&root, "entities/transformer.md").expect("读取失败");
+    let fm = typed.frontmatter.expect("合法 frontmatter 应有值");
+    assert_eq!(fm.title, "Transformer");
     assert_eq!(
-        read_page(&root, "sources/hello.md").expect("正常读取失败"),
-        "# 页面\n"
+        fm.aliases,
+        vec!["Transformer".to_string(), "transformer 架构".to_string()]
     );
+    assert_eq!(typed.body, "架构说明，见 [[concepts/自注意力]]。\n");
+
+    // wiki/index.md（引擎自维护目录，无 frontmatter）：可读（T4 目录入口）
+    let index = read_page_typed(&root, "index.md").expect("index.md 应可读");
+    assert!(index.frontmatter.is_none());
+    assert!(index.body.contains("Wiki Index"));
 
     // `..` 逃逸：路径安全关口拒绝（同一错误类型，HTTP / IPC 上同一文案）
-    let err = read_page(&root, "../purpose.md").expect_err("逃逸应被拒绝");
+    let err = read_page_typed(&root, "../purpose.md").expect_err("逃逸应被拒绝");
     assert!(matches!(err, Error::InvalidPagePath { .. }), "got: {err:?}");
     assert!(err.to_string().contains("非法页面路径"), "got: {err}");
 
     // 非 Vault 根：open_vault 级校验先于路径校验拒绝（NotAVault）
-    let err = read_page(dir.path(), "sources/hello.md").expect_err("非 Vault 应被拒绝");
+    let err = read_page_typed(dir.path(), "sources/hello.md").expect_err("非 Vault 应被拒绝");
     assert!(matches!(err, Error::NotAVault { .. }), "got: {err:?}");
 }

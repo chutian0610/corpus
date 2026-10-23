@@ -1,11 +1,18 @@
 //! Wiki 浏览：`list_pages` 纯文件系统遍历的页面树 + `resolve_page_path`
-//! 只读入口的路径安全校验与 `read_page` 页面读取唯一入口（应用壳 T-UX）。
+//! 只读入口的路径安全校验与 `read_page_typed` 页面读取唯一入口（应用壳
+//! T-UX；T4 起结构化返回 frontmatter + 正文）。
 //!
 //! 与 Ingest 管道的 [`crate::ingest::scan_existing_pages`]（全量解析
 //! frontmatter 供精确名去重）分工：本模块只回答「wiki/ 下有哪些页面
-//! 文件、各自最后更新于何时」与「这个相对路径能不能安全地读」，供
-//! 文件面板与预览面板使用——零 LLM、零写入；`updated` 只做宽松窥探
-//! （只读该字段，页面 schema 不合规不影响列出，只是该项为 `None`）。
+//! 文件、各自 title / 别名 / 最后更新于何时」与「这个相对路径能不能
+//! 安全地读」，供文件面板与预览面板使用——零 LLM、零写入；frontmatter
+//! 只做宽松窥探（schema 不合规不影响列出，字段落 `None` / 空）。
+//!
+//! `read_page_typed`（T4）：`Option<PageFrontmatter>` + 正文。浏览是
+//! 只读场景，单个坏页面（frontmatter 非法）不应卡死阅读——解析失败
+//! 宽松降级为 `frontmatter: None` + 全文 body（与 [`list_pages`] 的
+//! 宽松哲学一致）；`wiki/index.md` 等引擎自维护、无 frontmatter 的
+//! 文件由此也能作为页面浏览（目录入口，票据 #5）。
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -13,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::page::{split_frontmatter, PageKind};
+use crate::page::{parse_page, split_frontmatter, PageFrontmatter, PageKind};
 
 /// [`list_pages`] 的结果：按页面类型分组的页面清单。
 #[derive(Debug, Clone, Serialize)]
@@ -39,23 +46,33 @@ pub struct PageEntry {
     /// frontmatter 的 `updated` 时间（RFC 3339）。页面缺 frontmatter /
     /// YAML 非法 / 无该字段时为 `None`（界面不展示），不影响列出。
     pub updated: Option<String>,
+    /// frontmatter 的 `title`（T4，wikilink 目标解析与目录展示用）。
+    /// 宽松窥探：缺 frontmatter / 非法 / 空白时为 `None`。
+    pub title: Option<String>,
+    /// frontmatter 的 `aliases`（T4，wikilink 目标解析用；别名是核心
+    /// 不变量，但窥探口径仍宽松——读不出即为空，不在此校验）。
+    pub aliases: Vec<String>,
 }
 
-/// 只窥探 `updated` 一个字段的宽松反序列化目标：serde 忽略未知字段，
-/// 字段缺失 / 类型不符 / YAML 整体非法都落到 `None`。
+/// 宽松窥探 frontmatter 最小字段的反序列化目标：serde 忽略未知字段，
+/// 字段缺失 / 类型不符 / YAML 整体非法都落到缺省（`None` / 空数组）。
 #[derive(Debug, Default, Deserialize)]
-struct UpdatedOnly {
+struct FrontmatterPeek {
     #[serde(default)]
     updated: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    aliases: Option<Vec<String>>,
 }
 
-/// 宽松读取页面 frontmatter 的 `updated`（读不出即 `None`，不报错）。
-fn peek_updated(content: &str) -> Option<String> {
-    let (yaml, _) = split_frontmatter(content)?;
-    serde_yaml_ng::from_str::<UpdatedOnly>(&yaml)
-        .ok()?
-        .updated
-        .filter(|t| !t.trim().is_empty())
+/// 宽松读取页面 frontmatter 的展示字段（`updated` / `title` / `aliases`；
+/// 读不出即缺省，不报错）。
+fn peek_frontmatter(content: &str) -> FrontmatterPeek {
+    let Some((yaml, _)) = split_frontmatter(content) else {
+        return FrontmatterPeek::default();
+    };
+    serde_yaml_ng::from_str::<FrontmatterPeek>(&yaml).unwrap_or_default()
 }
 
 /// 遍历 `wiki/` 下各 PageKind 目录，返回按类型分组的页面树（公共 API）。
@@ -84,6 +101,16 @@ pub fn list_pages(vault_root: impl AsRef<Path>) -> Result<PageTree> {
         }
     }
     Ok(PageTree { groups })
+}
+
+/// [`read_page_typed`] 的结果：结构化 frontmatter + 正文（不含 YAML 头）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadPageResult {
+    /// 解析后的 frontmatter；页面无 frontmatter 或其解析 / 校验失败
+    /// （宽松降级，见 [`read_page_typed`]）为 `None`。
+    pub frontmatter: Option<PageFrontmatter>,
+    /// Markdown 正文。frontmatter 合法时不含 `---` 头；降级时为全文。
+    pub body: String,
 }
 
 /// 解析并校验 `wiki/` 下的页面相对路径（公共 API）：通过全部校验后
@@ -129,28 +156,41 @@ pub fn resolve_page_path(vault_root: impl AsRef<Path>, rel_path: &str) -> Result
     Ok(canonical_page)
 }
 
-/// 读取 `wiki/` 下某页面的原始文本（公共 API）。
+/// 读取 `wiki/` 下某页面为结构化内容（公共 API，T4）。
 ///
 /// **桌面壳与 corpus-server 共用的页面读取唯一入口**——三段全部在引擎：
 /// 先 [`crate::open_vault`] 级校验（`.corpus/vault.json` 存在且模板可
 /// 解析，与「打开」同一口径），再 [`resolve_page_path`] 路径安全单一
-/// 关口（拒绝绝对路径 / `..` / 非 `.md` / symlink 逃逸），最后读取文件
-/// 原文。壳层只做委托与错误映射，不再各写一份胶水。
+/// 关口（拒绝绝对路径 / `..` / 非 `.md` / symlink 逃逸），最后读取并
+/// 分离 frontmatter 与正文（复用 [`crate::page`] 的解析）。
+///
+/// 宽松口径（浏览是只读场景，单个坏页面不卡死阅读）：
+/// - 无 `---` frontmatter（`wiki/index.md`、手写页）：`frontmatter`
+///   为 `None`，body 即全文；
+/// - frontmatter 存在但解析 / 校验失败：同样降级为 `None` + 全文
+///   （与 [`list_pages`] 的宽松哲学一致）；严格解析（Apply 前强制）
+///   是 Ingest 管道的职责，不在此重复。
 ///
 /// 失败情形：非 Vault 报 [`Error::NotAVault`]；路径非法报
 /// [`Error::InvalidPagePath`]；校验通过但读取失败（权限 / 竞争删除）报
 /// [`Error::PageUnreadable`]。
-pub fn read_page(vault_root: impl AsRef<Path>, rel_path: &str) -> Result<String> {
+pub fn read_page_typed(vault_root: impl AsRef<Path>, rel_path: &str) -> Result<ReadPageResult> {
     let root = vault_root.as_ref();
     crate::open_vault(root)?;
     let page = resolve_page_path(root, rel_path)?;
-    fs::read_to_string(&page).map_err(|err| Error::PageUnreadable {
+    let content = fs::read_to_string(&page).map_err(|err| Error::PageUnreadable {
         path: page,
         reason: err.to_string(),
-    })
+    })?;
+    let (frontmatter, body) = match parse_page(&content) {
+        Ok((fm, body)) => (Some(fm), body),
+        // 坏 frontmatter 降级为全文：阅读入口不抛格式错，原始内容可见
+        Err(_) => (None, content),
+    };
+    Ok(ReadPageResult { frontmatter, body })
 }
 
-/// 递归收集 `dir` 下的 `.md` 文件为页面条目（读内容窥探 `updated`）。
+/// 递归收集 `dir` 下的 `.md` 文件为页面条目（读内容窥探展示字段）。
 ///
 /// `dir` 不存在视为空（全新 Vault 尚无该类型页面）；目录存在但读取
 /// 失败（权限等）则如实上抛——静默吞掉会让文件面板展示假空树。
@@ -172,11 +212,24 @@ fn collect_md_pages(dir: &Path, prefix: &str, out: &mut Vec<PageEntry>) -> Resul
             collect_md_pages(&path, &format!("{prefix}/{name}"), out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             let rel = format!("{prefix}/{name}");
-            let updated = fs::read_to_string(&path)
+            let peeked = fs::read_to_string(&path)
                 .ok()
                 .as_deref()
-                .and_then(peek_updated);
-            out.push(PageEntry { path: rel, updated });
+                .map(peek_frontmatter);
+            let (updated, title, aliases) = match peeked {
+                Some(peek) => {
+                    let updated = peek.updated.filter(|t| !t.trim().is_empty());
+                    let title = peek.title.filter(|t| !t.trim().is_empty());
+                    (updated, title, peek.aliases.unwrap_or_default())
+                }
+                None => (None, None, Vec::new()),
+            };
+            out.push(PageEntry {
+                path: rel,
+                updated,
+                title,
+                aliases,
+            });
         }
     }
     Ok(())
@@ -200,16 +253,69 @@ mod tests {
     }
 
     #[test]
-    fn peek_updated_tolerates_missing_or_invalid_frontmatter() {
-        let full = "---\ntype: entity\ntitle: T\naliases: [T]\ntags: []\nrelated: []\nsources: []\ncreated: 2026-10-16T10:00:00+08:00\nupdated: 2026-10-16T11:00:00+08:00\n---\n\n正文\n";
+    fn peek_frontmatter_tolerates_missing_or_invalid_yaml() {
+        let full = "---\ntype: entity\ntitle: T\naliases: [T, TT]\ntags: []\nrelated: []\nsources: []\ncreated: 2026-10-16T10:00:00+08:00\nupdated: 2026-10-16T11:00:00+08:00\n---\n\n正文\n";
+        let peek = peek_frontmatter(full);
+        assert_eq!(peek.updated.as_deref(), Some("2026-10-16T11:00:00+08:00"));
+        assert_eq!(peek.title.as_deref(), Some("T"));
         assert_eq!(
-            peek_updated(full).as_deref(),
-            Some("2026-10-16T11:00:00+08:00")
+            peek.aliases.as_deref(),
+            Some(&["T".to_string(), "TT".to_string()][..])
         );
-        // 缺 frontmatter / 缺字段 / 空值 / YAML 非法：一律 None，不报错
-        assert_eq!(peek_updated("普通 Markdown，无 frontmatter"), None);
-        assert_eq!(peek_updated("---\ntitle: 只有标题\n---\n\n正文\n"), None);
-        assert_eq!(peek_updated("---\nupdated: \"\"\n---\n\n"), None);
-        assert_eq!(peek_updated("---\nupdated: [broken\n---\n\n"), None);
+
+        // 缺 frontmatter / 缺字段 / 空值 / YAML 非法：一律缺省，不报错
+        let empty = peek_frontmatter("普通 Markdown，无 frontmatter");
+        assert_eq!(empty.updated, None);
+        assert_eq!(empty.title, None);
+        assert_eq!(empty.aliases, None);
+        let partial = peek_frontmatter("---\ntitle: 只有标题\n---\n\n正文\n");
+        assert_eq!(partial.title.as_deref(), Some("只有标题"));
+        assert_eq!(partial.updated, None);
+        assert_eq!(partial.aliases, None);
+        // 窥探是原样的：空值过滤（updated/title 空白视为无）在收集侧完成
+        let blank = peek_frontmatter("---\nupdated: \"\"\ntitle: \"  \"\n---\n\n");
+        assert_eq!(blank.updated.as_deref(), Some(""));
+        assert_eq!(blank.title.as_deref(), Some("  "));
+        let broken = peek_frontmatter("---\nupdated: [broken\n---\n\n");
+        assert_eq!(broken.updated, None);
+    }
+
+    /// read_page_typed：合法 frontmatter 页面返回结构化字段 + 去头正文；
+    /// index.md 类无 frontmatter 文件宽松返回 None + 全文；坏 frontmatter
+    /// 同样降级而非报错（浏览不因单个坏页面卡死）。
+    #[test]
+    fn read_page_typed_splits_frontmatter_and_degrades_gracefully() {
+        let dir = tempfile::tempdir().expect("tempdir 失败");
+        let root = dir.path().join("vault");
+        crate::create_vault(&root, &crate::template::TemplateId::from("generic"))
+            .expect("建 Vault 失败");
+        let entity = root.join("wiki/entities");
+        fs::create_dir_all(&entity).expect("建目录失败");
+        fs::write(
+            entity.join("transformer.md"),
+            "---\ntype: entity\ntitle: Transformer\naliases: [Transformer 架构]\ntags: [dl]\nrelated: []\nsources: []\ncreated: 2026-10-16T10:00:00+08:00\nupdated: 2026-10-16T11:00:00+08:00\n---\n\n正文第一段。\n",
+        )
+        .expect("写页面失败");
+        fs::write(root.join("wiki/index.md"), "# Wiki Index\n\n（暂无页面）\n")
+            .expect("写 index 失败");
+        fs::write(
+            entity.join("broken.md"),
+            "---\ntitle: 缺 aliases 的坏页面\n---\n\n正文。\n",
+        )
+        .expect("写坏页面失败");
+
+        let typed = read_page_typed(&root, "entities/transformer.md").expect("读取失败");
+        let fm = typed.frontmatter.expect("合法 frontmatter 应有值");
+        assert_eq!(fm.title, "Transformer");
+        assert_eq!(fm.aliases, vec!["Transformer 架构"]);
+        assert_eq!(typed.body, "正文第一段。\n");
+
+        let index = read_page_typed(&root, "index.md").expect("index.md 应可读（目录入口）");
+        assert!(index.frontmatter.is_none(), "index.md 无 frontmatter");
+        assert!(index.body.contains("（暂无页面）"), "body 应为全文");
+
+        let broken = read_page_typed(&root, "entities/broken.md").expect("坏页面不应报错");
+        assert!(broken.frontmatter.is_none(), "坏 frontmatter 宽松降级");
+        assert!(broken.body.contains("title: 缺 aliases 的坏页面"));
     }
 }

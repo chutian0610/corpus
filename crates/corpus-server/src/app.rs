@@ -22,7 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use corpus_engine::{
     builtin_template_infos, create_vault, ingest_file, list_pages, open_vault, test_connection,
     AppConfig, ConnectionReport, IngestFileReport, IngestStage, ModelTier, OpenedVault, PageTree,
-    RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    ReadPageResult, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
 
 use crate::error::{ApiError, ApiJson};
@@ -48,7 +48,7 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
         .route("/vaults/open", post(open_vault_handler))
         .route("/vaults/recent", get(list_recent).delete(remove_recent))
         .route("/vaults/pages", get(pages))
-        .route("/vaults/page", get(read_page))
+        .route("/vaults/page", get(read_page_typed))
         .route("/fs/list", get(fs_list))
         .route("/config", get(get_config).put(put_config))
         .route("/config/test-connection", post(test_connection_handler))
@@ -238,16 +238,20 @@ async fn pages(Query(q): Query<HashMap<String, String>>) -> Result<Json<PageTree
     Ok(Json(list_pages(&vault)?))
 }
 
-/// 只读读取 wiki/ 某页面原始文本（对应 read_page 命令，预览用）。
+/// 只读读取 wiki/ 某页面（对应 read_page_typed 命令，T4 页面渲染用）。
 ///
-/// 全部校验与读取都在引擎 [`corpus_engine::read_page`] 单一入口（open_vault
-/// 级 Vault 校验 + resolve_page_path 路径安全关口 + 读原文三段：拒绝绝对
-/// 路径 / `..` 逃逸 / 非 `.md` / symlink 逃逸）——HTTP 层不重复造轮子，
-/// 也不因「服务只绑本机」而绕过校验，与桌面壳同一口径。
-async fn read_page(Query(q): Query<HashMap<String, String>>) -> Result<Json<String>, ApiError> {
+/// 全部校验与读取都在引擎 [`corpus_engine::read_page_typed`] 单一入口
+/// （open_vault 级 Vault 校验 + resolve_page_path 路径安全关口 + 结构化
+/// frontmatter/正文分离：拒绝绝对路径 / `..` 逃逸 / 非 `.md` / symlink
+/// 逃逸）——HTTP 层不重复造轮子，也不因「服务只绑本机」而绕过校验，
+/// 与桌面壳同一口径。无 frontmatter 的页面（wiki/index.md 等）宽松返回
+/// `frontmatter: null`。
+async fn read_page_typed(
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<ReadPageResult>, ApiError> {
     let vault = q_param(&q, "vault")?;
     let rel = q_param(&q, "rel")?;
-    Ok(Json(corpus_engine::read_page(&vault, &rel)?))
+    Ok(Json(corpus_engine::read_page_typed(&vault, &rel)?))
 }
 
 /// 读取全局配置（对应 get_config 命令）。
@@ -698,30 +702,47 @@ mod tests {
         let _ = env; // TempDir 与 store 一同存活
     }
 
-    /// 验收：read_page 对 `../` 逃逸返回错误（引擎单关口，HTTP 层不绕过）；
-    /// 正常路径可读出页面原文。
+    /// 验收：read_page_typed 对 `../` 逃逸返回错误（引擎单关口，HTTP 层
+    /// 不绕过）；正常路径可读出结构化 frontmatter/正文，无 frontmatter
+    /// 的页面（wiki/index.md 等）宽松返回 `frontmatter: null`（T4）。
     #[tokio::test]
-    async fn read_page_rejects_path_escape_and_serves_page() {
+    async fn read_page_typed_rejects_escape_and_serves_structured_page() {
         let env = test_env();
         let vault_dir = tempfile::tempdir().expect("tempdir 失败");
         let vault_path = vault_dir.path().join("vault");
         corpus_engine::create_vault(&vault_path, &TemplateId::from("generic"))
             .expect("建 Vault 失败");
-        let sources = vault_path.join("wiki/sources");
-        std::fs::create_dir_all(&sources).expect("建 sources 失败");
-        std::fs::write(sources.join("hello.md"), "# Hello\n正文内容").expect("写页面失败");
+        let entities = vault_path.join("wiki/entities");
+        std::fs::create_dir_all(&entities).expect("建目录失败");
+        std::fs::write(
+            entities.join("hello.md"),
+            "---\ntype: entity\ntitle: Hello\naliases: [Hello]\ntags: []\nrelated: []\nsources: []\ncreated: 2026-10-16T10:00:00+08:00\nupdated: 2026-10-16T11:00:00+08:00\n---\n\n正文内容",
+        )
+        .expect("写页面失败");
 
         let vault_enc = vault_path.to_string_lossy();
 
         let (status, body) = send(
             &env.app,
             get(&format!(
-                "/api/vaults/page?vault={vault_enc}&rel=sources/hello.md"
+                "/api/vaults/page?vault={vault_enc}&rel=entities/hello.md"
             )),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::Value::String("# Hello\n正文内容".into()));
+        assert_eq!(body["frontmatter"]["title"], "Hello");
+        assert_eq!(body["frontmatter"]["aliases"][0], "Hello");
+        assert_eq!(body["body"], "正文内容");
+
+        // 无 frontmatter 的 index.md：宽松降级（T4 目录入口）
+        let (status, body) = send(
+            &env.app,
+            get(&format!("/api/vaults/page?vault={vault_enc}&rel=index.md")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["frontmatter"].is_null());
+        assert!(body["body"].as_str().unwrap().contains("Wiki Index"));
 
         for rel in ["../purpose.md", "../../outside.md", "..%2Fpurpose.md"] {
             let (status, body) = send(
@@ -740,7 +761,7 @@ mod tests {
         let (status, _) = send(
             &env.app,
             get(&format!(
-                "/api/vaults/page?vault={other}&rel=sources/hello.md"
+                "/api/vaults/page?vault={other}&rel=entities/hello.md"
             )),
         )
         .await;
