@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// 页面类型（核心页面三兄弟；Topic / Query 等后续票据引入）。
+/// 页面类型（核心三兄弟 + Query；Topic 等后续票据引入）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PageKind {
@@ -24,14 +24,21 @@ pub enum PageKind {
     Entity,
     /// Concept：抽象概念（`wiki/concepts/`）。
     Concept,
+    /// Query page：一次查询沉淀的页面（`wiki/queries/`，T9）。
+    Query,
 }
 
 impl PageKind {
-    /// 全部页面类型（固定顺序：Source / Entity / Concept）。
+    /// 全部页面类型（固定顺序：Source / Entity / Concept / Query）。
     ///
     /// 遍历各类型目录的代码（如 [`crate::wiki::list_pages`]）从这里取
     /// 清单，不各自硬编码，新增类型时只改这一处。
-    pub const ALL: [PageKind; 3] = [PageKind::Source, PageKind::Entity, PageKind::Concept];
+    pub const ALL: [PageKind; 4] = [
+        PageKind::Source,
+        PageKind::Entity,
+        PageKind::Concept,
+        PageKind::Query,
+    ];
 
     /// 单一数据源：该类型页面在 `wiki/` 下的子目录名与 `type` 字段取值
     /// （`.0` 为 dir、`.1` 为 id），dir()/as_str() 都从这里派生。
@@ -40,6 +47,7 @@ impl PageKind {
             PageKind::Source => ("sources", "source"),
             PageKind::Entity => ("entities", "entity"),
             PageKind::Concept => ("concepts", "concept"),
+            PageKind::Query => ("queries", "query"),
         }
     }
 
@@ -311,6 +319,7 @@ mod tests {
             (PageKind::Source, "sources", "source"),
             (PageKind::Entity, "entities", "entity"),
             (PageKind::Concept, "concepts", "concept"),
+            (PageKind::Query, "queries", "query"),
         ] {
             assert_eq!(kind.dir(), dir);
             assert_eq!(kind.as_str(), id);

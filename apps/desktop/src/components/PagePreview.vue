@@ -294,6 +294,12 @@ function onMetaLinkClick(ev: MouseEvent, target: string): void {
   color: var(--danger);
 }
 
+.badge-query {
+  background: var(--accent-soft);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
 .chip {
   padding: 1px 8px;
   border-radius: 999px;

@@ -51,16 +51,24 @@ pub struct VaultMeta {
 /// 只承载 Wiki 与骨架）。
 const CORPUS_GITIGNORE: &str = "state.db\nllm-calls.log\nllm-debug.log\nllm-debug.log.1\n";
 
-/// `wiki/index.md` 初始内容（内容目录，由引擎维护）。
-const INDEX_MD: &str = "\
+/// `wiki/index.md` 的固定头部（内容目录的标题与说明；页面行由引擎在
+/// 每次 Apply / 查询沉淀时**全量重建**追加在 `## 页面` 之后）。
+///
+/// 页面行为富行（T9）：`- [[path|title]] — 摘要首句 · N 源`，由
+/// [`crate::ingest::rebuild_index`] 从磁盘全量页面生成——本头部与重建
+/// 输出拼装，两处口径以此常量为单一数据源。
+pub(crate) const INDEX_MD_HEADER: &str = "\
 # Wiki Index
 
 本文件由 Corpus 引擎维护，是 Wiki 的内容目录。请勿手工编辑。
 
 ## 页面
 
-（暂无页面）
 ";
+
+/// `wiki/index.md` 初始内容（头部 + 空目录占位；占位在首次 Apply 的
+/// 全量重建中被自然清除）。
+const INDEX_MD_PLACEHOLDER: &str = "（暂无页面）\n";
 
 /// `wiki/log.md` 的文件头；其后跟第一条可 grep 的时序记录。
 const LOG_MD_HEADER: &str = "\
@@ -135,7 +143,10 @@ pub fn create_vault<P: AsRef<Path>>(path: P, template_id: &TemplateId) -> Result
     )?;
 
     // 内容目录
-    fs::write(root.join("wiki/index.md"), INDEX_MD)?;
+    fs::write(
+        root.join("wiki/index.md"),
+        format!("{INDEX_MD_HEADER}{INDEX_MD_PLACEHOLDER}"),
+    )?;
     // 时序日志：首条记录为可 grep 的 `## [YYYY-MM-DD] init | Vault`
     let today = chrono::Local::now().format("%Y-%m-%d");
     fs::write(

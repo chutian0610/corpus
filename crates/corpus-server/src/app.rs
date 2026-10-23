@@ -22,7 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use corpus_engine::{
     builtin_template_infos, create_vault, ingest_file, list_pages, open_vault, test_connection,
     AppConfig, ConnectionReport, IngestFileReport, IngestStage, ModelTier, OpenedVault, PageTree,
-    ReadPageResult, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    QueryEvent, QueryOutcome, ReadPageResult, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
 
 use crate::error::{ApiError, ApiJson};
@@ -30,6 +30,10 @@ use crate::state::AppState;
 
 /// SSE 进度事件名（前端 EventSource addEventListener 同名）。
 pub const INGEST_PROGRESS_SSE_EVENT: &str = "ingest-progress";
+
+/// 查询流式进度事件名（T9）：通道已泛化为「事件名 + payload」对，
+/// 新增事件类型只是发新的名字对，通道与 SSE 写循环零改动。
+pub const QUERY_PROGRESS_SSE_EVENT: &str = "query-progress";
 
 /// 广播对（事件名 + JSON payload）→ SSE 事件的单一映射：按事件名输出
 /// `event: <名>`（data 为 payload 的 JSON）。payload 序列化失败丢弃该
@@ -53,6 +57,7 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
         .route("/config", get(get_config).put(put_config))
         .route("/config/test-connection", post(test_connection_handler))
         .route("/ingest", post(ingest))
+        .route("/query", post(query_ask))
         .route("/events", get(events))
         .with_state(state.clone());
 
@@ -325,6 +330,51 @@ async fn ingest(
     Ok(Json(report))
 }
 
+#[derive(Debug, Deserialize)]
+struct QueryAskReq {
+    vault_path: String,
+    question: String,
+}
+
+/// 自然语言查询（对应桌面 query_ask 命令，T9）：整体委托引擎
+/// [`corpus_engine::query`]（词法候选 → strong 档流式综合 → 按
+/// `query_pages` 沉淀 Query page），双壳行为一致。
+///
+/// - **与 ingest 共用全局互斥**（同一 `ingest_lock`）：查询是只读 +
+///   沉淀写单页，但沉淀写的是同一个 git 仓库（Query page + index +
+///   log + 提交），与摄取并发会交织 git 提交——同一时刻只允许一个
+///   写事务，`try_lock` 命中即 409；
+/// - **流式进度**：`on_event` 回调以新事件名 `query-progress` 发往
+///   既有广播通道，经 GET /api/events 的 SSE 连接推送（通道已是
+///   「事件名 + payload」对，零改动扩展）；本响应等到查询完成，
+///   body 即完整 [`QueryOutcome`]（与 Tauri 命令的 await 语义一致）。
+async fn query_ask(
+    State(state): State<AppState>,
+    ApiJson(req): ApiJson<QueryAskReq>,
+) -> Result<Json<QueryOutcome>, ApiError> {
+    let _guard = state.ingest_lock.try_lock().map_err(|_| {
+        ApiError::conflict(
+            "已有另一个摄取或查询正在进行（服务端同一时刻只允许一个写事务），请等待其完成后再试",
+        )
+    })?;
+    let config = state.store.get_config()?;
+    let progress_tx = state.progress_tx.clone();
+    let outcome = corpus_engine::query(
+        &req.vault_path,
+        &req.question,
+        &config,
+        move |event: QueryEvent| {
+            // 引擎 QueryEvent 即纯数据 enum，序列化不会失败（失败落 Null
+            // 只影响该条进度展示）；无订阅者 / 通道满时 send 出错只丢
+            // 进度，不阻断查询。
+            let payload = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+            let _ = progress_tx.send((QUERY_PROGRESS_SSE_EVENT.to_string(), payload));
+        },
+    )
+    .await?;
+    Ok(Json(outcome))
+}
+
 /// SSE 事件流：把广播通道的「事件名 + JSON payload」对经 [`sse_event`]
 /// 转成 `event: <名>` 逐条输出。同源 EventSource 直连（本机源校验
 /// 中间件放行本机源）。订阅晚于事件发出时拿不到先前
@@ -594,6 +644,7 @@ mod tests {
                 "/api/ingest",
                 &json!({"vault_path": "/x", "src_path": "/y"}),
             ),
+            post_json("/api/query", &json!({"vault_path": "/x", "question": "q"})),
             get("/api/events?token=irrelevant"),
         ] {
             let (req, _) = {
@@ -891,6 +942,49 @@ mod tests {
         let message = body["message"].as_str().unwrap_or_default();
         assert!(
             !message.contains("已有另一个摄取"),
+            "互斥释放后不得再报并发冲突：{message}"
+        );
+    }
+
+    /// 验收（T9）：查询与摄取**共用同一把全局互斥**——查询沉淀写的是
+    /// 同一个 git 仓库（Query page + index + log + 提交），与摄取并发
+    /// 会交织提交。预锁命中即 409（互斥检查先于引擎调用与 Vault 校验，
+    /// 无需真实 Vault）；释放后非 Vault 请求落回引擎的 400（不得再报
+    /// 并发冲突）。真实查询链路由引擎 Fake 端口测试 + e2e（假 LLM）
+    /// 覆盖，server 层无注入点（与 ingest 同口径）。
+    #[tokio::test]
+    async fn concurrent_query_shares_ingest_lock_409() {
+        let env = test_env();
+        let _guard = env.state.ingest_lock.lock().await;
+
+        let (status, body) = send(
+            &env.app,
+            post_json(
+                "/api/query",
+                &json!({"vault_path": "/tmp/any", "question": "测试"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let message = body["message"].as_str().expect("409 应为 {message}");
+        assert!(
+            message.contains("查询") && message.contains("正在进行"),
+            "409 文案应说明查询共用写事务互斥：{message}"
+        );
+
+        drop(_guard);
+        let (status, body) = send(
+            &env.app,
+            post_json(
+                "/api/query",
+                &json!({"vault_path": "/tmp/any", "question": "测试"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "非 Vault 落引擎 400");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("正在进行"),
             "互斥释放后不得再报并发冲突：{message}"
         );
     }
