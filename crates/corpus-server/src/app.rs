@@ -22,7 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use corpus_engine::{
     builtin_template_infos, create_vault, ingest_file, list_pages, open_vault, test_connection,
     AppConfig, ConnectionReport, IngestFileReport, IngestStage, ModelTier, OpenedVault, PageTree,
-    ReadPageResult, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    QueryEvent, QueryOutcome, ReadPageResult, RecentVault, TemplateId, TemplateInfo, VaultInfo,
 };
 
 use crate::error::{ApiError, ApiJson};
@@ -30,6 +30,10 @@ use crate::state::AppState;
 
 /// SSE 进度事件名（前端 EventSource addEventListener 同名）。
 pub const INGEST_PROGRESS_SSE_EVENT: &str = "ingest-progress";
+
+/// 查询流式进度事件名（T9）：通道已泛化为「事件名 + payload」对，
+/// 新增事件类型只是发新的名字对，通道与 SSE 写循环零改动。
+pub const QUERY_PROGRESS_SSE_EVENT: &str = "query-progress";
 
 /// 广播对（事件名 + JSON payload）→ SSE 事件的单一映射：按事件名输出
 /// `event: <名>`（data 为 payload 的 JSON）。payload 序列化失败丢弃该
@@ -53,6 +57,7 @@ pub fn build_router(state: AppState, dist: &Path) -> Router {
         .route("/config", get(get_config).put(put_config))
         .route("/config/test-connection", post(test_connection_handler))
         .route("/ingest", post(ingest))
+        .route("/query", post(query_ask))
         .route("/events", get(events))
         .with_state(state.clone());
 
@@ -293,7 +298,8 @@ struct IngestReq {
 ///   多请求环境，并发摄取会交织 git 提交与指纹状态，同一时刻只允许
 ///   一个；桌面壳无此限制（Tauri 单窗口天然串行）——这是 web 形态
 ///   新增的语义，且 guard 随 handler future 结束（含 panic unwind 后
-///   由 Mutex 修复毒锁语义）自动释放；
+///   由 Mutex 修复毒锁语义）自动释放。查询（`query_ask`）不占此锁：
+///   写盘并发安全由引擎级写锁兜底（见其注释）；
 /// - **进度不经本响应**：`on_progress` 回调发 broadcast channel，由
 ///   GET /api/events 的 SSE 连接以 `event: ingest-progress` 推送；
 ///   本响应等到摄取完成，body 即完整 [`IngestFileReport`]（与 Tauri
@@ -323,6 +329,47 @@ async fn ingest(
     )
     .await?;
     Ok(Json(report))
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryAskReq {
+    vault_path: String,
+    question: String,
+}
+
+/// 自然语言查询（对应桌面 query_ask 命令，T9）：整体委托引擎
+/// [`corpus_engine::query`]（词法候选 → strong 档流式综合 → 按
+/// `query_pages` 沉淀 Query page），双壳行为一致。
+///
+/// - **不占 [`AppState::ingest_lock`]**：该锁只守「摄取 vs 摄取」的
+///   壳层互斥（见 `ingest` 注释）；查询的并发安全已下沉引擎——引擎
+///   级写锁只串行化 ingest apply 与 query 沉淀共用的落盘事务核心
+///   （`write_pages_and_commit`），LLM 调用阶段不持锁，查询与摄取
+///   互不阻塞，这里无需再加壳层互斥与 409 分支；
+/// - **流式进度**：`on_event` 回调以新事件名 `query-progress` 发往
+///   既有广播通道，经 GET /api/events 的 SSE 连接推送（通道已是
+///   「事件名 + payload」对，零改动扩展）；本响应等到查询完成，
+///   body 即完整 [`QueryOutcome`]（与 Tauri 命令的 await 语义一致）。
+async fn query_ask(
+    State(state): State<AppState>,
+    ApiJson(req): ApiJson<QueryAskReq>,
+) -> Result<Json<QueryOutcome>, ApiError> {
+    let config = state.store.get_config()?;
+    let progress_tx = state.progress_tx.clone();
+    let outcome = corpus_engine::query(
+        &req.vault_path,
+        &req.question,
+        &config,
+        move |event: QueryEvent| {
+            // 引擎 QueryEvent 即纯数据 enum，序列化不会失败（失败落 Null
+            // 只影响该条进度展示）；无订阅者 / 通道满时 send 出错只丢
+            // 进度，不阻断查询。
+            let payload = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+            let _ = progress_tx.send((QUERY_PROGRESS_SSE_EVENT.to_string(), payload));
+        },
+    )
+    .await?;
+    Ok(Json(outcome))
 }
 
 /// SSE 事件流：把广播通道的「事件名 + JSON payload」对经 [`sse_event`]
@@ -594,6 +641,7 @@ mod tests {
                 "/api/ingest",
                 &json!({"vault_path": "/x", "src_path": "/y"}),
             ),
+            post_json("/api/query", &json!({"vault_path": "/x", "question": "q"})),
             get("/api/events?token=irrelevant"),
         ] {
             let (req, _) = {
@@ -892,6 +940,36 @@ mod tests {
         assert!(
             !message.contains("已有另一个摄取"),
             "互斥释放后不得再报并发冲突：{message}"
+        );
+    }
+
+    /// 验收（T9 评审修正）：查询**不再占用** `ingest_lock`（壳层 409
+    /// 分支已移除）——预锁摄取互斥后查询照常进入引擎（并发安全由引
+    ///擎级写锁兜底，LLM 阶段不持锁），非 Vault 请求落引擎的 400 而非
+    /// 任何并发冲突。真实查询链路由引擎 Fake 端口测试 + e2e（假 LLM）
+    /// 覆盖，server 层无注入点（与 ingest 同口径）。
+    #[tokio::test]
+    async fn query_does_not_contend_with_ingest_lock() {
+        let env = test_env();
+        let _guard = env.state.ingest_lock.lock().await;
+
+        let (status, body) = send(
+            &env.app,
+            post_json(
+                "/api/query",
+                &json!({"vault_path": "/tmp/any", "question": "测试"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "查询不得因摄取互斥被 409：{body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("正在进行") && !message.contains("冲突"),
+            "查询不得报并发冲突（引擎写锁兜底）：{message}"
         );
     }
 

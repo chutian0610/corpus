@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// 页面类型（核心页面三兄弟；Topic / Query 等后续票据引入）。
+/// 页面类型（核心三兄弟 + Query；Topic 等后续票据引入）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PageKind {
@@ -24,14 +24,21 @@ pub enum PageKind {
     Entity,
     /// Concept：抽象概念（`wiki/concepts/`）。
     Concept,
+    /// Query page：一次查询沉淀的页面（`wiki/queries/`，T9）。
+    Query,
 }
 
 impl PageKind {
-    /// 全部页面类型（固定顺序：Source / Entity / Concept）。
+    /// 全部页面类型（固定顺序：Source / Entity / Concept / Query）。
     ///
     /// 遍历各类型目录的代码（如 [`crate::wiki::list_pages`]）从这里取
     /// 清单，不各自硬编码，新增类型时只改这一处。
-    pub const ALL: [PageKind; 3] = [PageKind::Source, PageKind::Entity, PageKind::Concept];
+    pub const ALL: [PageKind; 4] = [
+        PageKind::Source,
+        PageKind::Entity,
+        PageKind::Concept,
+        PageKind::Query,
+    ];
 
     /// 单一数据源：该类型页面在 `wiki/` 下的子目录名与 `type` 字段取值
     /// （`.0` 为 dir、`.1` 为 id），dir()/as_str() 都从这里派生。
@@ -40,6 +47,7 @@ impl PageKind {
             PageKind::Source => ("sources", "source"),
             PageKind::Entity => ("entities", "entity"),
             PageKind::Concept => ("concepts", "concept"),
+            PageKind::Query => ("queries", "query"),
         }
     }
 
@@ -155,6 +163,72 @@ pub fn wikilink(link: &str, title: &str) -> String {
     } else {
         format!("[[{link}|{title}]]")
     }
+}
+
+// ---------------------------------------------------------------------------
+// wikilink 扫描（单一解析实现，query 引用提取与 ingest 摘要剥标记共用）
+// ---------------------------------------------------------------------------
+
+/// 扫描产物：文本中一个**完整** wikilink 的解析结果。
+///
+/// `target` 是 `|` 前的目标（trim 后）；`label` 是展示文本（`|` 后部分
+/// 原样保留，无 `|` 时为整个内层）——分别对应引用提取与摘要剥标记的
+/// 既有口径。`start` / `end` 是完整链接（含双方括号）在原文中的字节
+/// 范围，供按原文重构非链接段落。
+#[derive(Debug)]
+pub(crate) struct WikilinkHit {
+    /// 完整链接的字节起点（`[[` 处）。
+    pub start: usize,
+    /// 完整链接的字节终点（`]]` 之后）。
+    pub end: usize,
+    /// 目标（`|` 前部分，trim 后）。
+    pub target: String,
+    /// 展示文本（`|` 后部分原样；无 `|` 时为整个内层）。
+    pub label: String,
+}
+
+/// 扫描文本中的全部完整 wikilink（`[[target]]` / `[[target|label]]`）。
+///
+/// 引擎侧 wikilink 语法检查的**唯一实现**（此前 query.rs 与 ingest.rs
+/// 各有一份手写扫描，已收敛于此）：遇到未闭合的 `[[`（其后不再有
+/// `]]`）即按字面文本容错、终止扫描——与前端渲染管线同一口径；所有
+/// 产物都是完整链接。
+pub(crate) fn scan_wikilinks(text: &str) -> Vec<WikilinkHit> {
+    let mut hits = Vec::new();
+    let mut rest = text;
+    let mut offset = 0usize;
+    while let Some(pos) = rest.find("[[") {
+        let after = &rest[pos + 2..];
+        let Some(end) = after.find("]]") else {
+            break; // 未闭合：其后不会再有完整链接（同段尾部无 `]]`）
+        };
+        let inner = &after[..end];
+        let (target, label) = match inner.split_once('|') {
+            Some((t, l)) => (t.trim(), l),
+            None => (inner.trim(), inner),
+        };
+        let end_abs = offset + pos + 2 + end + 2;
+        hits.push(WikilinkHit {
+            start: offset + pos,
+            end: end_abs,
+            target: target.to_string(),
+            label: label.to_string(),
+        });
+        rest = &rest[pos + 2 + end + 2..];
+        offset = end_abs;
+    }
+    hits
+}
+
+/// 提取文本中全部完整 wikilink 的目标列表（按出现顺序；空目标跳过）。
+///
+/// 未闭合的 `[[` 按文本容错（不产生目标），见 [`scan_wikilinks`]。
+pub(crate) fn extract_wikilink_targets(text: &str) -> Vec<String> {
+    scan_wikilinks(text)
+        .into_iter()
+        .filter(|hit| !hit.target.is_empty())
+        .map(|hit| hit.target)
+        .collect()
 }
 
 /// 分离 frontmatter 与正文；非 `---\n` 开头或找不到结束分隔时返回 `None`。
@@ -311,6 +385,7 @@ mod tests {
             (PageKind::Source, "sources", "source"),
             (PageKind::Entity, "entities", "entity"),
             (PageKind::Concept, "concepts", "concept"),
+            (PageKind::Query, "queries", "query"),
         ] {
             assert_eq!(kind.dir(), dir);
             assert_eq!(kind.as_str(), id);
@@ -340,5 +415,50 @@ mod tests {
     fn parse_page_rejects_missing_frontmatter() {
         assert!(parse_page("没有分隔线的普通 markdown").is_err());
         assert!(parse_page("---\ntitle: 只有半截").is_err());
+    }
+
+    #[test]
+    fn scan_wikilinks_extracts_targets_labels_and_ranges() {
+        let text = "见 [[entities/a|A 页]] 与 [[b]]，空壳 [[]] 原样交由过滤。";
+        let hits = scan_wikilinks(text);
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].target, "entities/a");
+        assert_eq!(hits[0].label, "A 页");
+        assert_eq!(&text[hits[0].start..hits[0].end], "[[entities/a|A 页]]");
+        assert_eq!(hits[1].target, "b");
+        assert_eq!(hits[1].label, "b", "短形式的 label = 整个内层");
+        // 空目标仍产生 hit（过滤职责在 extract_wikilink_targets）
+        assert_eq!(hits[2].target, "");
+    }
+
+    #[test]
+    fn scan_wikilinks_tolerates_unclosed_bracket_and_rebuilds_text() {
+        // 未闭合的 [[ 按字面容错：它与其后文本都不是链接
+        assert!(scan_wikilinks("悬空 [[断掉").is_empty());
+        assert!(scan_wikilinks("无链接").is_empty());
+        // 完整链接 + 尾部悬空：只取完整者
+        let text = "前 [[a|甲]] 中 [[b 尾";
+        let hits = scan_wikilinks(text);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target, "a");
+        // 扫描产物可无损重构「非链接原文」（strip_wikilinks 的实现路径）
+        let mut rebuilt = String::new();
+        let mut offset = 0usize;
+        for hit in &hits {
+            rebuilt.push_str(&text[offset..hit.start]);
+            rebuilt.push_str(&hit.label);
+            offset = hit.end;
+        }
+        rebuilt.push_str(&text[offset..]);
+        assert_eq!(rebuilt, "前 甲 中 [[b 尾");
+    }
+
+    #[test]
+    fn extract_wikilink_targets_keeps_order_and_skips_empty() {
+        assert_eq!(
+            extract_wikilink_targets("A [[x|X]] B [[y]] C [[x|X 再现]] [[]] 尾 [[断"),
+            vec!["x".to_string(), "y".to_string(), "x".to_string()]
+        );
+        assert!(extract_wikilink_targets("没有链接").is_empty());
     }
 }

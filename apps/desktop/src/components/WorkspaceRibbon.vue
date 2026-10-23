@@ -1,15 +1,15 @@
 <script setup lang="ts">
 /** 工作区左窄 ribbon（图标竖条，Obsidian 式）：
- *  上部功能入口（摄取可用；查询/图谱/Lint 置灰并标注后续票据），
+ *  上部功能入口（摄取 / 查询可用；图谱/Lint 置灰并标注后续票据），
  *  底部设置齿轮与「切换 Vault」（回启动页）。
  *  图标为内联 SVG（stroke 风格），不引入图标库依赖。 */
 defineProps<{
-  /** 高亮的活动入口（'ingest' | 'settings'）；文件预览时无功能入口高亮。 */
-  active: 'ingest' | 'settings' | null
+  /** 高亮的活动入口（'ingest' | 'query' | 'settings'）；文件预览时无功能入口高亮。 */
+  active: 'ingest' | 'query' | 'settings' | null
 }>()
 
 const emit = defineEmits<{
-  (e: 'selectPanel', panel: 'ingest' | 'settings'): void
+  (e: 'selectPanel', panel: 'ingest' | 'query' | 'settings'): void
   (e: 'switchVault'): void
 }>()
 </script>
@@ -35,17 +35,17 @@ const emit = defineEmits<{
 
       <button
         type="button"
-        class="ribbon-btn disabled"
-        disabled
-        title="查询 · 属后续票据 T9"
-        aria-label="查询（未实现，属票据 T9）"
+        class="ribbon-btn"
+        :class="{ active: active === 'query' }"
+        title="查询（Query）：自然语言提问，词法候选 → LLM 综合 → 沉淀 Query page"
+        aria-label="查询"
+        @click="emit('selectPanel', 'query')"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="11" cy="11" r="7" />
           <path d="m20 20-3.8-3.8" />
         </svg>
         <span class="ribbon-label">查询</span>
-        <span class="ribbon-badge">T9</span>
       </button>
 
       <button

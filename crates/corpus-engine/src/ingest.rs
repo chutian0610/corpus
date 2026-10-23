@@ -8,8 +8,9 @@
 //!   为 Source page 与每个 Entity/Concept 成文 → 组装 [`IngestDraft`]
 //!   （内存变更集，可整体检视/丢弃，不产生任何写入与提交）；
 //! - [`apply`]（第二步，显式落盘）：全页面原子写 + git add/commit
-//!   （恰好一个提交）+ log.md 追加 + index.md 增量更新 + 指纹记录；
-//!   任一步失败恢复快照并清空暂存区，不留半写状态。
+//!   （恰好一个提交）+ log.md 追加 + index.md 全量重建（T9 富行，见
+//!   [`rebuild_index`]）+ 指纹记录；任一步失败恢复快照并清空暂存区，
+//!   不留半写状态。
 //!   自动执行还是人审触发由配置 `apply_mode` 决定，引擎不预设——
 //!   壳层读到 `manual` 时不调 apply，Draft 留待人审。
 //!
@@ -646,9 +647,9 @@ Every item MUST have a non-empty title; aliases must contain at least the \
 title itself when no better alias exists; use [] when a list is empty.";
 
 /// 流式进度节流：距上次上报至少这么久（时间阈值）……
-const REPORT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+pub(crate) const REPORT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 /// ……或累计新增至少这么多字符（字符阈值），二者满足其一才上报。
-const REPORT_MIN_NEW_CHARS: usize = 50;
+pub(crate) const REPORT_MIN_NEW_CHARS: usize = 50;
 
 /// 第一步（分析）的输出熔断上限（字符）。正常分析 JSON 应在几千字内，
 /// 远小于此值；超过即视为模型复述原文 / 陷入重复，该次调用按失败处理。
@@ -714,7 +715,8 @@ pub(crate) struct LlmCallRecorder {
 }
 
 impl LlmCallRecorder {
-    fn new(vault_root: &Path) -> Self {
+    /// 构造（绑定 Vault，日志落在其 `.corpus/` 内）。
+    pub(crate) fn new(vault_root: &Path) -> Self {
         Self {
             vault_root: vault_root.to_path_buf(),
             calls: Vec::new(),
@@ -723,7 +725,7 @@ impl LlmCallRecorder {
 
     /// 记录一条统计：追加日志行（best-effort，失败只打 stderr 不阻断
     /// 摄取——诊断数据不能反噬主流程）+ 累积进内存（进报告）。
-    fn record(&mut self, stats: LlmCallStats) {
+    pub(crate) fn record(&mut self, stats: LlmCallStats) {
         if let Err(err) = append_llm_call_line(&self.vault_root, &stats) {
             eprintln!("追加 LLM 调用日志失败（不影响摄取结果）：{err}");
         }
@@ -740,7 +742,7 @@ impl LlmCallRecorder {
     /// 解析或校验违约）；成功调用仅在 `CORPUS_DEBUG=1` 时全量记录。
     /// Best-effort：写日志失败只打 stderr，绝不影响摄取主流程。
     #[allow(clippy::too_many_arguments)]
-    fn record_debug(
+    pub(crate) fn record_debug(
         &self,
         tier: LlmTier,
         purpose: LlmCallPurpose,
@@ -1334,7 +1336,7 @@ struct PlannedPage {
 }
 
 /// 名称归一化：去首尾空白 + 小写（精确名匹配不区分大小写）。
-fn normalize_name(name: &str) -> String {
+pub(crate) fn normalize_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
@@ -1342,7 +1344,7 @@ fn normalize_name(name: &str) -> String {
 /// 四处收敛于此）：把 `incoming` 去空白、去重后并入 `aliases`（跳过与
 /// `title` 或既有项重复的别名，不区分大小写），并保证 `title` 自身在
 /// 集合内——「aliases 非空不变量」由此兜底。
-fn merge_aliases(aliases: &mut Vec<String>, incoming: &[String], title: &str) {
+pub(crate) fn merge_aliases(aliases: &mut Vec<String>, incoming: &[String], title: &str) {
     let push_unique = |aliases: &mut Vec<String>, value: String| {
         let normalized = normalize_name(&value);
         if normalized != normalize_name(title)
@@ -1700,7 +1702,7 @@ fn parse_written(output: &str) -> Result<(WrittenPages, bool)> {
 }
 
 /// 按字符数截断（Unicode 安全；喂给 LLM 的既有正文限长用）。
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_string()
     } else {
@@ -1909,6 +1911,26 @@ fn pages_meta(
 // Apply 事务：原子写 + git 提交 + log/index 维护
 // ---------------------------------------------------------------------------
 
+/// 引擎级写锁（模块级单例）：ingest apply 与 query 沉淀走**同一个**
+/// 落盘事务核心（[`write_pages_and_commit`]，写的是同一个 git 仓库的
+/// 页面 + index + log + 提交），并发执行会交织提交与快照恢复。互斥
+/// 下沉在引擎侧后，锁只覆盖**写盘段**——两边的 LLM 调用阶段都不持锁
+/// （查询不阻塞摄取，摄取的长时间综合也不阻塞查询的词法检索）。
+///
+/// std Mutex：写盘段是同步代码、不跨 `.await`，临界区毫秒级到秒级
+///（git 提交），短暂阻塞 async 线程可接受；毒锁自动恢复（写盘 panic
+/// 后快照已尽力恢复，锁不传染后续事务）。
+static CORPUS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 持引擎写锁执行 `f`（[`write_pages_and_commit`] 专用；锁语义见
+/// [`CORPUS_WRITE_LOCK`]）。
+fn with_corpus_write_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = CORPUS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f()
+}
+
 /// 写前快照：`None` 表示文件原本不存在（恢复时删除）。
 #[derive(Debug)]
 struct FileSnapshot {
@@ -1941,79 +1963,231 @@ fn restore_all(snapshots: &[FileSnapshot]) {
     }
 }
 
-/// index.md 增量更新（纯函数，便于单测）：首次清掉「（暂无页面）」占位，
-/// 已有条目按 link 原位替换，新条目按提交顺序追加。
-fn update_index(existing: &str, entries: &[(String, String)]) -> String {
-    let mut lines: Vec<String> = existing
+/// index.md 全量重建的页面行条目（T9 富行）。
+pub(crate) struct IndexEntry {
+    /// wikilink 目标（相对 `wiki/`、去 `.md`）。
+    pub link: String,
+    /// 页面标题。
+    pub title: String,
+    /// 摘要首句（已剥 wikilink 标记并截断，见 [`index_digest`]）。
+    pub digest: String,
+    /// 资料源计数（frontmatter `sources` 数组长度）。
+    pub source_count: usize,
+}
+
+/// 富行渲染（纯函数）：`- [[link|title]] — 摘要 · N 源`。
+///
+/// link == title 用短形式 `[[link]]`；页面无 sources（如 Source page /
+/// Query page）省略计数段——计数为 0 的「· 0 源」是噪音不是信息。
+pub(crate) fn render_index_line(entry: &IndexEntry) -> String {
+    let mut line = format!(
+        "- {} — {}",
+        wikilink(&entry.link, &entry.title),
+        entry.digest
+    );
+    if entry.source_count > 0 {
+        line.push_str(&format!(" · {} 源", entry.source_count));
+    }
+    line
+}
+
+/// 摘要首句（纯函数）：跳过 Markdown 标题行与空行，取首个非空行，
+/// 剥 wikilink 标记（`[[a|b]]`→`b`、`[[a]]`→`a`），截断约 60 字——
+/// 超长时**优先在句读边界截断**（60 字窗口内最后一个句号/问号/叹号/
+/// 分号，全半角皆可；首句经 `lines()` 逐行取出故换行边界天然不出现），
+/// 窗口内无边界才按字符硬截（60 字 + 省略号）。
+///
+/// 数据源说明：页面 frontmatter 没有 summary 字段（T3 schema 七必填
+/// 之外无该字段），富行的摘要取正文首句——设计补充评论中
+/// 「frontmatter 的 summary（或正文首句）」的后者。
+pub(crate) fn index_digest(body: &str) -> String {
+    const DIGEST_MAX_CHARS: usize = 60;
+    let first = body
         .lines()
-        .filter(|line| line.trim() != "（暂无页面）")
-        .map(str::to_string)
-        .collect();
-    for (link, title) in entries {
-        let prefix = format!("- [[{link}]]");
-        let prefix_alias = format!("- [[{link}|");
-        let rendered = format!("- {}", wikilink(link, title));
-        match lines
-            .iter()
-            .position(|line| line.starts_with(&prefix) || line.starts_with(&prefix_alias))
-        {
-            Some(idx) => lines[idx] = rendered,
-            None => lines.push(rendered),
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or("");
+    let plain = strip_wikilinks(first);
+    if plain.chars().count() <= DIGEST_MAX_CHARS {
+        return plain;
+    }
+    let window: Vec<char> = plain.chars().take(DIGEST_MAX_CHARS).collect();
+    if let Some(cut) = window
+        .iter()
+        .rposition(|c| matches!(c, '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'))
+    {
+        return window[..cut + 1].iter().collect();
+    }
+    truncate_chars(&plain, DIGEST_MAX_CHARS)
+}
+
+/// 剥一段文本里的 wikilink 标记：`[[target|label]]` → `label`，
+/// `[[target]]` → `target`（富行摘要里嵌链接会让截断落在括号中间，
+/// 渲染出破碎链接——摘要只留纯文本）。扫描走 [`crate::page::scan_wikilinks`]
+/// 单一解析实现（未闭合的 `[[` 按字面文本保留，不是链接）。
+pub(crate) fn strip_wikilinks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut offset = 0usize;
+    for hit in crate::page::scan_wikilinks(text) {
+        out.push_str(&text[offset..hit.start]);
+        out.push_str(&hit.label);
+        offset = hit.end;
+    }
+    out.push_str(&text[offset..]);
+    out
+}
+
+/// index.md 全量重建（T9 富行升级）：扫描 `wiki/` 下全部页面类型的
+/// `.md` 文件（含 `queries/`），按类型顺序 + 路径升序生成富行，拼在
+/// 固定头部（[`crate::vault::INDEX_MD_HEADER`]）之后。
+///
+/// 为什么是全量重建而非旧的行级 upsert：富行格式上线后，行级替换只能
+/// 刷新本次摄取触碰到的页面，旧格式行会长期残留——全量重建让既有
+/// Vault 的 index 在**下次落盘事务**（ingest apply / 查询沉淀）时一次
+/// 刷新到位，不做迁移工具。单页解析失败（坏 frontmatter）跳过该页，
+/// 不阻断重建；目录缺失视为空（全新 Vault）。
+pub(crate) fn rebuild_index(vault_root: &Path) -> Result<String> {
+    let wiki = vault_root.join("wiki");
+    let mut entries: Vec<IndexEntry> = Vec::new();
+    for kind in PageKind::ALL {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        collect_md_files(&wiki.join(kind.dir()), &mut paths);
+        paths.sort();
+        for path in paths {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok((frontmatter, body)) = parse_page(&content) else {
+                continue; // 坏页不进目录（与 list_pages 宽松哲学一致）
+            };
+            let link = path
+                .strip_prefix(&wiki)
+                .expect("wiki 下的页面必然能 strip wiki/ 前缀")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let link = link.strip_suffix(".md").unwrap_or(&link).to_string();
+            entries.push(IndexEntry {
+                link,
+                title: frontmatter.title,
+                digest: index_digest(&body),
+                source_count: frontmatter.sources.len(),
+            });
         }
     }
-    let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
+    let mut out = String::from(crate::vault::INDEX_MD_HEADER);
+    for entry in &entries {
+        out.push_str(&render_index_line(entry));
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
-/// log.md 追加一条可 grep 的时序记录：`## [YYYY-MM-DD] ingest | <标题>`
-/// （规格格式；git 提交信息另带 `corpus:` 前缀，见 [`INGEST_COMMIT_PREFIX`]）。
-fn append_log(existing: &str, title: &str) -> String {
-    let today = chrono::Local::now().format("%Y-%m-%d");
+/// 递归收集 `dir` 下的 `.md` 文件（不读内容；目录不存在为空操作）。
+pub(crate) fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_md_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md")
+            && !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("._"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// 追加一条完整时序记录（`entry` 自带末尾换行；ingest 与 query 沉淀共用）。
+pub(crate) fn append_log_entry(existing: &str, entry: &str) -> String {
     let mut out = existing.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(entry);
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&format!("## [{today}] ingest | {title}\n"));
     out
 }
 
-/// 写入 + 提交（apply 的私有实现）：全部页面 tempfile persist 原子写 +
-/// log/index 更新 + 恰好一个 git 提交。任一步失败恢复快照并清空暂存区
-/// （commit 前的 `git add` 可能把文件写进了 index），不留半写状态。
+/// 写入 + 提交（apply 的私有实现）：委托通用事务核心
+/// [`write_pages_and_commit`]，额外把 raw 文件随本次提交入库
+///（Source page 的指纹指针需要原文可溯）。
 fn write_and_commit(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
+    let message = format!("{INGEST_COMMIT_PREFIX} | {}", draft.source_title);
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let log_entry = format!("## [{today}] ingest | {}\n", draft.source_title);
+    write_pages_and_commit(
+        vault_root,
+        &draft.pages,
+        std::slice::from_ref(&draft.raw_path),
+        &message,
+        &log_entry,
+    )
+}
+
+/// 通用落盘事务核心（ingest apply 与 query 沉淀共用，T9）：全部页面
+/// tempfile persist 原子写 + **index.md 全量重建**（[`rebuild_index`]，
+/// 页面落盘后执行，磁盘即全量事实源）+ log 追加 + 恰好一个 git 提交。
+///
+/// **引擎级写互斥**：本函数是全部写盘事务的唯一入口，整体持
+/// [`CORPUS_WRITE_LOCK`]（见其文档）——调用方（ingest apply / query
+/// 沉淀）的 LLM 调用阶段在锁外，写盘段在此串行。任一步失败恢复快照
+/// 并清空暂存区（commit 前的 `git add` 可能把文件写进了 index），不
+/// 留半写状态。`extra_git_files` 是除页面与 index/log 外要一并提交的
+/// Vault 相对路径（ingest 传 raw 文件）。
+pub(crate) fn write_pages_and_commit(
+    vault_root: &Path,
+    pages: &[PageDraft],
+    extra_git_files: &[String],
+    commit_message: &str,
+    log_entry: &str,
+) -> Result<String> {
+    with_corpus_write_lock(|| {
+        write_pages_and_commit_locked(
+            vault_root,
+            pages,
+            extra_git_files,
+            commit_message,
+            log_entry,
+        )
+    })
+}
+
+/// [`write_pages_and_commit`] 的锁内实现（调用方必须已持
+/// [`CORPUS_WRITE_LOCK`]）。
+fn write_pages_and_commit_locked(
+    vault_root: &Path,
+    pages: &[PageDraft],
+    extra_git_files: &[String],
+    commit_message: &str,
+    log_entry: &str,
+) -> Result<String> {
     let wiki = vault_root.join("wiki");
 
-    // 先在内存生成全部新内容：render 失败（schema 违规）时零写入。
-    let mut writes: Vec<(PathBuf, String)> = Vec::new();
-    for page in &draft.pages {
-        writes.push((wiki.join(&page.path), page.render()?));
-    }
-    let index_entries: Vec<(String, String)> = draft
-        .pages
+    // 先在内存生成全部页面内容：render 失败（schema 违规）时零写入。
+    let mut writes: Vec<(PathBuf, String)> = pages
         .iter()
-        .map(|p| (p.link().to_string(), p.frontmatter.title.clone()))
-        .collect();
-    let index_path = wiki.join("index.md");
-    let index_new = update_index(
-        &fs::read_to_string(&index_path).unwrap_or_default(),
-        &index_entries,
-    );
+        .map(|page| Ok((wiki.join(&page.path), page.render()?)))
+        .collect::<Result<_>>()?;
     let log_path = wiki.join("log.md");
-    let log_new = append_log(
+    let log_new = append_log_entry(
         &fs::read_to_string(&log_path).unwrap_or_default(),
-        &draft.source_title,
+        log_entry,
     );
-    writes.push((index_path, index_new));
     writes.push((log_path, log_new));
 
-    // 快照 → 建目录 → 逐文件原子写 → git add 指定文件 + 单次提交。
-    let snapshots: Vec<FileSnapshot> = writes
-        .iter()
-        .map(|(path, _)| snapshot(path.clone()))
-        .collect();
+    // 快照 → 建目录 → 逐文件原子写（index 不在先写之列：全量重建要以
+    // 落盘后的全量页面为源）→ 重建 index → git add 指定文件 + 单次提交。
+    let index_path = wiki.join("index.md");
+    let mut snapshot_paths: Vec<PathBuf> = writes.iter().map(|(path, _)| path.clone()).collect();
+    snapshot_paths.push(index_path.clone());
+    let snapshots: Vec<FileSnapshot> = snapshot_paths.into_iter().map(snapshot).collect();
     for (path, content) in &writes {
         let result = (|| -> Result<()> {
             if let Some(parent) = path.parent() {
@@ -2026,19 +2200,25 @@ fn write_and_commit(vault_root: &Path, draft: &IngestDraft) -> Result<String> {
             return Err(err);
         }
     }
-    let files: Vec<String> = draft
-        .pages
+    let index_new = match rebuild_index(vault_root) {
+        Ok(content) => content,
+        Err(err) => {
+            restore_all(&snapshots);
+            return Err(err);
+        }
+    };
+    if let Err(err) = atomic_write(&index_path, &index_new) {
+        restore_all(&snapshots);
+        return Err(err);
+    }
+
+    let files: Vec<String> = pages
         .iter()
         .map(|p| format!("wiki/{}", p.path))
-        .chain([
-            "wiki/index.md".to_string(),
-            "wiki/log.md".to_string(),
-            // raw 随本次提交入库：Source page 的指纹指针需要原文可溯。
-            draft.raw_path.clone(),
-        ])
+        .chain(extra_git_files.iter().cloned())
+        .chain(["wiki/index.md".to_string(), "wiki/log.md".to_string()])
         .collect();
-    let message = format!("{INGEST_COMMIT_PREFIX} | {}", draft.source_title);
-    match git::commit_files(vault_root, &files, &message) {
+    match git::commit_files(vault_root, &files, commit_message) {
         Ok(commit) => Ok(commit),
         Err(err) => {
             restore_all(&snapshots);
@@ -2278,38 +2458,117 @@ mod tests {
     }
 
     #[test]
-    fn update_index_replaces_placeholder_then_upserts_lines() {
-        let initial = "# Wiki Index\n\n说明。\n\n## 页面\n\n（暂无页面）\n";
-        let v1 = update_index(initial, &[("entities/a".into(), "A".into())]);
-        assert!(!v1.contains("（暂无页面）"), "占位行应被清除");
-        assert!(v1.contains("- [[entities/a|A]]"));
-
-        // 同 link 更新标题 → 原位替换不重复追加
-        let v2 = update_index(&v1, &[("entities/a".into(), "A2".into())]);
-        assert_eq!(v2.matches("[[entities/a").count(), 1);
-        assert!(v2.contains("- [[entities/a|A2]]"));
-        assert!(!v2.contains("A]]"));
-
-        // 新条目追加（link != title 时带别名形式）
-        let v3 = update_index(&v2, &[("sources/s".into(), "s".into())]);
-        assert!(v3.contains("- [[sources/s|s]]"));
-        // link == title 时用短形式
-        let v4 = update_index(&v3, &[("concepts/c".into(), "concepts/c".into())]);
-        assert!(v4.trim_end().ends_with("- [[concepts/c]]"));
+    fn render_index_line_rich_formats() {
+        // 富行：wikilink — 摘要 · N 源；link == title 用短形式；
+        // 无 sources 的页面省略计数段
+        let with_sources = render_index_line(&IndexEntry {
+            link: "entities/transformer".into(),
+            title: "Transformer".into(),
+            digest: "完全基于注意力的架构".into(),
+            source_count: 2,
+        });
+        assert_eq!(
+            with_sources,
+            "- [[entities/transformer|Transformer]] — 完全基于注意力的架构 · 2 源"
+        );
+        let short_link = render_index_line(&IndexEntry {
+            link: "自注意力".into(),
+            title: "自注意力".into(),
+            digest: "让每个位置直接关注全部位置".into(),
+            source_count: 0,
+        });
+        assert_eq!(short_link, "- [[自注意力]] — 让每个位置直接关注全部位置");
     }
 
     #[test]
-    fn append_log_adds_greppable_entry() {
-        let initial = "# Wiki Log\n\n## [2026-01-01] init | Vault\n";
-        let out = append_log(initial, "Attention Is All You Need");
-        let last = out.lines().last().unwrap();
+    fn index_digest_takes_first_plain_sentence_stripped_and_truncated() {
+        // 跳过标题行与空行，取首个非空行；wikilink 剥成纯文本
+        let body = "# Transformer\n\n[[entities/transformer|Transformer]] 是完全基于注意力的架构。\n\n第二段。";
+        assert_eq!(index_digest(body), "Transformer 是完全基于注意力的架构。");
+        // 超长截断：60 字窗口内有句读边界 → 在**最后一个**句号处截断
+        //（保留完整句子，无省略号）
+        let long = format!("第一句在这里结束。{}无边界填充", "字".repeat(80));
+        let digest = index_digest(&format!("# 标题\n\n{long}"));
+        assert_eq!(digest, "第一句在这里结束。", "应在句读边界截断：{digest}");
+        // 窗口内无任何句读边界 → 硬截（60 字 + 省略号，既有行为）
+        let boundless = "字".repeat(80);
+        let digest = index_digest(&format!("# 标题\n\n{boundless}"));
+        assert_eq!(digest.chars().count(), 61, "60 字 + 省略号：{digest}");
+        assert!(digest.ends_with('…'));
+        // 半角句读同样是边界
+        let half = format!("Head sentence. {}", "x".repeat(80));
+        let digest = index_digest(&half);
+        assert_eq!(digest, "Head sentence.", "半角句号也是边界：{digest}");
+        // 全是标题行：摘要在 index 行里是可辨识但空的兜底
+        assert_eq!(index_digest("# 只有标题\n\n"), "");
+        // 未闭合的 [[ 按字面保留
+        assert_eq!(index_digest("悬空的 [[链接 与正文"), "悬空的 [[链接 与正文");
+    }
+
+    /// index 全量重建：含富行与占位清除语义；旧格式行随重建消失
+    /// （既有 Vault 的迁移路径 = 下次落盘事务的全量重建，无迁移工具）。
+    #[test]
+    fn rebuild_index_regenerates_rich_lines_from_disk() {
+        let dir = tempfile::tempdir().expect("tempdir 失败");
+        let root = dir.path().join("vault");
+        crate::create_vault(&root, &crate::template::TemplateId::from("generic"))
+            .expect("建 Vault 失败");
+        let fm = |title: &str| {
+            format!(
+                "---\ntype: entity\ntitle: {title}\naliases: [{title}]\ntags: []\nrelated: []\nsources: [\"[[sources/a]]\"]\ncreated: t\nupdated: t\n---\n\n"
+            )
+        };
+        let entities = root.join("wiki/entities");
+        fs::create_dir_all(&entities).expect("建目录失败");
+        fs::write(entities.join("a.md"), format!("{}旧格式正文", fm("A"))).expect("写失败");
+        fs::write(
+            entities.join("b.md"),
+            format!("{}[[entities/a|A]] 引用与正文摘要句。", fm("B")),
+        )
+        .expect("写失败");
+
+        let index = rebuild_index(&root).expect("重建失败");
+        assert!(index.starts_with(crate::vault::INDEX_MD_HEADER));
+        assert!(!index.contains("（暂无页面）"), "占位应被重建清除");
+        // 富行：摘要 + 来源计数（sources 数组长 1）
         assert!(
-            last.starts_with("## [") && last.contains("] ingest | Attention Is All You Need"),
-            "记录行应为 `## [日期] ingest | 标题`：{last}"
+            index.contains("- [[entities/a|A]] — 旧格式正文 · 1 源"),
+            "富行应含摘要与源数：{index}"
         );
-        // 日期是今天（本地）
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(last.contains(&today));
+        assert!(
+            index.contains("- [[entities/b|B]] — A 引用与正文摘要句。 · 1 源"),
+            "wikilink 应剥成纯文本摘要：{index}"
+        );
+        // 路径升序稳定（a 在 b 前）
+        let a_pos = index.find("[[entities/a|A]]").expect("缺 a 行");
+        let b_pos = index.find("[[entities/b|B]]").expect("缺 b 行");
+        assert!(a_pos < b_pos);
+
+        // 坏 frontmatter 页面：跳过不阻断
+        fs::write(
+            entities.join("broken.md"),
+            "---\ntitle: 缺 aliases\n---\n\n正文",
+        )
+        .expect("写失败");
+        let index = rebuild_index(&root).expect("坏页不应阻断重建");
+        assert!(!index.contains("broken"), "坏页不进目录：{index}");
+    }
+
+    #[test]
+    fn append_log_entry_normalizes_trailing_newlines() {
+        // 无尾换行 / 空文件 / 已有尾换行：都恰好追加一条带换行的记录
+        assert_eq!(
+            append_log_entry("# Wiki Log", "## [2026-01-01] ingest | A\n"),
+            "# Wiki Log\n## [2026-01-01] ingest | A\n"
+        );
+        assert_eq!(
+            append_log_entry("", "## [d] query | Q\n"),
+            "## [d] query | Q\n"
+        );
+        assert_eq!(
+            append_log_entry("# Log\n", "## [d] query | Q\n"),
+            "# Log\n## [d] query | Q\n"
+        );
     }
 
     #[test]

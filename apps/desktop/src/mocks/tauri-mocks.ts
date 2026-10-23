@@ -33,7 +33,7 @@ interface TemplateInfo {
 interface IngestedPage {
   path: string
   title: string
-  page_type: 'source' | 'entity' | 'concept'
+  page_type: 'source' | 'entity' | 'concept' | 'query'
   action: 'create' | 'update'
 }
 
@@ -71,12 +71,32 @@ type IngestProgress =
   | { stage: 'applying'; pages: number }
 
 interface PageGroup {
-  kind: 'source' | 'entity' | 'concept'
+  kind: 'source' | 'entity' | 'concept' | 'query'
   pages: PageEntry[]
 }
 
 interface PageTree {
   groups: PageGroup[]
+}
+
+/** 查询（T9）形状镜像自引擎 serde 输出。 */
+type QueryProgress =
+  | { stage: 'searching'; terms: string[] }
+  | { stage: 'answering'; chars: number; answer: string }
+  | { stage: 'done' }
+
+interface QueryCitation {
+  path: string
+  title: string
+}
+
+interface QueryOutcome {
+  question: string
+  answer: string
+  candidates: { path: string; title: string; score: number }[]
+  citations: QueryCitation[]
+  query_page_path: string | null
+  commit: string | null
 }
 
 /** 浏览器模式假摄取的产出（不落盘，仅供 UI 调试）。 */
@@ -117,57 +137,88 @@ function upsertRecent(path: string, templateId: string): void {
   ]
 }
 
-/** 假页面树：基础三页 + 假摄取（auto 模式）成功后追加的 source 页。
- *  条目携带 frontmatter title / aliases（T4 wikilink 解析数据源）。 */
+/** 假页面树：基础三页 + 假摄取（auto 模式）成功后追加的 source 页 +
+ *  假查询沉淀的 queries 页（T9）。条目携带 frontmatter title / aliases
+ * （T4 wikilink 解析数据源）。 */
 let extraSourcePages: PageEntry[] = []
+
+/** 假查询沉淀页（内存态）：重复提问按同题更新（路径不变）。 */
+let fakeQueryPage: { path: string; title: string; answer: string } | null = null
 
 function fakePageTree(): PageTree {
   const updated = '2026-10-16T10:30:00+08:00'
-  return {
-    groups: [
-      {
-        kind: 'source',
-        pages: [
-          {
-            path: 'sources/attention-is-all-you-need.md',
-            updated,
-            title: 'Attention Is All You Need',
-            aliases: ['Attention 论文'],
-          },
-          ...extraSourcePages,
-        ],
-      },
-      {
-        kind: 'entity',
-        pages: [
-          { path: 'entities/transformer.md', updated, title: 'Transformer', aliases: ['Transformer 架构'] },
-        ],
-      },
-      {
-        kind: 'concept',
-        pages: [
-          { path: 'concepts/自注意力.md', updated, title: '自注意力', aliases: ['Self-Attention'] },
-        ],
-      },
-    ],
+  const groups: PageGroup[] = [
+    {
+      kind: 'source',
+      pages: [
+        {
+          path: 'sources/attention-is-all-you-need.md',
+          updated,
+          title: 'Attention Is All You Need',
+          aliases: ['Attention 论文'],
+        },
+        ...extraSourcePages,
+      ],
+    },
+    {
+      kind: 'entity',
+      pages: [
+        { path: 'entities/transformer.md', updated, title: 'Transformer', aliases: ['Transformer 架构'] },
+      ],
+    },
+    {
+      kind: 'concept',
+      pages: [
+        { path: 'concepts/自注意力.md', updated, title: '自注意力', aliases: ['Self-Attention'] },
+      ],
+    },
+  ]
+  if (fakeQueryPage !== null) {
+    groups.push({
+      kind: 'query',
+      pages: [
+        { path: fakeQueryPage.path, updated, title: fakeQueryPage.title, aliases: [fakeQueryPage.title] },
+      ],
+    })
   }
+  return { groups }
 }
 
 /** 假页面（read_page_typed）：与假页面树一一对应的结构化 frontmatter +
- *  正文；index.md（引擎自维护目录，无 frontmatter）宽松降级。 */
+ *  正文；index.md（引擎自维护目录，无 frontmatter）宽松降级；查询沉淀
+ *  的 queries 页（T9）按内存态返回。 */
 function fakePageTyped(relPath: string): ReadPageResult {
   if (relPath === 'index.md') {
+    const lines = [
+      '# Wiki Index',
+      '',
+      '- [[sources/attention-is-all-you-need|Attention Is All You Need]]',
+      '- [[entities/transformer|Transformer]]',
+      '- [[concepts/自注意力]]',
+      '- [[concepts/不存在的页面|死链示例]]',
+    ]
+    if (fakeQueryPage !== null) {
+      lines.push(`- [[${fakeQueryPage.path.replace(/\.md$/, '')}|${fakeQueryPage.title}]]`)
+    }
+    lines.push('')
+    return { frontmatter: null, body: lines.join('\n') }
+  }
+  if (fakeQueryPage !== null && relPath === fakeQueryPage.path) {
+    const now = '2026-10-16T10:30:00+08:00'
     return {
-      frontmatter: null,
-      body: [
-        '# Wiki Index',
-        '',
-        '- [[sources/attention-is-all-you-need|Attention Is All You Need]]',
-        '- [[entities/transformer|Transformer]]',
-        '- [[concepts/自注意力]]',
-        '- [[concepts/不存在的页面|死链示例]]',
-        '',
-      ].join('\n'),
+      frontmatter: {
+        type: 'query',
+        title: fakeQueryPage.title,
+        aliases: [fakeQueryPage.title],
+        tags: ['query'],
+        related: ['[[entities/transformer|Transformer]]', '[[concepts/自注意力]]'],
+        sources: [],
+        created: now,
+        updated: now,
+        raw_path: null,
+        fingerprint: null,
+      },
+      body: fakeQueryPage.answer,
     }
   }
   const titles: Record<string, string> = {
@@ -347,6 +398,87 @@ async function fakeIngest(srcPath: string, applyMode: string): Promise<IngestRep
   }
 }
 
+/**
+ * 假查询（T9，镜像引擎 query 编排的负载形状）：searching（带假分词）
+ * → answering（假流式按 ~250ms 间隔吐 chars + 累积回答文本）→ 返回假
+ * 回答 + 假引用；query_pages 默认开——按问题 slug 沉淀假 Query page
+ * （内存态，重复提问同题更新），并让假页面树长出 queries 分组。不写
+ * 任何文件。
+ */
+async function fakeQueryAsk(question: string): Promise<QueryOutcome> {
+  const { emit } = await import('@tauri-apps/api/event')
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  await emit('query-progress', { stage: 'searching', terms: fakeTokenize(question) })
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  await emit('query-progress', { stage: 'answering', chars: 0, answer: '' })
+  const answer = [
+    '（浏览器模式假回答）自注意力让序列中每个位置直接关注全部位置，是 [[entities/transformer|Transformer]] 的核心机制。',
+    '',
+    '详细概念见 [[concepts/自注意力|自注意力]]；论文出处见 [[sources/attention-is-all-you-need|Attention Is All You Need]]。',
+  ].join('\n')
+  await emitAnswerStream(answer, 250)
+  await emit('query-progress', { stage: 'done' })
+  // 沉淀（query_pages=true 的默认路径）：同题更新（路径不变）
+  const slug = fakeSlug(question)
+  const path = `queries/${slug}.md`
+  fakeQueryPage = { path, title: question.slice(0, 30), answer }
+  return {
+    question,
+    answer,
+    candidates: [
+      { path: 'entities/transformer.md', title: 'Transformer', score: 22 },
+      { path: 'concepts/自注意力.md', title: '自注意力', score: 18 },
+    ],
+    citations: [
+      { path: 'entities/transformer.md', title: 'Transformer' },
+      { path: 'concepts/自注意力.md', title: '自注意力' },
+    ],
+    query_page_path: path,
+    commit: 'browser-mock-query',
+  }
+}
+
+/** 假分词（引擎 tokenize_question 的简化镜像）：ASCII 词 + CJK 单字。 */
+function fakeTokenize(question: string): string[] {
+  const terms = new Set<string>()
+  for (const word of question.toLowerCase().split(/[^a-z0-9\u4e00-\u9fff]+/)) {
+    if (word === '') continue
+    if (/^[a-z0-9]+$/.test(word)) {
+      terms.add(word)
+    } else {
+      for (const ch of word) terms.add(ch)
+    }
+  }
+  return [...terms].sort()
+}
+
+/** 问题 slug（引擎 slugify 的浏览器简化：小写 + 空白转 - + 截断 30）。 */
+function fakeSlug(question: string): string {
+  const slug = question
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 30)
+  return slug === '' ? 'untitled' : slug
+}
+
+/** 假流式（查询 answering 阶段）：按 ~12 段把回答吐完，每段携带
+ *  chars 与累积文本快照（引擎 QueryEvent::Answering 的形状）。 */
+async function emitAnswerStream(answer: string, stepMs: number): Promise<void> {
+  const { emit } = await import('@tauri-apps/api/event')
+  const chars: string[] = [...answer]
+  const step = Math.max(1, Math.ceil(chars.length / 12))
+  for (let n = step; ; n = Math.min(chars.length, n + step)) {
+    await new Promise((resolve) => setTimeout(resolve, stepMs))
+    await emit('query-progress', {
+      stage: 'answering',
+      chars: n,
+      answer: chars.slice(0, n).join(''),
+    } satisfies QueryProgress)
+    if (n >= chars.length) break
+  }
+}
+
 mockIPC(
   (cmd, payload) => {
     const args = (payload ?? {}) as InvokeArgs
@@ -435,6 +567,13 @@ mockIPC(
       case 'ingest_file': {
         const { rawPath } = args as { rawPath: string }
         return fakeIngest(rawPath, DEFAULT_CONFIG.apply_mode)
+      }
+      case 'query_ask': {
+        const { question } = args as { question: string }
+        if (question.trim() === '') {
+          throw '查询问题不能为空'
+        }
+        return fakeQueryAsk(question)
       }
       // 对话框：目录选择返回演示 Vault；文件选择返回 Vault 外的演示
       // 文档（Ingest 流程「任意位置选文件 → 自动导入 raw/」，对话框

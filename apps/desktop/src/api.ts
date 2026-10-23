@@ -23,6 +23,41 @@ export const isTauri = typeof (window as any).__TAURI_INTERNALS__ !== 'undefined
 
 /** SSE 进度事件名（与 corpus-server 的 INGEST_PROGRESS_SSE_EVENT 对应）。 */
 const INGEST_PROGRESS_SSE_EVENT = 'ingest-progress'
+/** 查询流式进度事件名（T9，与 server 的 QUERY_PROGRESS_SSE_EVENT 对应）。 */
+const QUERY_PROGRESS_SSE_EVENT = 'query-progress'
+
+/**
+ * web 模式共用的 SSE 连接（懒建立，页面生命周期内常驻）：
+ * ingest 与查询两条进度流共用同一条 /api/events 连接，各自
+ * addEventListener 自己的事件名。返回的 unlisten 只摘除本监听，
+ * 连接保留（后续订阅零成本复用）。
+ */
+function sseSubscribe<T>(eventName: string, handler: (payload: T) => void): UnlistenFn {
+  let source = sseSource
+  if (source === null) {
+    source = new EventSource('/api/events')
+    source.onerror = () => {
+      // EventSource 失败后会自动重连；连接被拒（服务未起）时给出指路
+      // 提示，不打断 UI。
+      console.error(
+        'Corpus：进度事件流连接失败。请确认 corpus-server 在运行、令牌有效（从启动输出复制 URL 重开）。',
+      )
+    }
+    sseSource = source
+  }
+  const listener = (ev: Event): void => {
+    try {
+      handler(JSON.parse((ev as MessageEvent).data as string) as T)
+    } catch (err) {
+      console.error('Corpus：进度事件解析失败', err)
+    }
+  }
+  source.addEventListener(eventName, listener)
+  return () => source.removeEventListener(eventName, listener)
+}
+
+/** 模块级 SSE 连接单例（仅 web transport 使用）。 */
+let sseSource: EventSource | null = null
 
 // ---------------------------------------------------------------------------
 // HTTP transport（浏览器壳）：同源 fetch，安全由 server 端本机源校验
@@ -107,7 +142,7 @@ export interface RecentVault {
 }
 
 /** 页面类型（引擎 PageKind serde 表示）。 */
-export type PageKind = 'source' | 'entity' | 'concept'
+export type PageKind = 'source' | 'entity' | 'concept' | 'query'
 
 /** 单个页面条目（引擎 PageEntry）：路径 + title/别名 + 最后更新时间。 */
 export interface PageEntry {
@@ -168,11 +203,11 @@ export interface IngestedPage {
   action: PageAction
 }
 
-/** LLM 档位（fast 分析 / strong 成文）。 */
+/** LLM 档位（fast 分析 / strong 成文与查询综合）。 */
 export type LlmTier = 'fast' | 'strong'
 
 /** LLM 调用用途。 */
-export type LlmCallPurpose = 'analyze' | 'compose'
+export type LlmCallPurpose = 'analyze' | 'compose' | 'query'
 
 /** 单次 LLM 调用的结果分类。 */
 export type LlmCallOutcome = 'ok' | 'parse_failed' | 'oversized' | 'error'
@@ -225,6 +260,47 @@ export type IngestProgress =
   | { stage: 'generating'; pages: number; chars: number }
   | { stage: 'applying'; pages: number }
 
+/** 查询进度事件 payload（引擎 QueryEvent，tag=stage）。
+ *
+ *  searching 带词法词项；answering 是 LLM 流式（同阶段重复事件携带
+ *  递增 chars 与**累积回答文本** answer，引擎侧已节流合并，chars=0
+ *  表示阶段开始——与 ingest 同口径的节流，文本供回答区流式渲染）；
+ *  done 表示查询完成（结果在 queryAsk() 的 Promise 结果里）。 */
+export type QueryProgress =
+  | { stage: 'searching'; terms: string[] }
+  | { stage: 'answering'; chars: number; answer: string }
+  | { stage: 'done' }
+
+/** 词法打分后的候选页（引擎 ScoredPage，score 降序）。 */
+export interface ScoredPage {
+  path: string
+  title: string
+  score: number
+}
+
+/** 回答中实际引用到的候选页（引擎 QueryCitation）。 */
+export interface QueryCitation {
+  /** 相对 wiki/ 的 .md 路径。 */
+  path: string
+  title: string
+}
+
+/** query_ask 的结果（引擎 QueryOutcome）：回答 + 引用 + 沉淀信息。 */
+export interface QueryOutcome {
+  /** 原始问题（trim 后）。 */
+  question: string
+  /** 完整回答文本（可含 [[wikilink]]，复用 wiki-links 渲染管线）。 */
+  answer: string
+  /** 词法候选页（TopN，score 降序）。 */
+  candidates: ScoredPage[]
+  /** 回答中实际引用到的候选页（按出现顺序去重）。 */
+  citations: QueryCitation[]
+  /** 沉淀的 Query page 相对 wiki/ 路径（配置关闭或无候选时 null）。 */
+  query_page_path: string | null
+  /** 沉淀产生的 git 短 hash（未沉淀时 null）。 */
+  commit: string | null
+}
+
 /** 服务器侧目录浏览的单个条目（server GET /api/fs/list 的 entries 项）。
  *
  *  `path` 为 server 拼好的绝对路径（canonical），前端直接用它下钻或选中。 */
@@ -259,6 +335,9 @@ interface Transport {
   readPage(vaultPath: string, relPath: string): Promise<ReadPageResult>
   ingestFile(vaultPath: string, rawPath: string): Promise<IngestReport>
   onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn>
+  /** 自然语言查询（T9）：Promise 等到查询完成，进度走 onQueryProgress。 */
+  queryAsk(vaultPath: string, question: string): Promise<QueryOutcome>
+  onQueryProgress(handler: (payload: QueryProgress) => void): Promise<UnlistenFn>
   /** 服务器侧目录浏览（web 壳「浏览…」的数据源；桌面壳弹系统对话框，
    *  本方法在 Tauri transport 下只做兜底抛错——组件在 Tauri 下不渲染）。 */
   listFs(path?: string): Promise<FsListing>
@@ -280,34 +359,19 @@ const tauriTransport: Transport = {
   ingestFile: (vaultPath, rawPath) => invoke<IngestReport>('ingest_file', { vaultPath, rawPath }),
   onIngestProgress: (handler) =>
     listen<IngestProgress>('ingest-progress', (e) => handler(e.payload)),
+  queryAsk: (vaultPath, question) =>
+    invoke<QueryOutcome>('query_ask', { vaultPath, question }),
+  onQueryProgress: (handler) =>
+    listen<QueryProgress>('query-progress', (e) => handler(e.payload)),
   // 桌面壳选路径走 plugin-dialog 的系统对话框；本方法不应被调用（组件
   // 在 Tauri 下不渲染），仅兜底给可辨认的中文错误。
   listFs: () => Promise.reject('桌面壳请使用系统对话框选择路径'),
 }
 
-/** 浏览器订阅 Ingest 进度：EventSource（SSE）。EventSource 无法自定义
- * 同源连接（server 端本机源校验放行）；unlisten = 关闭连接。 */
+/** 浏览器订阅 Ingest 进度：共用 SSE 连接上监听 ingest-progress 事件
+ *（连接懒建立，查询进度流同源复用，见 sseSubscribe）。 */
 function sseIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
-  const source = new EventSource('/api/events')
-  source.addEventListener(INGEST_PROGRESS_SSE_EVENT, (ev) => {
-    try {
-      handler(JSON.parse((ev as MessageEvent).data as string) as IngestProgress)
-    } catch (err) {
-      console.error('Corpus：进度事件解析失败', err)
-    }
-  })
-  source.onerror = () => {
-    // EventSource 失败后会自动重连；连接被拒（401 / 服务未起）时给
-    // 出与 401 相同的指路提示，不打断 UI。
-    console.error(
-      'Corpus：进度事件流连接失败。请确认 corpus-server 在运行、令牌有效（从启动输出复制 URL 重开）。',
-    )
-  }
-  const unlisten: UnlistenFn = () => source.close()
-  // Tauri 的 listen 返回的 Promise 在监听注册后 resolve；SSE 没有等价
-  // 的「注册完成」信号，立即 resolve unlisten 即可（连接在后台建立，
-  // 早到的进度事件有组件级 loading 态兜底）。
-  return Promise.resolve(unlisten)
+  return Promise.resolve(sseSubscribe(INGEST_PROGRESS_SSE_EVENT, handler))
 }
 
 /** HTTP transport（浏览器壳）：同源 fetch（query 参数直拼，经
@@ -338,6 +402,10 @@ const webTransport: Transport = {
   ingestFile: (vaultPath, rawPath) =>
     httpPost<IngestReport>('/api/ingest', { vault_path: vaultPath, src_path: rawPath }),
   onIngestProgress: sseIngestProgress,
+  queryAsk: (vaultPath, question) =>
+    httpPost<QueryOutcome>('/api/query', { vault_path: vaultPath, question }),
+  onQueryProgress: (handler) =>
+    Promise.resolve(sseSubscribe(QUERY_PROGRESS_SSE_EVENT, handler)),
   // path 缺省时 server 列用户主目录（首响应的 path 字段即 home canonical）
   listFs: (path) =>
     httpJson<FsListing>(path === undefined ? '/api/fs/list' : `/api/fs/list?path=${encodeURIComponent(path)}`),
@@ -408,6 +476,23 @@ export function ingestFile(vaultPath: string, rawPath: string): Promise<IngestRe
  */
 export function onIngestProgress(handler: (payload: IngestProgress) => void): Promise<UnlistenFn> {
   return transport.onIngestProgress(handler)
+}
+
+/** 自然语言查询（T9）：词法候选 → LLM 流式综合 → 按配置沉淀 Query page。
+ *
+ * 浏览器 transport：POST /api/query 阻塞到查询完成，响应即完整结果
+ * （流式进度不经本响应，走 onQueryProgress 的 SSE query-progress）。 */
+export function queryAsk(vaultPath: string, question: string): Promise<QueryOutcome> {
+  return transport.queryAsk(vaultPath, question)
+}
+
+/**
+ * 订阅查询流式进度事件（tag=stage：searching / answering / done）；
+ * unlisten 语义同 onIngestProgress（组件卸载时调用；模块级 query-state
+ * 常驻订阅则不注销）。
+ */
+export function onQueryProgress(handler: (payload: QueryProgress) => void): Promise<UnlistenFn> {
+  return transport.onQueryProgress(handler)
 }
 
 /** 服务器侧只读目录浏览（web 壳专用）：path 缺省列用户主目录。

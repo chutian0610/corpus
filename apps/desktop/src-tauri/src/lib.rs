@@ -19,12 +19,16 @@
 
 use corpus_engine::{
     AppConfig, ConfigStore, ConnectionReport, IngestFileReport, IngestStage, ModelTier,
-    OpenedVault, PageTree, RecentVault, TemplateId, TemplateInfo, VaultInfo,
+    OpenedVault, PageTree, QueryEvent, QueryOutcome, RecentVault, TemplateId, TemplateInfo,
+    VaultInfo,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 前端 listen 的 Ingest 进度事件名。
 pub const INGEST_PROGRESS_EVENT: &str = "ingest-progress";
+
+/// 前端 listen 的查询流式进度事件名（T9，与 server 的 SSE 事件名一致）。
+pub const QUERY_PROGRESS_EVENT: &str = "query-progress";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -53,6 +57,7 @@ pub fn run() {
             list_pages,
             read_page_typed,
             ingest_file,
+            query_ask,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -190,6 +195,29 @@ async fn ingest_file(
         let _ = app.emit(INGEST_PROGRESS_EVENT, &stage);
     };
     corpus_engine::ingest_file(&vault_path, &raw_path, &config, emit_progress)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 自然语言查询（T9，薄委托）：编排（词法候选 → strong 档流式综合 →
+/// 按 `query_pages` 沉淀 Query page）在引擎 [`corpus_engine::query`]，
+/// 本命令只负责壳层职责：读全局配置与把引擎进度回调桥接为全局
+/// `query-progress` 事件（payload 即引擎 `QueryEvent`；回答流式的
+/// chars 增量原样 emit）。响应为引擎 [`QueryOutcome`]（回答 / 引用 /
+/// 候选 / 沉淀路径），字段形状与前端 `QueryOutcome` 接口一致。
+#[tauri::command]
+async fn query_ask(
+    app: AppHandle,
+    store: State<'_, ConfigStore>,
+    vault_path: String,
+    question: String,
+) -> Result<QueryOutcome, String> {
+    let config = store.get_config().map_err(|e| e.to_string())?;
+    let emit_event = move |event: QueryEvent| {
+        // 事件推送失败只影响进度展示，不阻断查询
+        let _ = app.emit(QUERY_PROGRESS_EVENT, &event);
+    };
+    corpus_engine::query(&vault_path, &question, &config, emit_event)
         .await
         .map_err(|e| e.to_string())
 }

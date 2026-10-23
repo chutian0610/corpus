@@ -76,7 +76,7 @@ pub enum LlmTier {
     Strong,
 }
 
-/// LLM 调用用途（与档位一一对应：fast 只用于分析、strong 只用于成文）。
+/// LLM 调用用途（fast 用于分析、strong 用于成文与查询综合）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmCallPurpose {
@@ -84,6 +84,8 @@ pub enum LlmCallPurpose {
     Analyze,
     /// 第二步：strong 档成文。
     Compose,
+    /// strong 档：查询综合（T9，自然语言 → 流式回答）。
+    Query,
 }
 
 /// 单次 LLM 调用的结果分类。
@@ -170,6 +172,12 @@ pub const ANALYSIS_MAX_TOKENS: u64 = 50_000;
 /// 换算依据：成文输出熔断是 60,000 字符（见 [`crate::ingest`]），
 /// 60,000 ÷ 1.5 = 40,000。
 pub const COMPOSE_MAX_TOKENS: u64 = 40_000;
+
+/// 查询综合（strong 档，T9）的服务端输出上限（token）。
+///
+/// 回答是自由文本（非 JSON，无解析重试），上限只需兜住失控输出：
+/// 16,000 token ≈ 24,000 字符（1.5 字/token 换算），远超正常回答长度。
+pub const QUERY_MAX_TOKENS: u64 = 16_000;
 
 /// 对注入的 [`LlmPort`] 发一次最小补全并计时（协议层，可离线用 Fake 驱动）。
 ///
